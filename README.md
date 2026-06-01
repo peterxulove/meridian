@@ -158,33 +158,117 @@ meridian-server / meridian-client 通用参数：
 
 ## 配置说明
 
-### 服务端配置（`server.yaml`）
+根据所部署的网络环境，Meridian 提供了三种传输层协议的配置方案：
 
+1. **QUIC (REALITY) 模式**：基于 QUIC/UDP，使用独创的 REALITY TLS 握手机制伪装正常流量，**性能最强，抗封锁效果最好，推荐作为默认方案**。
+2. **WebSocket (WSS) 模式**：基于 TCP/TLS 升级协议，流量表现为标准的 WSS 通信，适合 UDP 受限或被 QoS 的环境。
+3. **HTTP-POST 模式**：通过 HTTP/1.1 POST 大文件或持续视频上传的流量特征，实现业务级高隐蔽通信。
+
+---
+
+### 1. QUIC (REALITY) 模式（默认推荐）
+
+使用真实的合法网站证书哈希和 TLS 伪装指纹，无需购买域名和配置公信力证书即可在客户端直接进行端到端强校验。
+
+#### 🔹 服务端 (`server.quic.yaml`)
 ```yaml
-# 监听地址
+# 监听端口（REALITY 推荐使用标准 443 端口以达到完美伪装）
 listen_addr: "0.0.0.0:443"
-
-# 传输协议：QUIC / WebSocket / HTTP-POST
 transport: "QUIC"
+cipher_suite: 1                    # 加密套件：1=ChaCha20, 2=AES256, 3=AES128
+password: "your-strong-random-password-here"
 
-# 加密套件：1=ChaCha20, 2=AES256, 3=AES128
-cipher_suite: 1
-
-# 认证密码
-password: "your-strong-random-password"
-
-# ─── REALITY 模式（抗检测）───
+# ─── REALITY 伪装配置 ───
 reality_mode: true
-server_cert: "cert.pem"          # TLS 证书
-server_key:  "key.pem"           # TLS 私钥
+reality_enabled: true
+server_cert: "cert.pem"            # 服务端私有签名证书
+server_key: "key.pem"              # 服务端私有签名私钥
+# 预设的 SPKI 证书哈希，可替换为你自签证书的 SPKI 哈希
+reality_spki: "804d9c7922d9c491aefbe7f2da4930bfae498cda692994ea9a9fefb0f2ea99cb"
+reality_short_id: 1002             # 4字节随机正整数 ID 标识，防侦测攻击
+reality_max_time: 0                # 时间戳校验最大容差秒数，0 表示不限制
 
-# ─── 反检测参数 ───
-fingerprint: "chrome_win"        # 可选：chrome_win / firefox_mac / curl_linux
-padding_mode: "random"           # 可选：none / fixed / random
+# ─── 抗检测主动防御 ───
+fingerprint: "chrome_win"          # 伪装客户端指纹类型：chrome_win / firefox_mac / curl_linux
+padding_mode: "random"             # 数据帧填充策略：none / fixed / random
+base_payload_size: 1400            # 数据帧基线载荷大小 (字节)
+max_payload_size: 1452             # 最大数据帧大小 (字节)
+timing_jitter_ms: 30.0             # 流量发送的时间轴随机扰动上限 (毫秒)
+
+# ─── 连接与性能控制 ───
+max_clients: 1000                  # 最大并发客户端会话数量
+stream_window: 1048576             # 数据流窗口大小 (字节，1MB)
+keepalive_interval: "30s"          # 存活心跳发送周期
+handshake_timeout: "10s"           # 握手最大超时时间
+
+# ─── 后端路由与转发（上游） ───
+destinations:
+  - name: "direct"
+    addr: "127.0.0.1:8080"         # 服务端中转或直连后端的落地服务地址
+    protocol: "direct"
+    rule: "all"
+    priority: 0
+```
+
+#### 🔹 客户端 (`client.quic.yaml`)
+```yaml
+# 服务端公网地址与监听端口
+server_addr: "your-server-ip:443"
+transport: "QUIC"
+cipher_suite: 1                    # 必须与服务端配置相同
+password: "your-strong-random-password-here"
+
+# ─── REALITY 抗探测握手 ───
+reality_mode: true
+sni_spoof: "www.google.com"        # 伪装的目标 SNI 域名（建议选择免流或访问频次极高的域名）
+# 填入服务端生成的 SPKI 哈希用于客户端主动强校验防 MITM 中间人探测
+reality_spki: "804d9c7922d9c491aefbe7f2da4930bfae498cda692994ea9a9fefb0f2ea99cb"
+reality_short_id: 1002             # 必须与服务端配置相同
+reality_max_time: 0
+
+# ─── 抗检测主动防御 ───
+fingerprint: "chrome_win"
+padding_mode: "random"
 base_payload_size: 1400
+max_payload_size: 1452
+direction_balance: true            # 开启双向流量伪造平衡，对抗非对称流量分析
 timing_jitter_ms: 30.0
 
-# ─── 上游目标 ───
+# ─── 连接优化参数 ───
+keepalive_interval: "30s"
+handshake_timeout: "10s"
+stream_window: 1048576
+max_concurrent_streams: 100
+session_lifetime: "1h"             # 临时密钥会话最大生命周期 (自动定期重协商)
+dial_timeout: "15s"
+
+# ─── 本地监听代理代理 ───
+listen_addr: "127.0.0.1:1080"      # 本地暴露出的科学上网服务接口
+proxy_protocol: "socks5"           # 支持 socks5 或 http
+```
+
+---
+
+### 2. WebSocket (WSS) 模式
+
+将加密流量包装在标准 HTTP WebSocket 升级链接内，可配合 Nginx / Caddy 等反向代理进行 HTTPS 流量伪装。
+
+#### 🔹 服务端 (`server.ws.yaml`)
+```yaml
+listen_addr: "127.0.0.1:8080"      # 推荐监听在本地，用外部 Nginx 暴露 443 并配置 HTTPS TLS
+transport: "WebSocket"
+cipher_suite: 1
+password: "your-strong-random-password-here"
+
+# ─── WebSocket 参数 ───
+wss_path: "/v2/connection"         # WebSocket 升级所用的指定伪装请求路径，防主动探测
+
+# ─── 抗检测主动防御 ───
+fingerprint: "firefox_mac"
+padding_mode: "random"
+timing_jitter_ms: 15.0
+
+# ─── 后端路由与转发 ───
 destinations:
   - name: "direct"
     addr: "127.0.0.1:8080"
@@ -192,32 +276,82 @@ destinations:
     rule: "all"
 ```
 
-### 客户端配置（`client.yaml`）
-
+#### 🔹 客户端 (`client.ws.yaml`)
 ```yaml
-# 服务端地址
-server_addr: "your-server.com:443"
-
-transport: "QUIC"
+server_addr: "your-server-domain.com:443" # 如果使用反代，请指向反向代理的公网域名和 HTTPS 端口
+transport: "WebSocket"
 cipher_suite: 1
-password: "your-strong-random-password"
+password: "your-strong-random-password-here"
 
-# ─── REALITY 模式 ───
-sni_spoof: "www.google.com"      # 伪装 SNI
-reality_mode: true
-reality_spki: "服务端证书 SPKI 哈希（64位十六进制）"
+# ─── WebSocket 升级配置 ───
+wss_path: "/v2/connection"         # 必须与服务端配置完全相同
 
-# ─── 本地代理 ───
+# ─── TLS 伪装指纹 ───
+reality_mode: false                # WSS 模式不使用自签 REALITY 握手
+sni_spoof: "your-server-domain.com"
+fingerprint: "firefox_mac"
+padding_mode: "random"
+direction_balance: false
+
+# ─── 本地监听代理代理 ───
 listen_addr: "127.0.0.1:1080"
-proxy_protocol: "socks5"         # 或 http
+proxy_protocol: "socks5"
 ```
 
-> **获取 SPKI 哈希：**
-> ```bash
-> openssl x509 -in cert.pem -pubkey -noout \
->   | openssl pkey -pubout -outform DER 2>/dev/null \
->   | sha256sum | cut -c1-64
-> ```
+---
+
+### 3. HTTP-POST 模式
+
+采用完全合法的标准 HTTP/1.1 POST 大文件上传或媒体流传输行为欺骗检测引擎。
+
+#### 🔹 服务端 (`server.http.yaml`)
+```yaml
+listen_addr: "0.0.0.0:80"          # 监听普通 HTTP 80 端口，模拟正常的免密明文或代理上传
+transport: "HTTP-POST"
+cipher_suite: 2                    # 推荐选用 AES-256-GCM 保护载荷
+password: "your-strong-random-password-here"
+
+# ─── 后端路由与转发 ───
+destinations:
+  - name: "direct"
+    addr: "127.0.0.1:8080"
+    protocol: "direct"
+    rule: "all"
+```
+
+#### 🔹 客户端 (`client.http.yaml`)
+```yaml
+server_addr: "your-server-ip:80"
+transport: "HTTP-POST"
+cipher_suite: 2
+password: "your-strong-random-password-here"
+
+# ─── HTTP-POST 镜像流量伪装 ───
+upload_url: "http://your-server-ip/api/v1/storage/upload" # 客户端请求大文件上传的模拟完整 URL
+mirror_boundary: "----WebKitFormBoundaryT8z736aFmE1yB"     # 伪装 MIME Web 浏览器文件上传分界线
+mirror_path: "/api/v1/storage/upload"                     # 服务端镜像处理的 HTTP 请求资源路径
+
+# ─── 本地监听代理代理 ───
+listen_addr: "127.0.0.1:1080"
+proxy_protocol: "socks5"
+```
+
+---
+
+> 💡 **小贴士：如何生成专用的自签证书并获取 SPKI 哈希？**
+>
+> 1. **生成私钥与自签证书**：
+>    ```bash
+>    openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -sha256 -days 3650 -nodes -subj "/CN=www.google.com"
+>    ```
+> 2. **一键提取 SPKI 哈希**（将其填入服务端和客户端的 `reality_spki`）：
+>    ```bash
+>    openssl x509 -in cert.pem -pubkey -noout \
+>      | openssl pkey -pubout -outform DER 2>/dev/null \
+>      | sha256sum | cut -c1-64
+>    ```
+
+---
 
 ---
 
