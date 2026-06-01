@@ -14,7 +14,6 @@ import (
 	"meridian/pkg/anti"
 	"meridian/pkg/config"
 	"meridian/pkg/crypto"
-	"meridian/pkg/mtp"
 )
 
 func main() {
@@ -88,9 +87,9 @@ func flagParse() (cfgPath, listen string, showFP bool) {
 
 // Client manages the Meridian upstream connection and the local SOCKS5 proxy.
 type Client struct {
-	cfg   config.ClientConfig
-	udp   *net.UDPConn
-	proxy *Socks5Server
+	cfg    config.ClientConfig
+	tunnel *TunnelClient
+	proxy  *Socks5Server
 }
 
 // NewClient initialises a Client, generating a session ID if none is set.
@@ -108,50 +107,26 @@ func NewClient(cfg config.ClientConfig) (*Client, error) {
 // Start performs the initial handshake with the Meridian server and
 // starts the SOCKS5 proxy listener.
 func (c *Client) Start() error {
-	// ── Step 1: Generate ephemeral ECDHE key pair ─────────────────────────
-	ek, err := crypto.GenerateKeyPair()
-	if err != nil {
-		return fmt.Errorf("client: key generation failed: %w", err)
+	// Start secure multiplexed tunnel over TCP
+	tunnel := NewTunnelClient(c.cfg)
+	useTunnel := true
+	if err := tunnel.Connect(); err != nil {
+		fmt.Printf("  [Tunnel] Warning: failed to establish encrypted tunnel (%v). Falling back to direct-dial mode.\n", err)
+		useTunnel = false
+	} else {
+		c.tunnel = tunnel
 	}
-
-	cr, err := crypto.GenerateRandom(32)
-	if err != nil {
-		return fmt.Errorf("client: failed to generate client random: %w", err)
-	}
-	var crArr [32]byte
-	copy(crArr[:], cr)
-
-	// ── Step 2: Build ClientHello ─────────────────────────────────────────
-	_, err = mtp.BuildClientHello(c.cfg, &crArr, ek.PubKey)
-	if err != nil {
-		return fmt.Errorf("client: BuildClientHello failed: %w", err)
-	}
-
-	// ── Step 3: Dial Meridian server (QUIC/UDP) ───────────────────────────
-	host, port, err := net.SplitHostPort(c.cfg.ServerAddr)
-	if err != nil {
-		host = c.cfg.ServerAddr
-		port = "443"
-	}
-	udp, err := net.DialUDP("udp", nil, &net.UDPAddr{
-		IP:   net.ParseIP(host),
-		Port: mustParsePort(port),
-	})
-	if err != nil {
-		return fmt.Errorf("client: failed to dial server: %w", err)
-	}
-	c.udp = udp
-	fmt.Printf("  [Tunnel] Connected to Meridian server at %s\n", c.cfg.ServerAddr)
 
 	// ── Step 4: Start SOCKS5 proxy ────────────────────────────────────────
-	// dialFn uses publicDialer (8.8.8.8 / 1.1.1.1 over UDP and TCP) to resolve external hostnames.
-	// If public DNS query fails or is blocked, it automatically falls back to system DNS.
 	dialFn := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if useTunnel && c.tunnel != nil {
+			return c.tunnel.DialStream(ctx, addr)
+		}
+		// Direct dial fallback if tunnel failed
 		conn, err := publicDialer.DialContext(ctx, network, addr)
 		if err == nil {
 			return conn, nil
 		}
-		// Fallback to system resolver
 		return (&net.Dialer{
 			Timeout:   15 * time.Second,
 			KeepAlive: 30 * time.Second,
@@ -162,13 +137,13 @@ func (c *Client) Start() error {
 	return c.proxy.Start()
 }
 
-// Stop closes the upstream UDP connection and the SOCKS5 listener.
+// Stop closes the upstream tunnel connection and the SOCKS5 listener.
 func (c *Client) Stop() {
 	if c.proxy != nil {
 		c.proxy.Stop()
 	}
-	if c.udp != nil {
-		c.udp.Close()
+	if c.tunnel != nil {
+		c.tunnel.Close()
 	}
 }
 

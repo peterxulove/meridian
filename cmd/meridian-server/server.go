@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -45,6 +46,8 @@ func (s *Server) Start() error {
 	if s.cfg.Transport == config.TransportWebSocket {
 		return s.startWS()
 	}
+	// Start TCP Tunnel listener concurrently for reliable proxying
+	go s.startTCP()
 	return s.startQUIC()
 }
 
@@ -210,3 +213,223 @@ var (
 	_ = mtp.BuildClientHello
 	_ = mfp.NewFramePool
 )
+
+func (s *Server) startTCP() {
+	ln, err := net.Listen("tcp", s.cfg.ListenAddr)
+	if err != nil {
+		fmt.Printf("  [TCP] Listen error on %s: %v\n", s.cfg.ListenAddr, err)
+		return
+	}
+	defer ln.Close()
+	fmt.Printf("  [TCP] Listening on %s (tunnel server)\n", s.cfg.ListenAddr)
+
+	for {
+		if s.stopped.Load() {
+			break
+		}
+		conn, err := ln.Accept()
+		if err != nil {
+			continue
+		}
+		go s.handleTCPTunnel(conn)
+	}
+}
+
+func (s *Server) handleTCPTunnel(conn net.Conn) {
+	defer conn.Close()
+
+	// ── MTP Handshake (Server Side) ───────────────────────────────────────
+	buf := make([]byte, 1024)
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	n, err := io.ReadAtLeast(conn, buf, 120) // min ClientHello size
+	if err != nil {
+		return
+	}
+	conn.SetReadDeadline(time.Time{})
+
+	hs, err := mtp.ParseClientHello(buf[:n])
+	if err != nil {
+		fmt.Printf("  [TCP Handshake] Parse error from %s: %v\n", conn.RemoteAddr(), err)
+		return
+	}
+
+	serverEK, err := crypto.GenerateKeyPair()
+	if err != nil {
+		return
+	}
+
+	shared, err := crypto.SharedKey(
+		&crypto.KeyPair{PrivKey: serverEK.PrivKey},
+		hs.ClientECDHE,
+	)
+	if err != nil {
+		return
+	}
+
+	serverRandomBytes, err := crypto.GenerateRandom(32)
+	if err != nil {
+		return
+	}
+	var serverRandom [32]byte
+	copy(serverRandom[:], serverRandomBytes)
+
+	keys, err := crypto.DeriveKeys(shared, hs.ClientRandom, serverRandom)
+	if err != nil {
+		return
+	}
+
+	// Build & Send ServerHello
+	sh := buildServerHello(serverEK.PubKey, serverRandomBytes, hs.ClientID)
+	if _, err := conn.Write(sh); err != nil {
+		return
+	}
+
+	fmt.Printf("  [TCP Handshake] OK from %s cipher=MERIDIAN-CHACHA\n", conn.RemoteAddr())
+
+	// Create Encoder and Decoder
+	enc := mfp.NewDownlinkEncoder(keys)
+	dec := mfp.NewUplinkDecoder(keys)
+
+	// Map of active StreamID -> target connection
+	activeStreams := make(map[uint32]net.Conn)
+	var mu sync.Mutex // protects activeStreams
+	var writeMu sync.Mutex // protects concurrent writing to conn
+
+	defer func() {
+		mu.Lock()
+		for _, c := range activeStreams {
+			c.Close()
+		}
+		mu.Unlock()
+	}()
+
+	// Loop to read and dispatch MFP frames from client
+	for {
+		frameData, err := readTCPFrame(conn)
+		if err != nil {
+			return // Client disconnected
+		}
+
+		frame, err := dec.Decode(frameData)
+		if err != nil {
+			continue
+		}
+
+		sid := frame.Header.StreamID
+
+		if frame.Header.Type == mfp.TypeRESET {
+			mu.Lock()
+			tc, exists := activeStreams[sid]
+			if exists {
+				tc.Close()
+				delete(activeStreams, sid)
+			}
+			mu.Unlock()
+			continue
+		}
+
+		if frame.Header.Type == mfp.TypeDATA {
+			flags := frame.Header.Flags
+			if flags == 0x01 {
+				// CONNECT stream request
+				targetAddr := string(frame.Data)
+				go func(streamID uint32, addr string) {
+					// Perform dial directly on server (resolving DNS on server side!)
+					targetConn, err := net.DialTimeout("tcp", addr, 10*time.Second)
+					if err != nil {
+						writeMu.Lock()
+						respFrame, _ := enc.Encode(streamID, 0x08, []byte(err.Error()))
+						conn.Write(respFrame)
+						writeMu.Unlock()
+						return
+					}
+
+					mu.Lock()
+					activeStreams[streamID] = targetConn
+					mu.Unlock()
+
+					// Send CONNECT SUCCESS frame (Flags = 0x01)
+					writeMu.Lock()
+					respFrame, _ := enc.Encode(streamID, 0x01, []byte("OK"))
+					conn.Write(respFrame)
+					writeMu.Unlock()
+
+					// Start bidirectional relay
+					go func() {
+						defer func() {
+							targetConn.Close()
+							mu.Lock()
+							delete(activeStreams, streamID)
+							mu.Unlock()
+							// Send RESET to client
+							writeMu.Lock()
+							rf, _ := enc.Encode(streamID, mfp.TypeRESET, nil)
+							conn.Write(rf)
+							writeMu.Unlock()
+						}()
+
+						relayBuf := make([]byte, 32*1024)
+						for {
+							rn, err := targetConn.Read(relayBuf)
+							if err != nil {
+								return
+							}
+
+							writeMu.Lock()
+							df, err := enc.Encode(streamID, 0x00, relayBuf[:rn])
+							if err == nil {
+								conn.Write(df)
+							}
+							writeMu.Unlock()
+
+							if err != nil {
+								return
+							}
+						}
+					}()
+				}(sid, targetAddr)
+			} else {
+				// Standard DATA frame
+				mu.Lock()
+				targetConn, exists := activeStreams[sid]
+				mu.Unlock()
+
+				if exists {
+					go targetConn.Write(frame.Data)
+				}
+			}
+		}
+	}
+}
+
+func buildServerHello(serverEKPub, serverRandom []byte, clientID [16]byte) []byte {
+	buf := new(bytes.Buffer)
+	binary.Write(buf, binary.BigEndian, uint32(0xDeadBeEF))
+	buf.WriteByte(1) // version
+	buf.WriteByte(0) // status = accept
+	buf.Write(serverRandom)
+	buf.Write(serverEKPub)
+	buf.Write(make([]byte, 32)) // server hash placeholder
+	binary.Write(buf, binary.BigEndian, uint16(1)) // cipher = CHACHA
+	buf.Write(make([]byte, 32)) // cert hash placeholder
+	buf.Write(clientID[:])
+	binary.Write(buf, binary.BigEndian, uint32(3600)) // session lifetime
+	buf.Write([]byte{0, 0, 0, 0}) // hash tag
+	return buf.Bytes()
+}
+
+// readTCPFrame reads a complete MFP frame (header + encrypted payload + auth tag) from r.
+func readTCPFrame(r io.Reader) ([]byte, error) {
+	header := make([]byte, 14)
+	if _, err := io.ReadFull(r, header); err != nil {
+		return nil, err
+	}
+	payloadLen := binary.BigEndian.Uint16(header[1:3])
+	// Payload ciphertext is followed by 16-byte Poly1305 Auth Tag
+	frameData := make([]byte, 14+int(payloadLen)+16)
+	copy(frameData[0:14], header)
+	if _, err := io.ReadFull(r, frameData[14:]); err != nil {
+		return nil, err
+	}
+	return frameData, nil
+}
