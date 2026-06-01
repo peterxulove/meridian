@@ -1,5 +1,4 @@
-# Binaries
-dist/
+# Binaries (only root-level, not dist/)
 *.exe
 *.dll
 *.so
