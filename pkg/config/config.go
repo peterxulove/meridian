@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -75,7 +76,8 @@ type ClientConfig struct {
 	// REALITY / SNI
 	SNISpoof        string            `yaml:"sni_spoof" json:"sni_spoof"`
 	RealityMode     bool              `yaml:"reality_mode" json:"reality_mode"`
-	RealitySPKIHash []byte            `yaml:"reality_spki" json:"-"`
+	RealitySPKIHex  string            `yaml:"reality_spki" json:"reality_spki"`
+	RealitySPKIHash []byte            `yaml:"-" json:"-"`
 	RealityShortID  uint32            `yaml:"reality_short_id" json:"reality_short_id"`
 	RealityMaxTime  uint64            `yaml:"reality_max_time" json:"reality_max_time"`
 	ServerCertFile  string             `yaml:"server_cert" json:"server_cert"`
@@ -122,7 +124,8 @@ type ServerConfig struct {
 	RealityMode     bool   `yaml:"reality_mode" json:"reality_mode"`
 	ServerCertFile  string `yaml:"server_cert" json:"server_cert"`
 	ServerKeyFile   string `yaml:"server_key" json:"server_key"`
-	ServerSPKIHash  []byte `yaml:"server_spki" json:"-"`
+	ServerSPKIHex   string `yaml:"server_spki" json:"server_spki"`
+	ServerSPKIHash  []byte `yaml:"-" json:"-"`
 	RealityShortID  uint32 `yaml:"reality_short_id" json:"reality_short_id"`
 	RealityMaxTime  uint64 `yaml:"reality_max_time" json:"reality_max_time"`
 	RealityEnabled  bool   `yaml:"reality_enabled" json:"reality_enabled"`
@@ -230,6 +233,13 @@ func LoadClientConfig(path string) (ClientConfig, error) {
 			)
 		}
 	}
+	if cfg.RealitySPKIHex != "" {
+		hash, err := hex.DecodeString(cfg.RealitySPKIHex)
+		if err != nil {
+			return cfg, fmt.Errorf("config: invalid reality_spki hex: %v", err)
+		}
+		cfg.RealitySPKIHash = hash
+	}
 	return cfg, nil
 }
 
@@ -248,6 +258,13 @@ func LoadServerConfig(path string) (ServerConfig, error) {
 				path, yamlErr, jsonErr,
 			)
 		}
+	}
+	if cfg.ServerSPKIHex != "" {
+		hash, err := hex.DecodeString(cfg.ServerSPKIHex)
+		if err != nil {
+			return cfg, fmt.Errorf("config: invalid server_spki hex: %v", err)
+		}
+		cfg.ServerSPKIHash = hash
 	}
 	return cfg, nil
 }
