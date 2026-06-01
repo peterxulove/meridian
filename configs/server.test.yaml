@@ -1,0 +1,32 @@
+# Meridian Server — Local Test Configuration (no TLS cert required)
+# ================================================================
+
+listen_addr: "127.0.0.1:15443"
+transport: "QUIC"
+cipher_suite: 1
+password: "test-password-local"
+
+# Disable REALITY mode for local testing (no cert needed)
+reality_mode: false
+reality_enabled: false
+
+# Anti-Detection (relaxed for testing)
+fingerprint: "chrome_win"
+padding_mode: "none"
+base_payload_size: 1400
+max_payload_size: 1452
+timing_jitter_ms: 0.0
+
+# Connection Limits
+max_clients: 100
+stream_window: 1048576
+keepalive_interval: "30s"
+handshake_timeout: "10s"
+
+# Upstream
+destinations:
+  - name: "direct"
+    addr: "127.0.0.1:8080"
+    protocol: "direct"
+    rule: "all"
+    priority: 0

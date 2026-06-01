@@ -1,0 +1,34 @@
+# Meridian Client — Example Configuration (REALITY mode)
+# ======================================================
+
+server_addr: "server.example.com:443"
+transport: "QUIC"
+cipher_suite: 1
+password: "your-strong-random-password-here"
+
+# ─── REALITY Mode (anti-detection) ───
+sni_spoof: "www.google.com"
+reality_mode: true
+reality_spki: "0000000000000000000000000000000000000000000000000000000000000000"
+reality_short_id: 0
+reality_max_time: 0
+
+# ─── Anti-Detection ───
+fingerprint: "chrome_win"
+padding_mode: "random"
+base_payload_size: 1400
+max_payload_size: 1452
+direction_balance: false
+timing_jitter_ms: 30.0
+
+# ─── Connection ───
+keepalive_interval: "30s"
+handshake_timeout: "10s"
+stream_window: 1048576
+max_concurrent_streams: 100
+session_lifetime: "1h"
+dial_timeout: "15s"
+
+# ─── Local Proxy ───
+listen_addr: "127.0.0.1:1080"
+proxy_protocol: "socks5"

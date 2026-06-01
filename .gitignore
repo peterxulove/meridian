@@ -1,0 +1,47 @@
+# Binaries
+dist/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Go build cache
+*.test
+*.out
+
+# Go module download cache
+vendor/
+
+# Compiled root-level binaries (produced by go build in project root)
+/meridian-client
+/meridian-server
+
+# Config files with real credentials (keep example files)
+configs/*.yaml
+!configs/*.example.yaml
+!configs/*.test.yaml
+
+# OS generated
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+
+# TLS certs (never commit private keys)
+*.pem
+*.key
+*.crt
+*.p12

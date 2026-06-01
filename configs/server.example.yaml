@@ -1,0 +1,39 @@
+# Meridian Server — Example Configuration (REALITY mode)
+# ======================================================
+
+listen_addr: "0.0.0.0:443"
+transport: "QUIC"
+cipher_suite: 1
+password: "your-strong-random-password-here"
+
+# ─── REALITY Mode (anti-detection) ───
+reality_mode: true
+reality_enabled: true
+server_cert: "cert.pem"
+server_key: "key.pem"
+# Generate SPKI hash from your server cert:
+# openssl x509 -in cert.pem -pubkey -noout | openssl pkey -pubout -outform DER 2>/dev/null | sha256sum | cut -c1-64
+reality_spki: "0000000000000000000000000000000000000000000000000000000000000000"
+reality_short_id: 0
+reality_max_time: 0
+
+# ─── Anti-Detection ───
+fingerprint: "chrome_win"
+padding_mode: "random"
+base_payload_size: 1400
+max_payload_size: 1452
+timing_jitter_ms: 30.0
+
+# ─── Connection Limits ───
+max_clients: 1000
+stream_window: 1048576
+keepalive_interval: "30s"
+handshake_timeout: "10s"
+
+# ─── Upstream ───
+destinations:
+  - name: "direct"
+    addr: "127.0.0.1:8080"
+    protocol: "direct"
+    rule: "all"
+    priority: 0
