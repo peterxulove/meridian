@@ -1,5 +1,7 @@
 # Meridian Client — Local Test Configuration
 # ==========================================
+# listen_addr: 0.0.0.0:1080 — serves the entire LAN (all devices on the same network)
+# listen_addr: 127.0.0.1:1080 — localhost only
 
 server_addr: "127.0.0.1:15443"
 transport: "QUIC"
@@ -28,6 +30,6 @@ max_concurrent_streams: 100
 session_lifetime: "1h"
 dial_timeout: "15s"
 
-# Local Proxy
-listen_addr: "127.0.0.1:11080"
-proxy_protocol: "socks5"
+# Local SOCKS5 Proxy
+# 0.0.0.0 allows all LAN devices (phones, tablets, other PCs) to connect
+listen_addr: "0.0.0.0:1080"

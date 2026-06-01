@@ -29,6 +29,8 @@ max_concurrent_streams: 100
 session_lifetime: "1h"
 dial_timeout: "15s"
 
-# ─── Local Proxy ───
-listen_addr: "127.0.0.1:1080"
+# ─── Local SOCKS5 Proxy ───
+# 0.0.0.0 — all LAN devices (phones, tablets, other computers) can connect
+# 127.0.0.1 — this machine only
+listen_addr: "0.0.0.0:1080"
 proxy_protocol: "socks5"
