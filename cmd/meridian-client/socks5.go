@@ -56,28 +56,36 @@ const (
 	maxConcurrent = 512
 )
 
-// publicResolver is a net.Resolver that uses public DNS servers (8.8.8.8 + 1.1.1.1)
-// instead of the system's local resolver. It tries UDP first, then falls back to TCP
-// if UDP is blocked by local firewalls or ISP restrictions.
+var dnsServers = []string{
+	"223.5.5.5:53",       // AliDNS (China)
+	"119.29.29.29:53",    // DNSPod (China)
+	"114.114.114.114:53", // 114DNS (China)
+	"8.8.8.8:53",         // Google DNS
+	"1.1.1.1:53",         // Cloudflare DNS
+}
+
+// publicResolver is a net.Resolver that uses public DNS servers (AliDNS, Tencent, Google, Cloudflare)
+// to avoid local DNS failures. It tries UDP first, then TCP fallback with a fast 1-second timeout per server
+// to prevent lookup hangs in case certain servers are blocked.
 var publicResolver = &net.Resolver{
 	PreferGo: true,
 	Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
-		d := net.Dialer{Timeout: 3 * time.Second}
-		// Try UDP first (8.8.8.8 then 1.1.1.1)
-		conn, err := d.DialContext(ctx, "udp", "8.8.8.8:53")
-		if err == nil {
-			return conn, nil
+		d := net.Dialer{Timeout: 1 * time.Second}
+		// Try UDP first
+		for _, server := range dnsServers {
+			conn, err := d.DialContext(ctx, "udp", server)
+			if err == nil {
+				return conn, nil
+			}
 		}
-		conn, err = d.DialContext(ctx, "udp", "1.1.1.1:53")
-		if err == nil {
-			return conn, nil
+		// Try TCP fallback
+		for _, server := range dnsServers {
+			conn, err := d.DialContext(ctx, "tcp", server)
+			if err == nil {
+				return conn, nil
+			}
 		}
-		// Fall back to TCP DNS (8.8.8.8 then 1.1.1.1)
-		conn, err = d.DialContext(ctx, "tcp", "8.8.8.8:53")
-		if err == nil {
-			return conn, nil
-		}
-		return d.DialContext(ctx, "tcp", "1.1.1.1:53")
+		return nil, fmt.Errorf("all public DNS resolvers timed out or failed")
 	},
 }
 
