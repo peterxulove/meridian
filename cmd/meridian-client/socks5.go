@@ -5,6 +5,8 @@
 //   - Supports CONNECT command (TCP tunnel) for all destination types
 //   - Supports DOMAIN NAME, IPv4, and IPv6 target address types
 //   - Optionally enforces username/password authentication (RFC 1929)
+//   - Uses public DNS (8.8.8.8 + 1.1.1.1) to avoid local DNS resolution failures
+//   - Limits concurrent connections via a semaphore to avoid "too many open files"
 //   - Forwards traffic through the Meridian encrypted tunnel to the server
 package main
 
@@ -14,7 +16,9 @@ import (
 	"io"
 	"net"
 	"os"
+	"runtime"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -31,20 +35,74 @@ const (
 	cmdConnect = 0x01
 
 	// Address types
-	addrIPv4   = 0x01
-	addrDomain = 0x03
-	addrIPv6   = 0x04
+	addrIPv4         = 0x01
+	addrDomain       = 0x03
+	addrIPv6         = 0x04
 
 	// Reply codes
-	replySuccess         = 0x00
-	replyGeneralFailure  = 0x01
-	replyNotAllowed      = 0x02
-	replyNetUnreachable  = 0x03
-	replyHostUnreachable = 0x04
-	replyConnRefused     = 0x05
-	replyCmdNotSupported = 0x07
+	replySuccess          = 0x00
+	replyGeneralFailure   = 0x01
+	replyNotAllowed       = 0x02
+	replyNetUnreachable   = 0x03
+	replyHostUnreachable  = 0x04
+	replyConnRefused      = 0x05
+	replyCmdNotSupported  = 0x07
 	replyAddrNotSupported = 0x08
+
+	// maxConcurrent limits how many connections are in flight simultaneously.
+	// Prevents "too many open files" on systems with low ulimits.
+	maxConcurrent = 512
 )
+
+// publicResolver is a net.Resolver that uses public DNS servers (8.8.8.8 + 1.1.1.1)
+// instead of the system's local resolver. This fixes failures when the host's
+// /etc/resolv.conf points to a local DNS that can't resolve external hostnames
+// (e.g. "lookup xxx on 127.0.0.1:53: no such host").
+var publicResolver = &net.Resolver{
+	PreferGo: true,
+	Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+		// Try Google DNS first, fall back to Cloudflare.
+		d := net.Dialer{Timeout: 3 * time.Second}
+		conn, err := d.DialContext(ctx, "udp", "8.8.8.8:53")
+		if err != nil {
+			conn, err = d.DialContext(ctx, "udp", "1.1.1.1:53")
+		}
+		return conn, err
+	},
+}
+
+// publicDialer dials upstream connections using the public DNS resolver.
+var publicDialer = &net.Dialer{
+	Timeout:   15 * time.Second,
+	KeepAlive: 30 * time.Second,
+	Resolver:  publicResolver,
+}
+
+// RaiseFileLimit attempts to raise the OS open-file descriptor limit to at least
+// target. It is a best-effort call; failures are logged but not fatal.
+func RaiseFileLimit(target uint64) {
+	if runtime.GOOS == "windows" {
+		return // Windows does not use POSIX rlimits
+	}
+	var rl syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rl); err != nil {
+		logf("[sys] getrlimit failed: %v", err)
+		return
+	}
+	if rl.Cur >= target {
+		return // already high enough
+	}
+	original := rl.Cur
+	rl.Cur = target
+	if rl.Max < target {
+		rl.Max = target
+	}
+	if err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rl); err != nil {
+		logf("[sys] could not raise open-file limit from %d to %d: %v (run with sudo or set 'ulimit -n %d' before starting)", original, target, err, target)
+		return
+	}
+	logf("[sys] open-file limit raised from %d → %d", original, target)
+}
 
 // Socks5Server is a SOCKS5 proxy server that forwards connections through
 // the Meridian encrypted tunnel.
@@ -56,6 +114,7 @@ type Socks5Server struct {
 	listener   net.Listener
 	stopOnce   sync.Once
 	wg         sync.WaitGroup
+	sem        chan struct{} // concurrency limiter
 
 	// Stats
 	mu       sync.Mutex
@@ -63,6 +122,7 @@ type Socks5Server struct {
 	total    uint64
 	bytesIn  uint64
 	bytesOut uint64
+	failed   uint64
 }
 
 // NewSocks5Server creates a new SOCKS5 server.
@@ -74,6 +134,7 @@ func NewSocks5Server(listenAddr, username, password string, dialFn func(ctx cont
 		username:   username,
 		password:   password,
 		dial:       dialFn,
+		sem:        make(chan struct{}, maxConcurrent),
 	}
 }
 
@@ -84,7 +145,7 @@ func (s *Socks5Server) Start() error {
 		return fmt.Errorf("socks5: listen %s: %w", s.listenAddr, err)
 	}
 	s.listener = ln
-	fmt.Printf("  [SOCKS5] Listening on %s (serving LAN)\n", s.listenAddr)
+	fmt.Printf("  [SOCKS5] Listening on %s (LAN, max %d concurrent)\n", s.listenAddr, maxConcurrent)
 	s.wg.Add(1)
 	go s.acceptLoop()
 	return nil
@@ -101,10 +162,10 @@ func (s *Socks5Server) Stop() {
 }
 
 // Stats returns current connection metrics.
-func (s *Socks5Server) Stats() (active int, total, bytesIn, bytesOut uint64) {
+func (s *Socks5Server) Stats() (active int, total, failed, bytesIn, bytesOut uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.active, s.total, s.bytesIn, s.bytesOut
+	return s.active, s.total, s.failed, s.bytesIn, s.bytesOut
 }
 
 func (s *Socks5Server) acceptLoop() {
@@ -112,9 +173,21 @@ func (s *Socks5Server) acceptLoop() {
 	for {
 		conn, err := s.listener.Accept()
 		if err != nil {
-			// Listener closed — normal shutdown
-			return
+			return // listener closed — normal shutdown
 		}
+
+		// Acquire semaphore slot (non-blocking: drop connection if saturated).
+		select {
+		case s.sem <- struct{}{}:
+		default:
+			conn.Close()
+			s.mu.Lock()
+			s.failed++
+			s.mu.Unlock()
+			logf("[warn] connection limit reached (%d), dropped %s", maxConcurrent, conn.RemoteAddr())
+			continue
+		}
+
 		s.mu.Lock()
 		s.active++
 		s.total++
@@ -123,6 +196,7 @@ func (s *Socks5Server) acceptLoop() {
 		go func(c net.Conn) {
 			defer func() {
 				c.Close()
+				<-s.sem // release slot
 				s.mu.Lock()
 				s.active--
 				s.mu.Unlock()
@@ -159,7 +233,7 @@ func (s *Socks5Server) handleConn(conn net.Conn) {
 
 	logf("socks5: [%s] → %s", conn.RemoteAddr(), target)
 
-	// ── Phase 4: dial upstream (Meridian tunnel or direct) ────────────────
+	// ── Phase 4: dial upstream using public DNS ────────────────────────────
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
@@ -167,23 +241,25 @@ func (s *Socks5Server) handleConn(conn net.Conn) {
 	if err != nil {
 		logf("socks5: [%s] dial %s failed: %v", conn.RemoteAddr(), target, err)
 		s.writeReply(conn, replyHostUnreachable, nil)
+		s.mu.Lock()
+		s.failed++
+		s.mu.Unlock()
 		return
 	}
 	defer upstream.Close()
 
 	// ── Phase 5: send success reply ────────────────────────────────────────
-	localAddr := upstream.LocalAddr().(*net.TCPAddr)
+	localAddr, _ := upstream.LocalAddr().(*net.TCPAddr)
 	s.writeReply(conn, replySuccess, localAddr)
 
 	// ── Phase 6: relay traffic bidirectionally ────────────────────────────
-	conn.SetDeadline(time.Time{}) // remove deadline for data phase
+	conn.SetDeadline(time.Time{})    // remove deadline for data phase
 	upstream.SetDeadline(time.Time{})
 	s.relay(conn, upstream)
 }
 
 // negotiate sends the supported auth methods and selects one.
 func (s *Socks5Server) negotiate(conn net.Conn) error {
-	// Read VER + NMETHODS
 	header := make([]byte, 2)
 	if _, err := io.ReadFull(conn, header); err != nil {
 		return err
@@ -197,10 +273,8 @@ func (s *Socks5Server) negotiate(conn net.Conn) error {
 		return err
 	}
 
-	// Choose method
 	chosen := byte(authNoAccept)
 	if s.username == "" {
-		// No auth required — accept if client offers method 0
 		for _, m := range methods {
 			if m == authNone {
 				chosen = authNone
@@ -208,7 +282,6 @@ func (s *Socks5Server) negotiate(conn net.Conn) error {
 			}
 		}
 	} else {
-		// Username/password auth
 		for _, m := range methods {
 			if m == authPassword {
 				chosen = authPassword
@@ -229,12 +302,10 @@ func (s *Socks5Server) negotiate(conn net.Conn) error {
 
 // authenticate performs RFC 1929 username/password authentication.
 func (s *Socks5Server) authenticate(conn net.Conn) error {
-	// Sub-negotiation version
 	ver := make([]byte, 1)
 	if _, err := io.ReadFull(conn, ver); err != nil {
 		return err
 	}
-	// Read username
 	ulenBuf := make([]byte, 1)
 	if _, err := io.ReadFull(conn, ulenBuf); err != nil {
 		return err
@@ -243,7 +314,6 @@ func (s *Socks5Server) authenticate(conn net.Conn) error {
 	if _, err := io.ReadFull(conn, uname); err != nil {
 		return err
 	}
-	// Read password
 	plenBuf := make([]byte, 1)
 	if _, err := io.ReadFull(conn, plenBuf); err != nil {
 		return err
@@ -263,7 +333,6 @@ func (s *Socks5Server) authenticate(conn net.Conn) error {
 
 // readRequest reads the SOCKS5 CONNECT request and returns "host:port".
 func (s *Socks5Server) readRequest(conn net.Conn) (string, error) {
-	// VER CMD RSV ATYP
 	header := make([]byte, 4)
 	if _, err := io.ReadFull(conn, header); err != nil {
 		return "", err
@@ -272,12 +341,10 @@ func (s *Socks5Server) readRequest(conn net.Conn) (string, error) {
 		return "", fmt.Errorf("unexpected version %d in request", header[0])
 	}
 	if header[1] != cmdConnect {
-		// Send "command not supported" and abort
 		s.writeReply(conn, replyCmdNotSupported, nil)
 		return "", fmt.Errorf("command %d not supported (only CONNECT)", header[1])
 	}
 
-	// Parse destination address
 	var host string
 	switch header[3] {
 	case addrIPv4:
@@ -307,13 +374,11 @@ func (s *Socks5Server) readRequest(conn net.Conn) (string, error) {
 		return "", fmt.Errorf("unsupported address type %d", header[3])
 	}
 
-	// Read port (big-endian uint16)
 	portBuf := make([]byte, 2)
 	if _, err := io.ReadFull(conn, portBuf); err != nil {
 		return "", err
 	}
 	port := int(portBuf[0])<<8 | int(portBuf[1])
-
 	return fmt.Sprintf("%s:%d", host, port), nil
 }
 
@@ -326,34 +391,32 @@ func (s *Socks5Server) writeReply(conn net.Conn, code byte, boundAddr *net.TCPAd
 			ip = []byte{0, 0, 0, 0}
 		}
 		copy(reply[4:8], ip)
-		port := boundAddr.Port
-		reply[8] = byte(port >> 8)
-		reply[9] = byte(port & 0xff)
+		reply[8] = byte(boundAddr.Port >> 8)
+		reply[9] = byte(boundAddr.Port & 0xff)
 	}
 	conn.Write(reply)
 }
 
 // relay copies traffic between client and upstream connections bidirectionally.
-// It tracks byte counts for statistics.
 func (s *Socks5Server) relay(client, upstream net.Conn) {
 	done := make(chan struct{}, 2)
 
-	copy := func(dst, src net.Conn, counter *uint64) {
+	pipe := func(dst, src net.Conn, counter *uint64) {
 		defer func() { done <- struct{}{} }()
 		n, _ := io.Copy(dst, src)
 		s.mu.Lock()
 		*counter += uint64(n)
 		s.mu.Unlock()
-		// Signal the other direction to stop by closing the connection
+		// Half-close the write side so the other goroutine's Read returns EOF.
 		if tc, ok := dst.(*net.TCPConn); ok {
 			tc.CloseWrite()
+		} else {
+			dst.Close()
 		}
 	}
 
-	go copy(upstream, client, &s.bytesIn)
-	go copy(client, upstream, &s.bytesOut)
-
-	// Wait for both directions to finish (or one side closes)
+	go pipe(upstream, client, &s.bytesIn)
+	go pipe(client, upstream, &s.bytesOut)
 	<-done
 	<-done
 }

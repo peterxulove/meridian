@@ -47,6 +47,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Raise the open-file descriptor limit before starting so that the
+	// SOCKS5 proxy can handle many concurrent connections without hitting
+	// "too many open files".
+	RaiseFileLimit(65535)
+
 	sigch := make(chan os.Signal, 1)
 	signal.Notify(sigch, syscall.SIGINT, syscall.SIGTERM)
 
@@ -60,9 +65,9 @@ func main() {
 	ticker := time.NewTicker(60 * time.Second)
 	go func() {
 		for range ticker.C {
-			active, total, in, out := client.proxy.Stats()
-			fmt.Printf("  [Stats] active=%d total=%d in=%dKB out=%dKB\n",
-				active, total, in/1024, out/1024)
+			active, total, failed, in, out := client.proxy.Stats()
+			fmt.Printf("  [Stats] active=%d total=%d failed=%d in=%dKB out=%dKB\n",
+				active, total, failed, in/1024, out/1024)
 		}
 	}()
 
@@ -139,14 +144,10 @@ func (c *Client) Start() error {
 	fmt.Printf("  [Tunnel] Connected to Meridian server at %s\n", c.cfg.ServerAddr)
 
 	// ── Step 4: Start SOCKS5 proxy ────────────────────────────────────────
-	// dialFn is called for each incoming SOCKS5 CONNECT request.
-	// Currently uses a direct TCP dial; in the full implementation this
-	// will send the request through the Meridian encrypted tunnel.
+	// dialFn uses publicDialer (8.8.8.8 / 1.1.1.1) to resolve external hostnames,
+	// bypassing the system's local DNS which may not resolve public domains.
 	dialFn := func(ctx context.Context, network, addr string) (net.Conn, error) {
-		return (&net.Dialer{
-			Timeout:   15 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext(ctx, network, addr)
+		return publicDialer.DialContext(ctx, network, addr)
 	}
 
 	c.proxy = NewSocks5Server(c.cfg.ListenAddr, "", "", dialFn)
