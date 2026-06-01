@@ -1,21 +1,26 @@
 # Meridian 协议
 
-> 高性能、抗检测的安全代理协议实现
+> 高性能、抗检测的安全代理协议实现  
 > 融合 Shadowsocks、Hysteria2、VLESS 和 REALITY 的设计精华
 
 [![Go Version](https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat&logo=go)](https://golang.org)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/peterxulove/meridian)](https://github.com/peterxulove/meridian/releases)
 [![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux-lightgrey)](https://github.com/peterxulove/meridian/releases)
 [![Architecture](https://img.shields.io/badge/Arch-ARM64%20%7C%20AMD64-orange)](https://github.com/peterxulove/meridian/releases)
+
+[English README](README_EN.md)
 
 ---
 
 ## 目录
 
 - [简介](#简介)
+- [v1.0.2 更新内容](#v102-更新内容)
 - [协议架构](#协议架构)
 - [功能特性](#功能特性)
 - [快速开始](#快速开始)
+- [使用方式（局域网代理）](#使用方式局域网代理)
 - [配置说明](#配置说明)
 - [安全机制](#安全机制)
 - [编译构建](#编译构建)
@@ -39,11 +44,32 @@ Meridian 是一个自定义安全代理协议，设计目标是在恶劣的网�
 
 ---
 
+## v1.0.2 更新内容
+
+### 🆕 新增功能
+
+- **完整 SOCKS5 代理服务器**（RFC 1928 + RFC 1929）
+  - 客户端启动后自动开启 SOCKS5 代理，无需额外配置
+  - 支持 TCP CONNECT 命令，兼容所有 IPv4、IPv6、域名目标
+  - 域名由代理服务端 DNS 解析（防止 DNS 泄露）
+  - 可选的用户名/密码认证（RFC 1929），配置密码即启用
+  - 每 60 秒自动打印流量统计（活跃连接数 / 总请求数 / 收发字节数）
+  - 每个请求记录带时间戳的访问日志
+
+- **局域网代理服务**
+  - 默认监听 `0.0.0.0:1080`，局域网内所有设备均可接入
+
+### 🐛 Bug 修复
+
+- 修复配置文件中 `reality_spki` / `server_spki` 填写十六进制哈希时的 YAML 反序列化错误（`cannot unmarshal !!str into []uint8`）
+
+---
+
 ## 协议架构
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│  应用层（代理 / 中继）                                    │
+│  应用层（SOCKS5 代理 / 中继）                            │
 ├─────────────────────────────────────────────────────────┤
 │  Meridian 帧协议（MFP）                                   │
 │  ┌──────┐ ┌───────┐ ┌───────┐ ┌──────────────────┐    │
@@ -87,6 +113,14 @@ Meridian 是一个自定义安全代理协议，设计目标是在恶劣的网�
 - **方向均衡**：双向流量伪造，对抗非对称流量分析
 - **SPKI 哈希验证**：无需 CA 信任链，直接验证服务端公钥指纹
 
+### 🌐 SOCKS5 代理（v1.0.2 新增）
+
+- **RFC 1928** 完整实现：支持 IPv4 / IPv6 / 域名三种地址类型
+- **RFC 1929** 用户名密码认证：配置账号密码后自动启用
+- **局域网服务**：默认监听 `0.0.0.0:1080`，手机、平板、其他电脑均可接入
+- **实时统计**：每 60 秒打印连接数和流量数据
+- **访问日志**：`[时间] [来源IP:端口] → 目标地址:端口`
+
 ### 📦 帧协议（MFP）
 
 - 14 字节固定帧头：类型、流ID、序号、标志、扩展字段
@@ -109,49 +143,111 @@ Meridian 是一个自定义安全代理协议，设计目标是在恶劣的网�
 | Linux | ARM64（树莓派、ARM 服务器） | `meridian-*-linux-arm64` |
 | Linux | x86_64 | `meridian-*-linux-amd64` |
 
-### 服务端部署
+### 服务端部署（Linux 服务器）
 
 ```bash
-# 1. 下载服务端
-chmod +x meridian-server-linux-arm64
+# 1. 下载并赋予执行权限
+chmod +x meridian-server-linux-amd64
 
-# 2. 复制配置文件
-cp configs/server.example.yaml server.yaml
+# 2. 生成自签证书（REALITY 模式必须）
+openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem \
+  -sha256 -days 3650 -nodes -subj "/CN=www.apple.com"
 
-# 3. 编辑配置（修改密码、证书路径等）
-vim server.yaml
+# 3. 获取 SPKI 哈希（填入客户端配置）
+openssl x509 -in cert.pem -pubkey -noout \
+  | openssl pkey -pubout -outform DER 2>/dev/null \
+  | sha256sum | cut -c1-64
 
-# 4. 启动服务端
-./meridian-server-linux-arm64 -config server.yaml
+# 4. 创建配置文件
+cp server.example.yaml server.yaml
+vim server.yaml   # 填入密码、证书路径
+
+# 5. 启动服务端
+./meridian-server-linux-amd64 -config server.yaml
 ```
 
-### 客户端使用
+### 客户端使用（本机 / 局域网网关）
 
 ```bash
-# 1. 下载客户端
+# 1. 下载并赋予执行权限
 chmod +x meridian-client-darwin-arm64
 
-# 2. 复制配置文件
-cp configs/client.example.yaml client.yaml
+# 2. 创建配置文件
+cp client.example.yaml client.yaml
+vim client.yaml   # 填入服务器地址、密码、SPKI 哈希
 
-# 3. 编辑配置（填入服务器地址、密码等）
-vim client.yaml
-
-# 4. 启动客户端（本地监听 SOCKS5 代理 127.0.0.1:1080）
+# 3. 启动客户端（自动开启 SOCKS5 代理，监听 0.0.0.0:1080）
 ./meridian-client-darwin-arm64 -config client.yaml
+```
+
+启动后日志示例：
+```text
+Meridian Client v1.0.2
+  Server:    1.2.3.4:443
+  Transport: QUIC
+  Cipher:    MERIDIAN-CHACHA
+  SOCKS5:    0.0.0.0:1080
+  [Tunnel] Connected to Meridian server at 1.2.3.4:443
+  [SOCKS5] Listening on 0.0.0.0:1080 (serving LAN)
+Client running (PID 12345). Press Ctrl+C to stop.
+[2026-06-01 23:27:38] socks5: [192.168.1.5:54321] → www.google.com:443
+[2026-06-01 23:27:39] socks5: [192.168.1.8:33210] → api.twitter.com:443
+  [Stats] active=2 total=47 in=1024KB out=8192KB
 ```
 
 ### CLI 参数
 
 ```
-meridian-server / meridian-client 通用参数：
+meridian-server 参数：
+  -config string      配置文件路径（默认：server.yaml）
+  -listen string      覆盖监听地址（例如：0.0.0.0:443）
+  -fingerprints       列出所有可用 TLS 指纹并退出
 
-  -config string
-        配置文件路径（默认：server.yaml / client.yaml）
-  -listen string
-        覆盖监听地址（服务端示例：0.0.0.0:443，客户端示例：127.0.0.1:1080）
-  -fingerprints
-        列出所有可用的 TLS 指纹并退出
+meridian-client 参数：
+  -config string      配置文件路径（默认：client.yaml）
+  -listen string      覆盖 SOCKS5 监听地址（例如：0.0.0.0:1080）
+  -fingerprints       列出所有可用 TLS 指纹并退出
+```
+
+---
+
+## 使用方式（局域网代理）
+
+客户端启动后，局域网内任意设备只需将 SOCKS5 代理指向**运行客户端的主机 IP + 1080 端口**即可科学上网。
+
+### 电脑浏览器（推荐 SwitchyOmega）
+
+1. 安装 [Proxy SwitchyOmega](https://chrome.google.com/webstore/detail/proxy-switchyomega/padekgcemlokbadohgkifijomclgjgif) 插件
+2. 新建情景模式：协议 `SOCKS5`，服务器 `运行客户端的主机IP`，端口 `1080`
+3. 导入 GFWList 规则实现智能分流（被墙走代理，国内直连）
+
+### macOS 系统全局代理
+
+**系统设置 → 网络 → Wi-Fi → 详细信息 → 代理 → SOCKS 代理**
+
+填入：服务器 `主机IP`，端口 `1080`
+
+### iOS / iPadOS
+
+**设置 → Wi-Fi → 点击当前网络 → 配置代理 → 手动**
+
+填入：服务器 `主机IP`，端口 `1080`
+
+### Android
+
+**Wi-Fi 长按 → 修改网络 → 高级选项 → 代理 → 手动**
+
+填入：代理主机名 `主机IP`，代理端口 `1080`
+
+### 终端 / 命令行
+
+```bash
+# 临时为当前终端会话启用代理
+export https_proxy="socks5://主机IP:1080"
+export http_proxy="socks5://主机IP:1080"
+
+# Git 仅对 GitHub 设置代理
+git config --global http.https://github.com.proxy socks5://主机IP:1080
 ```
 
 ---
@@ -160,51 +256,47 @@ meridian-server / meridian-client 通用参数：
 
 根据所部署的网络环境，Meridian 提供了三种传输层协议的配置方案：
 
-1. **QUIC (REALITY) 模式**：基于 QUIC/UDP，使用独创的 REALITY TLS 握手机制伪装正常流量，**性能最强，抗封锁效果最好，推荐作为默认方案**。
-2. **WebSocket (WSS) 模式**：基于 TCP/TLS 升级协议，流量表现为标准的 WSS 通信，适合 UDP 受限或被 QoS 的环境。
-3. **HTTP-POST 模式**：通过 HTTP/1.1 POST 大文件或持续视频上传的流量特征，实现业务级高隐蔽通信。
+1. **QUIC (REALITY) 模式**：基于 QUIC/UDP，性能最强，抗封锁效果最好，**推荐默认方案**。
+2. **WebSocket (WSS) 模式**：基于 TCP/TLS，适合 UDP 受限环境。
+3. **HTTP-POST 模式**：模拟大文件上传，极端环境下使用。
 
 ---
 
 ### 1. QUIC (REALITY) 模式（默认推荐）
 
-使用真实的合法网站证书哈希和 TLS 伪装指纹，无需购买域名和配置公信力证书即可在客户端直接进行端到端强校验。
-
 #### 🔹 服务端 (`server.quic.yaml`)
 ```yaml
-# 监听端口（REALITY 推荐使用标准 443 端口以达到完美伪装）
 listen_addr: "0.0.0.0:443"
 transport: "QUIC"
-cipher_suite: 1                    # 加密套件：1=ChaCha20, 2=AES256, 3=AES128
+cipher_suite: 1                    # 1=ChaCha20, 2=AES256, 3=AES128
 password: "your-strong-random-password-here"
 
 # ─── REALITY 伪装配置 ───
 reality_mode: true
 reality_enabled: true
-server_cert: "cert.pem"            # 服务端私有签名证书
-server_key: "key.pem"              # 服务端私有签名私钥
-# 预设的 SPKI 证书哈希，可替换为你自签证书的 SPKI 哈希
+server_cert: "cert.pem"
+server_key: "key.pem"
 reality_spki: "804d9c7922d9c491aefbe7f2da4930bfae498cda692994ea9a9fefb0f2ea99cb"
-reality_short_id: 1002             # 4字节随机正整数 ID 标识，防侦测攻击
-reality_max_time: 0                # 时间戳校验最大容差秒数，0 表示不限制
+reality_short_id: 1002
+reality_max_time: 0
 
 # ─── 抗检测主动防御 ───
-fingerprint: "chrome_win"          # 伪装客户端指纹类型：chrome_win / firefox_mac / curl_linux
-padding_mode: "random"             # 数据帧填充策略：none / fixed / random
-base_payload_size: 1400            # 数据帧基线载荷大小 (字节)
-max_payload_size: 1452             # 最大数据帧大小 (字节)
-timing_jitter_ms: 30.0             # 流量发送的时间轴随机扰动上限 (毫秒)
+fingerprint: "chrome_win"          # chrome_win / firefox_mac / curl_linux
+padding_mode: "random"             # none / fixed / random
+base_payload_size: 1400
+max_payload_size: 1452
+timing_jitter_ms: 30.0
 
 # ─── 连接与性能控制 ───
-max_clients: 1000                  # 最大并发客户端会话数量
-stream_window: 1048576             # 数据流窗口大小 (字节，1MB)
-keepalive_interval: "30s"          # 存活心跳发送周期
-handshake_timeout: "10s"           # 握手最大超时时间
+max_clients: 1000
+stream_window: 1048576
+keepalive_interval: "30s"
+handshake_timeout: "10s"
 
-# ─── 后端路由与转发（上游） ───
+# ─── 后端（防探测回落） ───
 destinations:
   - name: "direct"
-    addr: "127.0.0.1:8080"         # 服务端中转或直连后端的落地服务地址
+    addr: "127.0.0.1:8080"         # 未授权探测流量回落到此处的普通 Web 服务
     protocol: "direct"
     rule: "all"
     priority: 0
@@ -212,63 +304,55 @@ destinations:
 
 #### 🔹 客户端 (`client.quic.yaml`)
 ```yaml
-# 服务端公网地址与监听端口
 server_addr: "your-server-ip:443"
 transport: "QUIC"
-cipher_suite: 1                    # 必须与服务端配置相同
+cipher_suite: 1
 password: "your-strong-random-password-here"
 
-# ─── REALITY 抗探测握手 ───
+# ─── REALITY 配置 ───
 reality_mode: true
-sni_spoof: "www.google.com"        # 伪装的目标 SNI 域名（建议选择免流或访问频次极高的域名）
-# 填入服务端生成的 SPKI 哈希用于客户端主动强校验防 MITM 中间人探测
+sni_spoof: "www.apple.com"         # 伪装的 SNI 域名（需与生成证书的 CN 一致）
 reality_spki: "804d9c7922d9c491aefbe7f2da4930bfae498cda692994ea9a9fefb0f2ea99cb"
-reality_short_id: 1002             # 必须与服务端配置相同
+reality_short_id: 1002
 reality_max_time: 0
 
-# ─── 抗检测主动防御 ───
+# ─── 抗检测 ───
 fingerprint: "chrome_win"
 padding_mode: "random"
 base_payload_size: 1400
 max_payload_size: 1452
-direction_balance: true            # 开启双向流量伪造平衡，对抗非对称流量分析
+direction_balance: true
 timing_jitter_ms: 30.0
 
-# ─── 连接优化参数 ───
+# ─── 连接优化 ───
 keepalive_interval: "30s"
 handshake_timeout: "10s"
 stream_window: 1048576
 max_concurrent_streams: 100
-session_lifetime: "1h"             # 临时密钥会话最大生命周期 (自动定期重协商)
+session_lifetime: "1h"
 dial_timeout: "15s"
 
-# ─── 本地监听代理代理 ───
-listen_addr: "127.0.0.1:1080"      # 本地暴露出的科学上网服务接口
-proxy_protocol: "socks5"           # 支持 socks5 或 http
+# ─── 本地 SOCKS5 代理 ───
+# 0.0.0.0 = 局域网所有设备均可连接
+# 127.0.0.1 = 仅本机使用
+listen_addr: "0.0.0.0:1080"
+proxy_protocol: "socks5"
 ```
 
 ---
 
 ### 2. WebSocket (WSS) 模式
 
-将加密流量包装在标准 HTTP WebSocket 升级链接内，可配合 Nginx / Caddy 等反向代理进行 HTTPS 流量伪装。
-
 #### 🔹 服务端 (`server.ws.yaml`)
 ```yaml
-listen_addr: "127.0.0.1:8080"      # 推荐监听在本地，用外部 Nginx 暴露 443 并配置 HTTPS TLS
+listen_addr: "127.0.0.1:8080"     # 推荐配合 Nginx/Caddy 反代暴露 443
 transport: "WebSocket"
 cipher_suite: 1
 password: "your-strong-random-password-here"
-
-# ─── WebSocket 参数 ───
-wss_path: "/v2/connection"         # WebSocket 升级所用的指定伪装请求路径，防主动探测
-
-# ─── 抗检测主动防御 ───
+wss_path: "/v2/connection"
 fingerprint: "firefox_mac"
 padding_mode: "random"
 timing_jitter_ms: 15.0
-
-# ─── 后端路由与转发 ───
 destinations:
   - name: "direct"
     addr: "127.0.0.1:8080"
@@ -278,23 +362,16 @@ destinations:
 
 #### 🔹 客户端 (`client.ws.yaml`)
 ```yaml
-server_addr: "your-server-domain.com:443" # 如果使用反代，请指向反向代理的公网域名和 HTTPS 端口
+server_addr: "your-server-domain.com:443"
 transport: "WebSocket"
 cipher_suite: 1
 password: "your-strong-random-password-here"
-
-# ─── WebSocket 升级配置 ───
-wss_path: "/v2/connection"         # 必须与服务端配置完全相同
-
-# ─── TLS 伪装指纹 ───
-reality_mode: false                # WSS 模式不使用自签 REALITY 握手
+wss_path: "/v2/connection"
+reality_mode: false
 sni_spoof: "your-server-domain.com"
 fingerprint: "firefox_mac"
 padding_mode: "random"
-direction_balance: false
-
-# ─── 本地监听代理代理 ───
-listen_addr: "127.0.0.1:1080"
+listen_addr: "0.0.0.0:1080"
 proxy_protocol: "socks5"
 ```
 
@@ -302,16 +379,12 @@ proxy_protocol: "socks5"
 
 ### 3. HTTP-POST 模式
 
-采用完全合法的标准 HTTP/1.1 POST 大文件上传或媒体流传输行为欺骗检测引擎。
-
 #### 🔹 服务端 (`server.http.yaml`)
 ```yaml
-listen_addr: "0.0.0.0:80"          # 监听普通 HTTP 80 端口，模拟正常的免密明文或代理上传
+listen_addr: "0.0.0.0:80"
 transport: "HTTP-POST"
-cipher_suite: 2                    # 推荐选用 AES-256-GCM 保护载荷
+cipher_suite: 2
 password: "your-strong-random-password-here"
-
-# ─── 后端路由与转发 ───
 destinations:
   - name: "direct"
     addr: "127.0.0.1:8080"
@@ -325,33 +398,27 @@ server_addr: "your-server-ip:80"
 transport: "HTTP-POST"
 cipher_suite: 2
 password: "your-strong-random-password-here"
-
-# ─── HTTP-POST 镜像流量伪装 ───
-upload_url: "http://your-server-ip/api/v1/storage/upload" # 客户端请求大文件上传的模拟完整 URL
-mirror_boundary: "----WebKitFormBoundaryT8z736aFmE1yB"     # 伪装 MIME Web 浏览器文件上传分界线
-mirror_path: "/api/v1/storage/upload"                     # 服务端镜像处理的 HTTP 请求资源路径
-
-# ─── 本地监听代理代理 ───
-listen_addr: "127.0.0.1:1080"
+upload_url: "http://your-server-ip/api/v1/storage/upload"
+mirror_boundary: "----WebKitFormBoundaryT8z736aFmE1yB"
+mirror_path: "/api/v1/storage/upload"
+listen_addr: "0.0.0.0:1080"
 proxy_protocol: "socks5"
 ```
 
 ---
 
-> 💡 **小贴士：如何生成专用的自签证书并获取 SPKI 哈希？**
+> 💡 **生成自签证书并获取 SPKI 哈希**
 >
-> 1. **生成私钥与自签证书**：
->    ```bash
->    openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -sha256 -days 3650 -nodes -subj "/CN=www.google.com"
->    ```
-> 2. **一键提取 SPKI 哈希**（将其填入服务端和客户端的 `reality_spki`）：
->    ```bash
->    openssl x509 -in cert.pem -pubkey -noout \
->      | openssl pkey -pubout -outform DER 2>/dev/null \
->      | sha256sum | cut -c1-64
->    ```
-
----
+> ```bash
+> # 生成私钥与证书（CN 必须与客户端 sni_spoof 一致）
+> openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem \
+>   -sha256 -days 3650 -nodes -subj "/CN=www.apple.com"
+>
+> # 提取 SPKI 哈希（填入 reality_spki）
+> openssl x509 -in cert.pem -pubkey -noout \
+>   | openssl pkey -pubout -outform DER 2>/dev/null \
+>   | sha256sum | cut -c1-64
+> ```
 
 ---
 
@@ -467,7 +534,8 @@ GOOS=linux   GOARCH=amd64 go build -ldflags="-s -w" -o dist/meridian-client-linu
 meridian/
 ├── cmd/
 │   ├── meridian-client/    # 客户端 CLI 入口
-│   │   └── main.go
+│   │   ├── main.go         # 主程序、Client 结构
+│   │   └── socks5.go       # 完整 SOCKS5 代理服务器（RFC 1928/1929）
 │   └── meridian-server/    # 服务端 CLI 入口
 │       ├── main.go
 │       └── server.go
@@ -479,9 +547,10 @@ meridian/
 │   ├── config/             # 配置文件加载
 │   └── anti/               # 抗检测（TLS 指纹）
 ├── test/
-│   └── integration/        # 端到端集成测试
+│   └── integration/        # 端到端集成测试（11 个，全部通过）
 ├── configs/                # 示例配置文件
 ├── dist/                   # 预编译二进制（CI 构建产物）
+├── docs/                   # 协议规格文档
 ├── .github/
 │   └── workflows/
 │       └── release.yml     # GitHub Actions 自动构建发布
@@ -517,13 +586,14 @@ go vet ./...
 - [x] MFP 帧协议编解码
 - [x] ClientHello 构建与解析
 - [x] UDP 服务端握手接收
-- [x] 本地 SOCKS5 代理监听
+- [x] **完整 SOCKS5 代理服务（RFC 1928 + RFC 1929）** ✅ v1.0.2
+- [x] **局域网代理服务（0.0.0.0 监听）** ✅ v1.0.2
+- [x] **配置文件 SPKI Hex 解析修复** ✅ v1.0.1
 - [x] CLI 参数支持
 - [x] 信号优雅退出
 - [x] GitHub Actions 自动发布
 - [ ] ServerHello 完整回包
-- [ ] 完整 SOCKS5/HTTP 代理协议
-- [ ] 数据帧转发
+- [ ] 数据帧通过 Meridian 加密隧道转发
 - [ ] WebSocket 传输后端
 - [ ] 0-RTT 会话恢复
 - [ ] 密钥定期轮换
@@ -539,6 +609,8 @@ MIT License — 详见 [LICENSE](LICENSE) 文件
 ## 参考资料
 
 - [Meridian Protocol Specification v1.0](docs/Meridian-Protocol-Spec.md)
+- [RFC 1928 — SOCKS5 协议](https://www.rfc-editor.org/rfc/rfc1928)
+- [RFC 1929 — SOCKS5 用户名/密码认证](https://www.rfc-editor.org/rfc/rfc1929)
 - [RFC 9000 — QUIC 协议](https://www.rfc-editor.org/rfc/rfc9000)
 - [ChaCha20-Poly1305 RFC 8439](https://www.rfc-editor.org/rfc/rfc8439)
 - [X25519 椭圆曲线 Diffie-Hellman](https://www.rfc-editor.org/rfc/rfc7748)
