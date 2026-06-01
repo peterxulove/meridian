@@ -144,10 +144,18 @@ func (c *Client) Start() error {
 	fmt.Printf("  [Tunnel] Connected to Meridian server at %s\n", c.cfg.ServerAddr)
 
 	// ── Step 4: Start SOCKS5 proxy ────────────────────────────────────────
-	// dialFn uses publicDialer (8.8.8.8 / 1.1.1.1) to resolve external hostnames,
-	// bypassing the system's local DNS which may not resolve public domains.
+	// dialFn uses publicDialer (8.8.8.8 / 1.1.1.1 over UDP and TCP) to resolve external hostnames.
+	// If public DNS query fails or is blocked, it automatically falls back to system DNS.
 	dialFn := func(ctx context.Context, network, addr string) (net.Conn, error) {
-		return publicDialer.DialContext(ctx, network, addr)
+		conn, err := publicDialer.DialContext(ctx, network, addr)
+		if err == nil {
+			return conn, nil
+		}
+		// Fallback to system resolver
+		return (&net.Dialer{
+			Timeout:   15 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext(ctx, network, addr)
 	}
 
 	c.proxy = NewSocks5Server(c.cfg.ListenAddr, "", "", dialFn)

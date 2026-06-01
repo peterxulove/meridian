@@ -3,9 +3,10 @@
 // This file implements a complete SOCKS5 proxy that:
 //   - Listens on a configurable address (0.0.0.0:1080 by default for LAN access)
 //   - Supports CONNECT command (TCP tunnel) for all destination types
+//   - Supports UDP ASSOCIATE command (UDP tunnel) with dynamic relay listeners
 //   - Supports DOMAIN NAME, IPv4, and IPv6 target address types
 //   - Optionally enforces username/password authentication (RFC 1929)
-//   - Uses public DNS (8.8.8.8 + 1.1.1.1) to avoid local DNS resolution failures
+//   - Uses robust public DNS (8.8.8.8 + 1.1.1.1 over both UDP and TCP) to avoid local DNS failures
 //   - Limits concurrent connections via a semaphore to avoid "too many open files"
 //   - Forwards traffic through the Meridian encrypted tunnel to the server
 package main
@@ -32,12 +33,13 @@ const (
 	authNoAccept = 0xFF
 
 	// Commands
-	cmdConnect = 0x01
+	cmdConnect      = 0x01
+	cmdUDPAssociate = 0x03
 
 	// Address types
-	addrIPv4         = 0x01
-	addrDomain       = 0x03
-	addrIPv6         = 0x04
+	addrIPv4   = 0x01
+	addrDomain = 0x03
+	addrIPv6   = 0x04
 
 	// Reply codes
 	replySuccess          = 0x00
@@ -55,19 +57,27 @@ const (
 )
 
 // publicResolver is a net.Resolver that uses public DNS servers (8.8.8.8 + 1.1.1.1)
-// instead of the system's local resolver. This fixes failures when the host's
-// /etc/resolv.conf points to a local DNS that can't resolve external hostnames
-// (e.g. "lookup xxx on 127.0.0.1:53: no such host").
+// instead of the system's local resolver. It tries UDP first, then falls back to TCP
+// if UDP is blocked by local firewalls or ISP restrictions.
 var publicResolver = &net.Resolver{
 	PreferGo: true,
 	Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
-		// Try Google DNS first, fall back to Cloudflare.
 		d := net.Dialer{Timeout: 3 * time.Second}
+		// Try UDP first (8.8.8.8 then 1.1.1.1)
 		conn, err := d.DialContext(ctx, "udp", "8.8.8.8:53")
-		if err != nil {
-			conn, err = d.DialContext(ctx, "udp", "1.1.1.1:53")
+		if err == nil {
+			return conn, nil
 		}
-		return conn, err
+		conn, err = d.DialContext(ctx, "udp", "1.1.1.1:53")
+		if err == nil {
+			return conn, nil
+		}
+		// Fall back to TCP DNS (8.8.8.8 then 1.1.1.1)
+		conn, err = d.DialContext(ctx, "tcp", "8.8.8.8:53")
+		if err == nil {
+			return conn, nil
+		}
+		return d.DialContext(ctx, "tcp", "1.1.1.1:53")
 	},
 }
 
@@ -224,10 +234,15 @@ func (s *Socks5Server) handleConn(conn net.Conn) {
 		}
 	}
 
-	// ── Phase 3: read CONNECT request ────────────────────────────────────
-	target, err := s.readRequest(conn)
+	// ── Phase 3: read CONNECT / UDP ASSOCIATE request ─────────────────────
+	cmd, target, err := s.readRequest(conn)
 	if err != nil {
 		logf("socks5: [%s] request error: %v", conn.RemoteAddr(), err)
+		return
+	}
+
+	if cmd == cmdUDPAssociate {
+		s.handleUDPAssociate(conn, target)
 		return
 	}
 
@@ -253,9 +268,214 @@ func (s *Socks5Server) handleConn(conn net.Conn) {
 	s.writeReply(conn, replySuccess, localAddr)
 
 	// ── Phase 6: relay traffic bidirectionally ────────────────────────────
-	conn.SetDeadline(time.Time{})    // remove deadline for data phase
+	conn.SetDeadline(time.Time{}) // remove deadline for data phase
 	upstream.SetDeadline(time.Time{})
 	s.relay(conn, upstream)
+}
+
+// handleUDPAssociate implements SOCKS5 UDP Associate (CMD = 0x03) relay.
+func (s *Socks5Server) handleUDPAssociate(conn net.Conn, clientUDPAddrStr string) {
+	localTCPAddr, ok := conn.LocalAddr().(*net.TCPAddr)
+	var listenIP net.IP
+	if ok {
+		listenIP = localTCPAddr.IP
+	} else {
+		listenIP = net.IPv4zero
+	}
+
+	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: listenIP, Port: 0})
+	if err != nil {
+		logf("socks5: [%s] UDP associate listen failed: %v", conn.RemoteAddr(), err)
+		s.writeReply(conn, replyGeneralFailure, nil)
+		return
+	}
+	defer udpConn.Close()
+
+	boundUDPAddr := udpConn.LocalAddr().(*net.UDPAddr)
+	logf("socks5: [%s] UDP associate bound to UDP %s", conn.RemoteAddr(), boundUDPAddr)
+
+	// Send success reply with the bound UDP IP and Port
+	s.writeReply(conn, replySuccess, &net.TCPAddr{IP: boundUDPAddr.IP, Port: boundUDPAddr.Port})
+
+	// Keep the TCP control connection open to maintain the UDP association.
+	tcpClosed := make(chan struct{})
+	go func() {
+		defer close(tcpClosed)
+		buf := make([]byte, 256)
+		for {
+			conn.SetDeadline(time.Now().Add(60 * time.Second))
+			_, err := conn.Read(buf)
+			if err != nil {
+				return // TCP connection closed or timed out
+			}
+		}
+	}()
+
+	relayDone := make(chan struct{})
+	go s.udpRelay(udpConn, tcpClosed, relayDone)
+
+	select {
+	case <-tcpClosed:
+		logf("socks5: [%s] UDP associate TCP closed, terminating session", conn.RemoteAddr())
+	case <-relayDone:
+		logf("socks5: [%s] UDP associate relay finished", conn.RemoteAddr())
+	}
+}
+
+// udpRelay acts as a UDP relay server, multiplexing packets from the SOCKS5 client.
+func (s *Socks5Server) udpRelay(udpConn *net.UDPConn, tcpClosed chan struct{}, relayDone chan struct{}) {
+	defer close(relayDone)
+
+	// Map to keep track of active outbound UDP sockets (client remote address string -> client UDP conn)
+	outConns := make(map[string]*net.UDPConn)
+	var mu sync.Mutex
+
+	defer func() {
+		mu.Lock()
+		for _, c := range outConns {
+			c.Close()
+		}
+		mu.Unlock()
+	}()
+
+	// Immediately close the UDP listener if the TCP control connection is terminated
+	go func() {
+		<-tcpClosed
+		udpConn.Close()
+	}()
+
+	buf := make([]byte, 65535)
+	for {
+		n, remoteAddr, err := udpConn.ReadFromUDP(buf)
+		if err != nil {
+			return // normal termination when udpConn is closed
+		}
+
+		if n < 10 {
+			continue // SOCKS5 UDP header must be at least 10 bytes
+		}
+
+		// Parse SOCKS5 UDP Header (RFC 1928 Section 7):
+		// RSV: buf[0:2] (must be 0x00 0x00)
+		// FRAG: buf[2] (current fragment, must be 0x00 as we don't support fragmentation)
+		// ATYP: buf[3] (0x01 = IPv4, 0x03 = Domain, 0x04 = IPv6)
+		if buf[0] != 0x00 || buf[1] != 0x00 || buf[2] != 0x00 {
+			continue
+		}
+
+		atyp := buf[3]
+		var host string
+		var port int
+		var offset int
+
+		switch atyp {
+		case addrIPv4:
+			host = net.IP(buf[4:8]).String()
+			port = int(buf[8])<<8 | int(buf[9])
+			offset = 10
+		case addrIPv6:
+			if n < 22 {
+				continue
+			}
+			host = "[" + net.IP(buf[4:20]).String() + "]"
+			port = int(buf[20])<<8 | int(buf[21])
+			offset = 22
+		case addrDomain:
+			domainLen := int(buf[4])
+			if n < 7+domainLen {
+				continue
+			}
+			host = string(buf[5 : 5+domainLen])
+			port = int(buf[5+domainLen])<<8 | int(buf[6+domainLen])
+			offset = 7 + domainLen
+		default:
+			continue
+		}
+
+		targetAddr := fmt.Sprintf("%s:%d", host, port)
+		payload := buf[offset:n]
+
+		clientKey := remoteAddr.String()
+		mu.Lock()
+		outConn, exists := outConns[clientKey]
+		if !exists {
+			outConn, err = net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+			if err != nil {
+				mu.Unlock()
+				logf("socks5: outbound UDP listen failed: %v", err)
+				continue
+			}
+			outConns[clientKey] = outConn
+
+			// Relay response packets from the target back to the client
+			go func(cAddr *net.UDPAddr, cOut *net.UDPConn) {
+				defer func() {
+					cOut.Close()
+					mu.Lock()
+					delete(outConns, cAddr.String())
+					mu.Unlock()
+				}()
+
+				respBuf := make([]byte, 65535)
+				for {
+					rn, tAddr, err := cOut.ReadFromUDP(respBuf)
+					if err != nil {
+						return
+					}
+
+					header := make([]byte, 22)
+					header[0] = 0x00
+					header[1] = 0x00
+					header[2] = 0x00 // FRAG = 0
+
+					var hLen int
+					tIP := tAddr.IP.To4()
+					if tIP != nil {
+						header[3] = addrIPv4
+						copy(header[4:8], tIP)
+						header[8] = byte(tAddr.Port >> 8)
+						header[9] = byte(tAddr.Port & 0xff)
+						hLen = 10
+					} else {
+						header[3] = addrIPv6
+						copy(header[4:20], tAddr.IP.To16())
+						header[20] = byte(tAddr.Port >> 8)
+						header[21] = byte(tAddr.Port & 0xff)
+						hLen = 22
+					}
+
+					packet := make([]byte, hLen+rn)
+					copy(packet[0:hLen], header[0:hLen])
+					copy(packet[hLen:], respBuf[:rn])
+
+					udpConn.WriteToUDP(packet, cAddr)
+				}
+			}(remoteAddr, outConn)
+		}
+		mu.Unlock()
+
+		// Resolve destination target UDP address and forward the packet
+		go func(cOut *net.UDPConn, tAddr string, pay []byte) {
+			tUDPAddr, err := net.ResolveUDPAddr("udp", tAddr)
+			if err != nil {
+				// If local resolution fails, fallback to custom public DNS resolver
+				thost, tportStr, err2 := net.SplitHostPort(tAddr)
+				if err2 == nil {
+					ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+					ips, err3 := publicResolver.LookupIPAddr(ctx, thost)
+					cancel()
+					if err3 == nil && len(ips) > 0 {
+						var tport int
+						fmt.Sscan(tportStr, &tport)
+						tUDPAddr = &net.UDPAddr{IP: ips[0].IP, Port: tport}
+					}
+				}
+			}
+			if tUDPAddr != nil {
+				cOut.WriteToUDP(pay, tUDPAddr)
+			}
+		}(outConn, targetAddr, payload)
+	}
 }
 
 // negotiate sends the supported auth methods and selects one.
@@ -331,18 +551,19 @@ func (s *Socks5Server) authenticate(conn net.Conn) error {
 	return err
 }
 
-// readRequest reads the SOCKS5 CONNECT request and returns "host:port".
-func (s *Socks5Server) readRequest(conn net.Conn) (string, error) {
+// readRequest reads the SOCKS5 CONNECT/UDP ASSOCIATE request and returns "host:port".
+func (s *Socks5Server) readRequest(conn net.Conn) (byte, string, error) {
 	header := make([]byte, 4)
 	if _, err := io.ReadFull(conn, header); err != nil {
-		return "", err
+		return 0, "", err
 	}
 	if header[0] != socks5Version {
-		return "", fmt.Errorf("unexpected version %d in request", header[0])
+		return 0, "", fmt.Errorf("unexpected version %d in request", header[0])
 	}
-	if header[1] != cmdConnect {
+	cmd := header[1]
+	if cmd != cmdConnect && cmd != cmdUDPAssociate {
 		s.writeReply(conn, replyCmdNotSupported, nil)
-		return "", fmt.Errorf("command %d not supported (only CONNECT)", header[1])
+		return 0, "", fmt.Errorf("command %d not supported (only CONNECT and UDP ASSOCIATE)", cmd)
 	}
 
 	var host string
@@ -350,36 +571,36 @@ func (s *Socks5Server) readRequest(conn net.Conn) (string, error) {
 	case addrIPv4:
 		addr := make([]byte, 4)
 		if _, err := io.ReadFull(conn, addr); err != nil {
-			return "", err
+			return 0, "", err
 		}
 		host = net.IP(addr).String()
 	case addrIPv6:
 		addr := make([]byte, 16)
 		if _, err := io.ReadFull(conn, addr); err != nil {
-			return "", err
+			return 0, "", err
 		}
 		host = "[" + net.IP(addr).String() + "]"
 	case addrDomain:
 		lenBuf := make([]byte, 1)
 		if _, err := io.ReadFull(conn, lenBuf); err != nil {
-			return "", err
+			return 0, "", err
 		}
 		domainBuf := make([]byte, lenBuf[0])
 		if _, err := io.ReadFull(conn, domainBuf); err != nil {
-			return "", err
+			return 0, "", err
 		}
 		host = string(domainBuf)
 	default:
 		s.writeReply(conn, replyAddrNotSupported, nil)
-		return "", fmt.Errorf("unsupported address type %d", header[3])
+		return 0, "", fmt.Errorf("unsupported address type %d", header[3])
 	}
 
 	portBuf := make([]byte, 2)
 	if _, err := io.ReadFull(conn, portBuf); err != nil {
-		return "", err
+		return 0, "", err
 	}
 	port := int(portBuf[0])<<8 | int(portBuf[1])
-	return fmt.Sprintf("%s:%d", host, port), nil
+	return cmd, fmt.Sprintf("%s:%d", host, port), nil
 }
 
 // writeReply sends the SOCKS5 reply to the client.
