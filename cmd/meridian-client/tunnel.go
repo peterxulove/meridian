@@ -56,7 +56,9 @@ func (tc *TunnelClient) Connect() error {
 		defer cancel()
 		
 		qconn, err := quic.DialAddr(ctx, tc.cfg.ServerAddr, tlsCfg, &quic.Config{
-			KeepAlivePeriod: 15 * time.Second,
+			KeepAlivePeriod:            15 * time.Second,
+			MaxStreamReceiveWindow:     8 * 1024 * 1024,  // 8MB
+			MaxConnectionReceiveWindow: 20 * 1024 * 1024, // 20MB
 		})
 		if err != nil {
 			return fmt.Errorf("tunnel: QUIC dial failed: %w", err)

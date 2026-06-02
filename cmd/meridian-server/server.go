@@ -61,7 +61,9 @@ func (s *Server) startQUIC() error {
 	}
 	
 	listener, err := quic.ListenAddr(s.cfg.ListenAddr, tlsCfg, &quic.Config{
-		KeepAlivePeriod: 15 * time.Second,
+		KeepAlivePeriod:            s.cfg.KeepaliveInterval,
+		MaxStreamReceiveWindow:     8 * 1024 * 1024,  // 8MB
+		MaxConnectionReceiveWindow: 20 * 1024 * 1024, // 20MB
 	})
 	if err != nil {
 		return err
