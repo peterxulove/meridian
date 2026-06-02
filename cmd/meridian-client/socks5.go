@@ -17,9 +17,7 @@ import (
 	"io"
 	"net"
 	"os"
-	"runtime"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -96,31 +94,7 @@ var publicDialer = &net.Dialer{
 	Resolver:  publicResolver,
 }
 
-// RaiseFileLimit attempts to raise the OS open-file descriptor limit to at least
-// target. It is a best-effort call; failures are logged but not fatal.
-func RaiseFileLimit(target uint64) {
-	if runtime.GOOS == "windows" {
-		return // Windows does not use POSIX rlimits
-	}
-	var rl syscall.Rlimit
-	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rl); err != nil {
-		logf("[sys] getrlimit failed: %v", err)
-		return
-	}
-	if rl.Cur >= target {
-		return // already high enough
-	}
-	original := rl.Cur
-	rl.Cur = target
-	if rl.Max < target {
-		rl.Max = target
-	}
-	if err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rl); err != nil {
-		logf("[sys] could not raise open-file limit from %d to %d: %v (run with sudo or set 'ulimit -n %d' before starting)", original, target, err, target)
-		return
-	}
-	logf("[sys] open-file limit raised from %d → %d", original, target)
-}
+
 
 // Socks5Server is a SOCKS5 proxy server that forwards connections through
 // the Meridian encrypted tunnel.
