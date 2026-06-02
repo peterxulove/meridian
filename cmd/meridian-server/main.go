@@ -13,7 +13,8 @@ import (
 )
 
 func main() {
-	cfgPath, listen, showFP := flagParse()
+	cfgPath, listen, showFP, debug := flagParse()
+	config.DebugMode = debug
 
 	if showFP {
 		fmt.Println("Available TLS Fingerprints:")
@@ -62,10 +63,11 @@ func main() {
 
 // flagParse parses command-line flags.
 // Fix #14: was an empty function; CLI flags had no effect.
-func flagParse() (cfgPath, listen string, showFP bool) {
+func flagParse() (cfgPath, listen string, showFP bool, debug bool) {
 	flag.StringVar(&cfgPath, "config", "server.yaml", "path to server config file")
 	flag.StringVar(&listen, "listen", "", "override listen address (e.g. 0.0.0.0:443)")
 	flag.BoolVar(&showFP, "fingerprints", false, "list available TLS fingerprints and exit")
+	flag.BoolVar(&debug, "debug", false, "enable debug logging")
 	flag.Parse()
 	return
 }

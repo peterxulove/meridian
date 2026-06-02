@@ -15,6 +15,9 @@ import (
 	"meridian/pkg/crypto"
 	"meridian/pkg/mfp"
 	"meridian/pkg/mtp"
+	"meridian/pkg/transport"
+
+	"github.com/quic-go/quic-go"
 )
 
 // TunnelClient manages the secure multiplexed TCP tunnel to the server.
@@ -39,11 +42,38 @@ func NewTunnelClient(cfg config.ClientConfig) *TunnelClient {
 	}
 }
 
-// Connect establishes the TCP connection and performs the MTP handshake.
+// Connect establishes the TCP or QUIC connection and performs the MTP handshake.
 func (tc *TunnelClient) Connect() error {
-	conn, err := net.DialTimeout("tcp", tc.cfg.ServerAddr, tc.cfg.DialTimeout)
-	if err != nil {
-		return fmt.Errorf("tunnel: failed to dial server: %w", err)
+	var conn net.Conn
+
+	if tc.cfg.Transport == "QUIC" {
+		tlsCfg, err := transport.ClientTLSConfig(tc.cfg)
+		if err != nil {
+			return fmt.Errorf("tunnel: TLS config error: %w", err)
+		}
+		
+		ctx, cancel := context.WithTimeout(context.Background(), tc.cfg.DialTimeout)
+		defer cancel()
+		
+		qconn, err := quic.DialAddr(ctx, tc.cfg.ServerAddr, tlsCfg, &quic.Config{
+			KeepAlivePeriod: 15 * time.Second,
+		})
+		if err != nil {
+			return fmt.Errorf("tunnel: QUIC dial failed: %w", err)
+		}
+		
+		stream, err := qconn.OpenStreamSync(ctx)
+		if err != nil {
+			qconn.CloseWithError(1, err.Error())
+			return fmt.Errorf("tunnel: QUIC open stream failed: %w", err)
+		}
+		conn = &quicStreamWrapper{Stream: stream, qconn: qconn}
+	} else {
+		tcpConn, err := net.DialTimeout("tcp", tc.cfg.ServerAddr, tc.cfg.DialTimeout)
+		if err != nil {
+			return fmt.Errorf("tunnel: TCP dial failed: %w", err)
+		}
+		conn = tcpConn
 	}
 	tc.tunnelConn = conn
 
@@ -112,7 +142,11 @@ func (tc *TunnelClient) Connect() error {
 	tc.encoder = mfp.NewEncoder(keys)
 	tc.decoder = mfp.NewDownlinkDecoder(keys)
 
-	fmt.Printf("  [Tunnel] Handshake successful over TCP! Cipher: MERIDIAN-CHACHA\n")
+	if config.DebugMode {
+		fmt.Printf("[DEBUG] [Tunnel] Handshake successful over %s! Cipher: MERIDIAN-CHACHA\n", tc.cfg.Transport)
+	} else {
+		fmt.Printf("  [Tunnel] Handshake successful over %s! Cipher: MERIDIAN-CHACHA\n", tc.cfg.Transport)
+	}
 
 	// Start read loop
 	go tc.readLoop()
@@ -161,7 +195,13 @@ func (tc *TunnelClient) DialStream(ctx context.Context, targetAddr string) (net.
 	case success := <-sc.confirmChan:
 		if !success {
 			tc.removeStream(sid)
+			if config.DebugMode {
+				fmt.Printf("[DEBUG] [Tunnel] Stream %d connection rejected by server\n", sid)
+			}
 			return nil, fmt.Errorf("tunnel: connection rejected by server")
+		}
+		if config.DebugMode {
+			fmt.Printf("[DEBUG] [Tunnel] Stream %d connection established to %s\n", sid, targetAddr)
 		}
 	case <-ctx.Done():
 		tc.removeStream(sid)
@@ -332,4 +372,27 @@ func readTCPFrame(r io.Reader) ([]byte, error) {
 		return nil, err
 	}
 	return frameData, nil
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// QUIC Wrapper
+// ─────────────────────────────────────────────────────────────────────────────
+
+type quicStreamWrapper struct {
+	*quic.Stream
+	qconn *quic.Conn
+}
+
+func (q *quicStreamWrapper) LocalAddr() net.Addr {
+	return q.qconn.LocalAddr()
+}
+
+func (q *quicStreamWrapper) RemoteAddr() net.Addr {
+	return q.qconn.RemoteAddr()
+}
+
+func (q *quicStreamWrapper) Close() error {
+	q.Stream.CancelRead(0)
+	q.Stream.Close()
+	return q.qconn.CloseWithError(0, "closed")
 }

@@ -10,6 +10,9 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// DebugMode enables verbose debug logging globally
+var DebugMode bool = false
+
 // CipherID identifies the encryption suite.
 type CipherID uint16
 

@@ -10,12 +10,15 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"context"
 
 	"meridian/pkg/config"
 	"meridian/pkg/crypto"
 	"meridian/pkg/mfp"
 	"meridian/pkg/mtp"
 	"meridian/pkg/transport"
+
+	"github.com/quic-go/quic-go"
 )
 
 // Server manages Meridian connections.
@@ -52,41 +55,52 @@ func (s *Server) Start() error {
 }
 
 func (s *Server) startQUIC() error {
-	udpAddr, err := net.ResolveUDPAddr("udp", s.cfg.ListenAddr)
+	tlsCfg, err := transport.ServerTLSConfig(s.cfg)
 	if err != nil {
 		return err
 	}
-	s.udp, err = net.ListenUDP("udp", udpAddr)
+	
+	listener, err := quic.ListenAddr(s.cfg.ListenAddr, tlsCfg, &quic.Config{
+		KeepAlivePeriod: 15 * time.Second,
+	})
 	if err != nil {
 		return err
 	}
+	fmt.Printf("  [QUIC] Listening on %s (tunnel server)\n", s.cfg.ListenAddr)
 
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		buf := make([]byte, 1500)
 		for {
 			if s.stopped.Load() {
 				break
 			}
-			s.udp.SetReadDeadline(time.Now().Add(time.Second))
-			n, remote, err := s.udp.ReadFromUDP(buf)
+			conn, err := listener.Accept(context.Background())
 			if err != nil {
-				if ne, ok := err.(net.Error); ok && ne.Timeout() {
-					continue
-				}
-				if !s.stopped.Load() {
-					fmt.Printf("  [UDP] Read error: %v\n", err)
+				if s.stopped.Load() {
+					break
 				}
 				continue
 			}
-			// Copy packet so the goroutine can use it safely.
-			pkt := make([]byte, n)
-			copy(pkt, buf[:n])
-			go s.handlePacket(pkt, remote)
+			go s.handleQUICConnection(conn)
 		}
 	}()
 	return nil
+}
+
+func (s *Server) handleQUICConnection(conn *quic.Conn) {
+	if config.DebugMode {
+		fmt.Printf("[DEBUG] [QUIC] Accepted connection from %s\n", (*conn).RemoteAddr())
+	}
+	stream, err := (*conn).AcceptStream(context.Background())
+	if err != nil {
+		if config.DebugMode {
+			fmt.Printf("[DEBUG] [QUIC] AcceptStream failed: %v\n", err)
+		}
+		return
+	}
+	wrapper := &quicStreamWrapper{Stream: stream, qconn: conn}
+	s.handleTCPTunnel(wrapper)
 }
 
 func (s *Server) startWS() error {
@@ -209,7 +223,7 @@ func splitHostPort(addr string) (string, string) {
 
 // Compile-time checks that referenced symbols exist.
 var (
-	_ = transport.TLSConfig
+	_ = transport.ServerTLSConfig
 	_ = mtp.BuildClientHello
 	_ = mfp.NewFramePool
 )
@@ -236,16 +250,29 @@ func (s *Server) startTCP() {
 }
 
 func (s *Server) handleTCPTunnel(conn net.Conn) {
+	if config.DebugMode {
+		fmt.Printf("[DEBUG] [Tunnel] New tunnel connection from %s\n", conn.RemoteAddr())
+	}
 	defer conn.Close()
 
 	// ── MTP Handshake (Server Side) ───────────────────────────────────────
+	conn.SetReadDeadline(time.Now().Add(s.cfg.HandshakeTimeout))
 	buf := make([]byte, 1024)
-	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-	n, err := io.ReadAtLeast(conn, buf, 120) // min ClientHello size
+	n, err := conn.Read(buf)
 	if err != nil {
+		if config.DebugMode {
+			fmt.Printf("[DEBUG] [Tunnel] Handshake read failed: %v\n", err)
+		}
 		return
 	}
 	conn.SetReadDeadline(time.Time{})
+
+	if n < 136 {
+		if config.DebugMode {
+			fmt.Printf("[DEBUG] [Tunnel] Invalid handshake (too short)\n")
+		}
+		return
+	}
 
 	hs, err := mtp.ParseClientHello(buf[:n])
 	if err != nil {
@@ -432,4 +459,27 @@ func readTCPFrame(r io.Reader) ([]byte, error) {
 		return nil, err
 	}
 	return frameData, nil
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// QUIC Wrapper
+// ─────────────────────────────────────────────────────────────────────────────
+
+type quicStreamWrapper struct {
+	*quic.Stream
+	qconn *quic.Conn
+}
+
+func (q *quicStreamWrapper) LocalAddr() net.Addr {
+	return q.qconn.LocalAddr()
+}
+
+func (q *quicStreamWrapper) RemoteAddr() net.Addr {
+	return q.qconn.RemoteAddr()
+}
+
+func (q *quicStreamWrapper) Close() error {
+	q.Stream.CancelRead(0)
+	q.Stream.Close()
+	return q.qconn.CloseWithError(0, "closed")
 }

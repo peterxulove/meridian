@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+	"sync"
 
 	"meridian/pkg/anti"
 	"meridian/pkg/config"
@@ -17,7 +18,8 @@ import (
 )
 
 func main() {
-	cfgPath, listen, showFP := flagParse()
+	cfgPath, listen, showFP, debug := flagParse()
+	config.DebugMode = debug
 
 	if showFP {
 		fmt.Println("Available TLS Fingerprints:")
@@ -77,10 +79,11 @@ func main() {
 }
 
 // flagParse parses command-line flags.
-func flagParse() (cfgPath, listen string, showFP bool) {
+func flagParse() (cfgPath, listen string, showFP bool, debug bool) {
 	flag.StringVar(&cfgPath, "config", "client.yaml", "path to client config file")
 	flag.StringVar(&listen, "listen", "", "override local SOCKS5 listen address (e.g. 0.0.0.0:1080)")
 	flag.BoolVar(&showFP, "fingerprints", false, "list available TLS fingerprints and exit")
+	flag.BoolVar(&debug, "debug", false, "enable debug logging")
 	flag.Parse()
 	return
 }
@@ -88,6 +91,7 @@ func flagParse() (cfgPath, listen string, showFP bool) {
 // Client manages the Meridian upstream connection and the local SOCKS5 proxy.
 type Client struct {
 	cfg    config.ClientConfig
+	mu     sync.RWMutex
 	tunnel *TunnelClient
 	proxy  *Socks5Server
 }
@@ -104,33 +108,43 @@ func NewClient(cfg config.ClientConfig) (*Client, error) {
 	return &Client{cfg: cfg}, nil
 }
 
+func (c *Client) maintainTunnel() {
+	for {
+		tunnel := NewTunnelClient(c.cfg)
+		if err := tunnel.Connect(); err != nil {
+			fmt.Printf("  [Tunnel] Connection failed: %v. Retrying in 5s...\n", err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		
+		c.mu.Lock()
+		c.tunnel = tunnel
+		c.mu.Unlock()
+
+		// Wait until tunnel is closed
+		for !tunnel.closed.Load() {
+			time.Sleep(1 * time.Second)
+		}
+		fmt.Printf("  [Tunnel] Disconnected. Reconnecting...\n")
+	}
+}
+
 // Start performs the initial handshake with the Meridian server and
 // starts the SOCKS5 proxy listener.
 func (c *Client) Start() error {
-	// Start secure multiplexed tunnel over TCP
-	tunnel := NewTunnelClient(c.cfg)
-	useTunnel := true
-	if err := tunnel.Connect(); err != nil {
-		fmt.Printf("  [Tunnel] Warning: failed to establish encrypted tunnel (%v). Falling back to direct-dial mode.\n", err)
-		useTunnel = false
-	} else {
-		c.tunnel = tunnel
-	}
+	// Start secure multiplexed tunnel maintenance in background
+	go c.maintainTunnel()
 
 	// ── Step 4: Start SOCKS5 proxy ────────────────────────────────────────
 	dialFn := func(ctx context.Context, network, addr string) (net.Conn, error) {
-		if useTunnel && c.tunnel != nil {
-			return c.tunnel.DialStream(ctx, addr)
+		c.mu.RLock()
+		t := c.tunnel
+		c.mu.RUnlock()
+
+		if t != nil && !t.closed.Load() {
+			return t.DialStream(ctx, addr)
 		}
-		// Direct dial fallback if tunnel failed
-		conn, err := publicDialer.DialContext(ctx, network, addr)
-		if err == nil {
-			return conn, nil
-		}
-		return (&net.Dialer{
-			Timeout:   15 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext(ctx, network, addr)
+		return nil, fmt.Errorf("tunnel not connected or unavailable")
 	}
 
 	c.proxy = NewSocks5Server(c.cfg.ListenAddr, "", "", dialFn)
@@ -142,9 +156,11 @@ func (c *Client) Stop() {
 	if c.proxy != nil {
 		c.proxy.Stop()
 	}
+	c.mu.RLock()
 	if c.tunnel != nil {
 		c.tunnel.Close()
 	}
+	c.mu.RUnlock()
 }
 
 // mustParsePort converts a port string to int; returns 443 on error.
