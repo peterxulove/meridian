@@ -91,11 +91,11 @@ generate_password() {
 calculate_spki_hex() {
     local cert_path="$1"
     if command -v sha256sum >/dev/null 2>&1; then
-        openssl x509 -in "$cert_path" -pubkey -noout | openssl pkey -pubout -outform DER 2>/dev/null | sha256sum | cut -c1-64
+        openssl x509 -in "$cert_path" -pubkey -noout | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | cut -c1-64
     elif command -v shasum >/dev/null 2>&1; then
-        openssl x509 -in "$cert_path" -pubkey -noout | openssl pkey -pubout -outform DER 2>/dev/null | shasum -a 256 | cut -c1-64
+        openssl x509 -in "$cert_path" -pubkey -noout | openssl pkey -pubin -outform DER 2>/dev/null | shasum -a 256 | cut -c1-64
     else
-        openssl x509 -in "$cert_path" -pubkey -noout | openssl pkey -pubout -outform DER 2>/dev/null | openssl dgst -sha256 | awk '{print $2}' | cut -c1-64
+        openssl x509 -in "$cert_path" -pubkey -noout | openssl pkey -pubin -outform DER 2>/dev/null | openssl dgst -sha256 | awk '{print $2}' | cut -c1-64
     fi
 }
 

@@ -217,7 +217,7 @@ openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem \
 
 # 3. Extract SPKI hash (paste into client config as reality_spki)
 openssl x509 -in cert.pem -pubkey -noout \
-  | openssl pkey -pubout -outform DER 2>/dev/null \
+  | openssl pkey -pubin -outform DER 2>/dev/null \
   | sha256sum | cut -c1-64
 
 # 4. Create config
@@ -474,7 +474,7 @@ proxy_protocol: "socks5"
 >
 > # Extract SPKI hash (paste into reality_spki in both configs)
 > openssl x509 -in cert.pem -pubkey -noout \
->   | openssl pkey -pubout -outform DER 2>/dev/null \
+>   | openssl pkey -pubin -outform DER 2>/dev/null \
 >   | sha256sum | cut -c1-64
 > ```
 

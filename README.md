@@ -218,7 +218,7 @@ openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem \
 
 # 3. 获取 SPKI 哈希（填入客户端配置）
 openssl x509 -in cert.pem -pubkey -noout \
-  | openssl pkey -pubout -outform DER 2>/dev/null \
+  | openssl pkey -pubin -outform DER 2>/dev/null \
   | sha256sum | cut -c1-64
 
 # 4. 创建配置文件
@@ -479,7 +479,7 @@ proxy_protocol: "socks5"
 >
 > # 提取 SPKI 哈希（填入 reality_spki）
 > openssl x509 -in cert.pem -pubkey -noout \
->   | openssl pkey -pubout -outform DER 2>/dev/null \
+>   | openssl pkey -pubin -outform DER 2>/dev/null \
 >   | sha256sum | cut -c1-64
 > ```
 

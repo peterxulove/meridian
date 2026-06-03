@@ -12,7 +12,7 @@ reality_enabled: true
 server_cert: "cert.pem"
 server_key: "key.pem"
 # Generate SPKI hash from your server cert:
-# openssl x509 -in cert.pem -pubkey -noout | openssl pkey -pubout -outform DER 2>/dev/null | sha256sum | cut -c1-64
+# openssl x509 -in cert.pem -pubkey -noout | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | cut -c1-64
 reality_spki: "0000000000000000000000000000000000000000000000000000000000000000"
 reality_short_id: 0
 reality_max_time: 0
