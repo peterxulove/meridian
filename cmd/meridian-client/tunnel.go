@@ -46,7 +46,7 @@ func NewTunnelClient(cfg config.ClientConfig) *TunnelClient {
 func (tc *TunnelClient) Connect() error {
 	var conn net.Conn
 
-	if tc.cfg.Transport == "Hysteria" {
+	if tc.cfg.Transport == config.TransportHysteria || tc.cfg.Transport == "QUIC" || tc.cfg.Transport == "Hysteria" {
 		tlsCfg, err := transport.ClientTLSConfig(tc.cfg)
 		if err != nil {
 			return fmt.Errorf("tunnel: TLS config error: %w", err)

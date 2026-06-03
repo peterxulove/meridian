@@ -268,7 +268,7 @@ func (s *Server) handleTCPTunnel(conn net.Conn) {
 	// ── MTP Handshake (Server Side) ───────────────────────────────────────
 	conn.SetReadDeadline(time.Now().Add(s.cfg.HandshakeTimeout))
 	buf := make([]byte, 1024)
-	n, err := conn.Read(buf)
+	n, err := io.ReadAtLeast(conn, buf, 136)
 	if err != nil {
 		if config.DebugMode {
 			fmt.Printf("[DEBUG] [Tunnel] Handshake read failed: %v\n", err)

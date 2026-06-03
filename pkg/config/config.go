@@ -45,7 +45,7 @@ func (c CipherID) String() string {
 type TransportType string
 
 const (
-	TransportHysteria   TransportType = "Hysteria"
+	TransportHysteria   TransportType = "QUIC"
 	TransportWebSocket  TransportType = "WebSocket"
 	TransportHTTPPOST   TransportType = "HTTP-POST"
 )
