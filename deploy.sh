@@ -12,6 +12,12 @@
 
 set -e
 
+# Re-execute with bash if run with sh
+if [ -z "$BASH_VERSION" ]; then
+    exec bash "$0" "$@"
+fi
+
+
 # Color definitions
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -39,7 +45,7 @@ if [ "$OS" = "linux" ]; then
     CONFIG_DIR="/etc/meridian"
     BIN_DIR="/usr/local/bin"
     # Detect sudo/root
-    if [ "$EUID" -ne 0 ]; then
+    if [ "$(id -u)" -ne 0 ]; then
         echo -e "${YELLOW}[Warning] Please run with sudo or as root for full installation on Linux.${NC}"
         SUDO="sudo"
     else
@@ -110,6 +116,11 @@ install_binary() {
         $SUDO cp "$bin_name" "$target_bin"
         $SUDO chmod +x "$target_bin"
         rm -f "$bin_name"
+    # Check if prebuilt exists in current directory as meridian-${role}-${OS}-${ARCH}
+    elif [ -f "meridian-${role}-${OS}-${ARCH}" ]; then
+        echo -e "Using prebuilt binary from current directory..."
+        $SUDO cp "meridian-${role}-${OS}-${ARCH}" "$target_bin"
+        $SUDO chmod +x "$target_bin"
     # Check if prebuilt exists in dist/
     elif [ -f "dist/meridian-${role}-${OS}-${ARCH}" ]; then
         echo -e "Using prebuilt binary from dist/ directory..."
@@ -121,9 +132,28 @@ install_binary() {
         $SUDO cp "meridian-${role}" "$target_bin"
         $SUDO chmod +x "$target_bin"
     else
-        echo -e "${RED}[Error] Could not find binary or build source.${NC}"
-        echo -e "Please run './build.sh' first, or install Go compiler to build from source."
-        exit 1
+        # Try to download from GitHub releases
+        local version="v1.5.0"
+        local asset_name="meridian-${role}-${OS}-${ARCH}"
+        if [ "$OS" = "windows" ]; then
+            asset_name+=".exe"
+        fi
+        local download_url="https://github.com/peterxulove/meridian/releases/download/${version}/${asset_name}"
+        
+        echo -e "No local binary or Go compiler found. Attempting to download ${version} from GitHub..."
+        echo -e "Download URL: ${download_url}"
+        
+        if command -v curl >/dev/null 2>&1; then
+            $SUDO curl -L -o "$target_bin" "$download_url"
+        elif command -v wget >/dev/null 2>&1; then
+            $SUDO wget -O "$target_bin" "$download_url"
+        else
+            echo -e "${RED}[Error] Neither curl nor wget found. Cannot download binary.${NC}"
+            echo -e "Please install Go, curl, wget, or compile/place binaries manually."
+            exit 1
+        fi
+        
+        $SUDO chmod +x "$target_bin"
     fi
     
     echo -e "${GREEN}Binary installed to $target_bin${NC}"
