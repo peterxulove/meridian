@@ -186,7 +186,26 @@ Download from the [Releases page](https://github.com/peterxulove/meridian/releas
 | Linux | ARM64 (Raspberry Pi, ARM servers) | `meridian-*-linux-arm64` |
 | Linux | x86_64 | `meridian-*-linux-amd64` |
 
-### Server Deployment (Linux)
+### One-Click Deployment (Recommended, Linux & macOS)
+
+A comprehensive one-click script `deploy.sh` is provided. It allows interactive installation, configuration, and automatic registration of the client and server as system services (`systemd` for Linux, `launchd` for macOS).
+
+```bash
+# 1. Make the script executable
+chmod +x deploy.sh
+
+# 2. Run the script to open the interactive menu
+./deploy.sh
+```
+
+**Supported CLI parameters:**
+* `./deploy.sh`: Open the interactive deployment menu.
+* `./deploy.sh status`: Display status of installed Meridian services.
+* `./deploy.sh uninstall`: Quickly uninstall client or server components.
+
+---
+
+### Server Deployment (Manual, Linux)
 
 ```bash
 # 1. Make executable

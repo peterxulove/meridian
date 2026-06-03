@@ -187,7 +187,26 @@ Meridian 是一个自定义安全代理协议，设计目标是在恶劣的网�
 | Linux | ARM64（树莓派、ARM 服务器） | `meridian-*-linux-arm64` |
 | Linux | x86_64 | `meridian-*-linux-amd64` |
 
-### 服务端部署（Linux 服务器）
+### 一键部署（推荐，支持 Linux & macOS）
+
+项目提供了一键部署脚本 `deploy.sh`，可交互式地安装、配置并启动服务端与客户端，自动注册为系统服务（Linux 上使用 `systemd`，macOS 上使用 `launchd`）。
+
+```bash
+# 1. 赋予执行权限
+chmod +x deploy.sh
+
+# 2. 运行脚本进入交互式菜单
+./deploy.sh
+```
+
+**支持的指令：**
+* `./deploy.sh`：打开交互式部署主菜单。
+* `./deploy.sh status`：查看目前所有 Meridian 服务运行状态。
+* `./deploy.sh uninstall`：快捷卸载已安装的客户端或服务端。
+
+---
+
+### 服务端部署（手动，Linux 服务器）
 
 ```bash
 # 1. 下载并赋予执行权限
