@@ -251,6 +251,12 @@ func (s *Server) startTCP() {
 	}
 }
 
+type activeStream struct {
+	conn      net.Conn
+	writeChan chan []byte
+	closeOnce sync.Once
+}
+
 func (s *Server) handleTCPTunnel(conn net.Conn) {
 	if config.DebugMode {
 		fmt.Printf("[DEBUG] [Tunnel] New tunnel connection from %s\n", conn.RemoteAddr())
@@ -320,14 +326,15 @@ func (s *Server) handleTCPTunnel(conn net.Conn) {
 	dec := mfp.NewUplinkDecoder(keys)
 
 	// Map of active StreamID -> target connection
-	activeStreams := make(map[uint32]net.Conn)
+	activeStreams := make(map[uint32]*activeStream)
 	var mu sync.Mutex // protects activeStreams
 	var writeMu sync.Mutex // protects concurrent writing to conn
 
 	defer func() {
 		mu.Lock()
 		for _, c := range activeStreams {
-			c.Close()
+			c.closeOnce.Do(func() { close(c.writeChan) })
+			c.conn.Close()
 		}
 		mu.Unlock()
 	}()
@@ -350,7 +357,8 @@ func (s *Server) handleTCPTunnel(conn net.Conn) {
 			mu.Lock()
 			tc, exists := activeStreams[sid]
 			if exists {
-				tc.Close()
+				tc.closeOnce.Do(func() { close(tc.writeChan) })
+				tc.conn.Close()
 				delete(activeStreams, sid)
 			}
 			mu.Unlock()
@@ -373,8 +381,13 @@ func (s *Server) handleTCPTunnel(conn net.Conn) {
 						return
 					}
 
+					streamInfo := &activeStream{
+						conn:      targetConn,
+						writeChan: make(chan []byte, 1024),
+					}
+
 					mu.Lock()
-					activeStreams[streamID] = targetConn
+					activeStreams[streamID] = streamInfo
 					mu.Unlock()
 
 					// Send CONNECT SUCCESS frame (Flags = 0x01)
@@ -383,48 +396,52 @@ func (s *Server) handleTCPTunnel(conn net.Conn) {
 					conn.Write(respFrame)
 					writeMu.Unlock()
 
-					// Start bidirectional relay
+					// Start writer goroutine
 					go func() {
-						defer func() {
-							targetConn.Close()
-							mu.Lock()
-							delete(activeStreams, streamID)
-							mu.Unlock()
-							// Send RESET to client
-							writeMu.Lock()
-							rf, _ := enc.Encode(streamID, mfp.TypeRESET, nil)
-							conn.Write(rf)
-							writeMu.Unlock()
-						}()
+						for data := range streamInfo.writeChan {
+							if _, err := targetConn.Write(data); err != nil {
+								break
+							}
+						}
+						targetConn.Close()
+						mu.Lock()
+						delete(activeStreams, streamID)
+						mu.Unlock()
+						// Send RESET to client
+						writeMu.Lock()
+						rf, _ := enc.Encode(streamID, mfp.TypeRESET, nil)
+						conn.Write(rf)
+						writeMu.Unlock()
+					}()
 
+					// Start bidirectional relay (reader)
+					go func() {
 						relayBuf := make([]byte, 32*1024)
 						for {
 							rn, err := targetConn.Read(relayBuf)
-							if err != nil {
-								return
+							if rn > 0 {
+								writeMu.Lock()
+								df, errEnc := enc.Encode(streamID, 0x00, relayBuf[:rn])
+								if errEnc == nil {
+									conn.Write(df)
+								}
+								writeMu.Unlock()
 							}
-
-							writeMu.Lock()
-							df, err := enc.Encode(streamID, 0x00, relayBuf[:rn])
-							if err == nil {
-								conn.Write(df)
-							}
-							writeMu.Unlock()
-
 							if err != nil {
-								return
+								break
 							}
 						}
+						streamInfo.closeOnce.Do(func() { close(streamInfo.writeChan) })
 					}()
 				}(sid, targetAddr)
 			} else {
 				// Standard DATA frame
 				mu.Lock()
-				targetConn, exists := activeStreams[sid]
+				tc, exists := activeStreams[sid]
 				mu.Unlock()
 
 				if exists {
-					go targetConn.Write(frame.Data)
+					tc.writeChan <- frame.Data
 				}
 			}
 		}

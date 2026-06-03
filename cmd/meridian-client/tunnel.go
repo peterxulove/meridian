@@ -167,7 +167,7 @@ func (tc *TunnelClient) DialStream(ctx context.Context, targetAddr string) (net.
 	sc := &StreamConn{
 		sid:         sid,
 		client:      tc,
-		readChan:    make(chan []byte, 128),
+		readChan:    make(chan []byte, 1024),
 		confirmChan: make(chan bool, 1),
 		closed:      make(chan struct{}),
 	}
@@ -249,11 +249,7 @@ func (tc *TunnelClient) readLoop() {
 				if flags == 0x01 {
 					sc.confirmChan <- true
 				} else {
-					select {
-					case sc.readChan <- frame.Data:
-					default:
-						// drop data if channel full to avoid blocking readLoop
-					}
+					sc.readChan <- frame.Data
 				}
 			}
 		}
