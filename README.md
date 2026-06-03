@@ -16,7 +16,7 @@
 ## 目录
 
 - [简介](#简介)
-- [v1.0.2 更新内容](#v102-更新内容)
+- [更新日志](#更新日志)
 - [协议架构](#协议架构)
 - [功能特性](#功能特性)
 - [快速开始](#快速开始)
@@ -44,24 +44,58 @@ Meridian 是一个自定义安全代理协议，设计目标是在恶劣的网�
 
 ---
 
-## v1.0.2 更新内容
+## 更新日志
 
-### 🆕 新增功能
+### v1.3.5.1（2026-06-03）
 
-- **完整 SOCKS5 代理服务器**（RFC 1928 + RFC 1929）
-  - 客户端启动后自动开启 SOCKS5 代理，无需额外配置
-  - 支持 TCP CONNECT 命令，兼容所有 IPv4、IPv6、域名目标
-  - 域名由代理服务端 DNS 解析（防止 DNS 泄露）
-  - 可选的用户名/密码认证（RFC 1929），配置密码即启用
-  - 每 60 秒自动打印流量统计（活跃连接数 / 总请求数 / 收发字节数）
-  - 每个请求记录带时间戳的访问日志
+#### 🐛 Bug 修复
 
-- **局域网代理服务**
-  - 默认监听 `0.0.0.0:1080`，局域网内所有设备均可接入
+- **修复 QUIC 传输协议名称不匹配问题**：配置文件中 `transport: "QUIC"` 无法正确匹配内部传输标识 `"Hysteria"`，导致客户端错误回退到 TCP 连接并出现 `deadline exceeded` 超时。现已统一传输名称为 `"QUIC"`，同时向后兼容 `"Hysteria"`。
+- **修复服务端握手流式读取 EOF 错误**：服务端使用 `conn.Read()` 读取 ClientHello，在 QUIC/TCP 流式传输中无法保证一次读取完整包，导致数据不足时服务端提前关闭连接，客户端收到 `EOF` 错误。已改用 `io.ReadAtLeast()` 确保至少读取 136 字节后再处理握手。
 
-### 🐛 Bug 修复
+#### 📦 构建
 
-- 修复配置文件中 `reality_spki` / `server_spki` 填写十六进制哈希时的 YAML 反序列化错误（`cannot unmarshal !!str into []uint8`）
+- 重新编译全平台二进制文件（Linux / macOS / Windows，amd64 / arm64）
+- 更新 SHA256SUMS 校验文件
+
+---
+
+### v1.3.5（2026-06-01）
+
+- 修复测试中 `TransportQUIC` 未定义错误
+- 更新 GitHub Actions 工作流至 Go 1.25
+- 重新编译全平台二进制文件
+
+### v1.3.2（2026-06-01）
+
+- 修复高延迟和数据损坏问题
+- QUIC 接收窗口调优
+
+### v1.3.1（2026-06-01）
+
+- 降级 Go Toolchain 至 1.23.0，修复 Linux/ARM64 FIPS CPU 初始化崩溃
+
+### v1.3.0（2026-06-01）
+
+- 实现 QUIC 传输层（基于 Hysteria v2）
+- SOCKS5 代理健壮性增强和全局调试模式
+
+### v1.0.2（2026-06-01）
+
+- 完整 SOCKS5 代理服务器（RFC 1928 + RFC 1929）
+- 局域网代理服务（默认监听 `0.0.0.0:1080`）
+- 修复 `reality_spki` / `server_spki` YAML 反序列化错误
+
+### v1.0.1
+
+- 配置文件 SPKI 十六进制解析修复
+
+### v1.0.0
+
+- Meridian 协议初始实现
+- X25519 ECDHE 密钥交换 + ChaCha20-Poly1305 加密
+- MFP 帧协议 + MTP 握手协议
+- 端到端集成测试
 
 ---
 
@@ -182,7 +216,7 @@ vim client.yaml   # 填入服务器地址、密码、SPKI 哈希
 
 启动后日志示例：
 ```text
-Meridian Client v1.0.2
+Meridian Client v1.3.5
   Server:    1.2.3.4:443
   Transport: QUIC
   Cipher:    MERIDIAN-CHACHA
@@ -535,6 +569,7 @@ meridian/
 ├── cmd/
 │   ├── meridian-client/    # 客户端 CLI 入口
 │   │   ├── main.go         # 主程序、Client 结构
+│   │   ├── tunnel.go       # QUIC/TCP 安全隧道（MTP 握手 + MFP 多路复用）
 │   │   └── socks5.go       # 完整 SOCKS5 代理服务器（RFC 1928/1929）
 │   └── meridian-server/    # 服务端 CLI 入口
 │       ├── main.go
@@ -589,14 +624,18 @@ go vet ./...
 - [x] **完整 SOCKS5 代理服务（RFC 1928 + RFC 1929）** ✅ v1.0.2
 - [x] **局域网代理服务（0.0.0.0 监听）** ✅ v1.0.2
 - [x] **配置文件 SPKI Hex 解析修复** ✅ v1.0.1
+- [x] **QUIC 传输层（Hysteria v2）** ✅ v1.3.0
+- [x] **ServerHello 完整回包** ✅ v1.3.0
+- [x] **数据帧通过 Meridian 加密隧道转发** ✅ v1.3.0
+- [x] **QUIC 传输连接和握手修复** ✅ v1.3.5.1
 - [x] CLI 参数支持
 - [x] 信号优雅退出
 - [x] GitHub Actions 自动发布
-- [ ] ServerHello 完整回包
-- [ ] 数据帧通过 Meridian 加密隧道转发
 - [ ] WebSocket 传输后端
 - [ ] 0-RTT 会话恢复
 - [ ] 密钥定期轮换
+- [ ] Windows 平台支持
+- [ ] HTTP 代理协议支持
 
 ---
 

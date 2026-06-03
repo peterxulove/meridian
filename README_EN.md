@@ -16,7 +16,7 @@
 ## Table of Contents
 
 - [Introduction](#introduction)
-- [What's New in v1.0.2](#whats-new-in-v102)
+- [Changelog](#changelog)
 - [Protocol Architecture](#protocol-architecture)
 - [Features](#features)
 - [Quick Start](#quick-start)
@@ -44,24 +44,58 @@ Meridian is a custom secure proxy protocol designed to deliver **undetectable en
 
 ---
 
-## What's New in v1.0.2
+## Changelog
 
-### 🆕 New Features
+### v1.3.5.1 (2026-06-03)
 
-- **Full SOCKS5 proxy server** (RFC 1928 + RFC 1929)
-  - Automatically starts when the client launches — no extra configuration required
-  - Supports TCP CONNECT for IPv4, IPv6, and domain name targets
-  - Server-side DNS resolution (prevents DNS leakage)
-  - Optional username/password authentication (RFC 1929) — enabled by setting credentials in config
-  - Prints traffic statistics every 60 seconds (active connections / total requests / bytes in/out)
-  - Timestamped access log per request
+#### 🐛 Bug Fixes
 
-- **LAN-wide proxy service**
-  - Listens on `0.0.0.0:1080` by default, accessible by all devices on the same network
+- **Fixed QUIC transport name mismatch**: Config value `transport: "QUIC"` did not match the internal transport identifier `"Hysteria"`, causing the client to incorrectly fall back to a TCP connection with `deadline exceeded` timeouts. The transport name is now unified to `"QUIC"` while remaining backward-compatible with `"Hysteria"`.
+- **Fixed server-side handshake stream read EOF**: The server used `conn.Read()` to read the ClientHello, which does not guarantee a complete read on QUIC/TCP streams. When insufficient data was received, the server prematurely closed the connection, causing the client to receive an `EOF` error. Changed to `io.ReadAtLeast()` to ensure at least 136 bytes are read before processing the handshake.
 
-### 🐛 Bug Fixes
+#### 📦 Build
 
-- Fixed YAML unmarshalling error when `reality_spki` / `server_spki` contains a hex string (`cannot unmarshal !!str into []uint8`)
+- Rebuilt all platform binaries (Linux / macOS / Windows, amd64 / arm64)
+- Updated SHA256SUMS checksum file
+
+---
+
+### v1.3.5 (2026-06-01)
+
+- Fixed `TransportQUIC` undefined error in tests
+- Updated GitHub Actions workflow to Go 1.25
+- Rebuilt all platform binaries
+
+### v1.3.2 (2026-06-01)
+
+- Fixed high latency and data corruption issues in multiplexer
+- Tuned QUIC receive window sizes for high throughput
+
+### v1.3.1 (2026-06-01)
+
+- Downgraded Go toolchain to 1.23.0 to fix Linux/ARM64 FIPS CPU init panic
+
+### v1.3.0 (2026-06-01)
+
+- Implemented QUIC transport layer (based on Hysteria v2)
+- Enhanced SOCKS5 proxy robustness and added global debug mode
+
+### v1.0.2 (2026-06-01)
+
+- Full SOCKS5 proxy server (RFC 1928 + RFC 1929)
+- LAN-wide proxy service (default listen `0.0.0.0:1080`)
+- Fixed `reality_spki` / `server_spki` YAML unmarshalling error
+
+### v1.0.1
+
+- Config SPKI hex parsing fix
+
+### v1.0.0
+
+- Initial Meridian Protocol implementation
+- X25519 ECDHE key exchange + ChaCha20-Poly1305 encryption
+- MFP frame protocol + MTP handshake protocol
+- End-to-end integration tests
 
 ---
 
@@ -182,7 +216,7 @@ vim client.yaml   # Set server address, password, SPKI hash
 
 Expected startup log:
 ```text
-Meridian Client v1.0.2
+Meridian Client v1.3.5
   Server:    1.2.3.4:443
   Transport: QUIC
   Cipher:    MERIDIAN-CHACHA
@@ -531,6 +565,7 @@ meridian/
 ├── cmd/
 │   ├── meridian-client/    # Client CLI entrypoint
 │   │   ├── main.go         # Main program, Client struct
+│   │   ├── tunnel.go       # QUIC/TCP secure tunnel (MTP handshake + MFP multiplexing)
 │   │   └── socks5.go       # Full SOCKS5 proxy server (RFC 1928/1929)
 │   └── meridian-server/    # Server CLI entrypoint
 │       ├── main.go
@@ -585,14 +620,18 @@ go vet ./...
 - [x] **Full SOCKS5 proxy server (RFC 1928 + RFC 1929)** ✅ v1.0.2
 - [x] **LAN-wide proxy service (0.0.0.0 listen)** ✅ v1.0.2
 - [x] **Config SPKI hex parsing fix** ✅ v1.0.1
+- [x] **QUIC transport layer (Hysteria v2)** ✅ v1.3.0
+- [x] **ServerHello full reply** ✅ v1.3.0
+- [x] **Data frame forwarding through Meridian encrypted tunnel** ✅ v1.3.0
+- [x] **QUIC transport connection and handshake fixes** ✅ v1.3.5.1
 - [x] CLI flags support
 - [x] Graceful signal shutdown
 - [x] GitHub Actions automated release
-- [ ] ServerHello full reply
-- [ ] Data frame forwarding through Meridian encrypted tunnel
 - [ ] WebSocket transport backend
 - [ ] 0-RTT session resumption
 - [ ] Periodic key rotation
+- [ ] Windows platform support
+- [ ] HTTP proxy protocol support
 
 ---
 
