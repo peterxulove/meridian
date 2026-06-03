@@ -17,7 +17,7 @@ import (
 	"meridian/pkg/mtp"
 	"meridian/pkg/transport"
 
-	"github.com/quic-go/quic-go"
+	"github.com/apernet/hysteria/core/v2/client"
 )
 
 // TunnelClient manages the secure multiplexed TCP tunnel to the server.
@@ -46,30 +46,41 @@ func NewTunnelClient(cfg config.ClientConfig) *TunnelClient {
 func (tc *TunnelClient) Connect() error {
 	var conn net.Conn
 
-	if tc.cfg.Transport == "QUIC" {
+	if tc.cfg.Transport == "Hysteria" {
 		tlsCfg, err := transport.ClientTLSConfig(tc.cfg)
 		if err != nil {
 			return fmt.Errorf("tunnel: TLS config error: %w", err)
 		}
 		
-		ctx, cancel := context.WithTimeout(context.Background(), tc.cfg.DialTimeout)
-		defer cancel()
-		
-		qconn, err := quic.DialAddr(ctx, tc.cfg.ServerAddr, tlsCfg, &quic.Config{
-			KeepAlivePeriod:            15 * time.Second,
-			MaxStreamReceiveWindow:     8 * 1024 * 1024,  // 8MB
-			MaxConnectionReceiveWindow: 20 * 1024 * 1024, // 20MB
+		serverAddr, err := net.ResolveUDPAddr("udp", tc.cfg.ServerAddr)
+		if err != nil {
+			return fmt.Errorf("tunnel: resolve UDP addr failed: %w", err)
+		}
+
+		hyClient, _, err := client.NewClient(&client.Config{
+			ServerAddr: serverAddr,
+			Auth:       tc.cfg.Password,
+			TLSConfig: client.TLSConfig{
+				ServerName:            tlsCfg.ServerName,
+				InsecureSkipVerify:    tlsCfg.InsecureSkipVerify,
+				VerifyPeerCertificate: tlsCfg.VerifyPeerCertificate,
+				RootCAs:               tlsCfg.RootCAs,
+			},
+			BandwidthConfig: client.BandwidthConfig{
+				MaxTx: tc.cfg.UpMbps * 1024 * 1024 / 8,
+				MaxRx: tc.cfg.DownMbps * 1024 * 1024 / 8,
+			},
 		})
 		if err != nil {
-			return fmt.Errorf("tunnel: QUIC dial failed: %w", err)
+			return fmt.Errorf("tunnel: Hysteria client creation failed: %w", err)
 		}
 		
-		stream, err := qconn.OpenStreamSync(ctx)
+		stream, err := hyClient.TCP("dummy:80")
 		if err != nil {
-			qconn.CloseWithError(1, err.Error())
-			return fmt.Errorf("tunnel: QUIC open stream failed: %w", err)
+			hyClient.Close()
+			return fmt.Errorf("tunnel: Hysteria TCP dial failed: %w", err)
 		}
-		conn = &quicStreamWrapper{Stream: stream, qconn: qconn}
+		conn = &hysteriaStreamWrapper{Conn: stream, hyClient: hyClient}
 	} else {
 		tcpConn, err := net.DialTimeout("tcp", tc.cfg.ServerAddr, tc.cfg.DialTimeout)
 		if err != nil {
@@ -373,24 +384,15 @@ func readTCPFrame(r io.Reader) ([]byte, error) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// QUIC Wrapper
+// Hysteria Wrapper
 // ─────────────────────────────────────────────────────────────────────────────
 
-type quicStreamWrapper struct {
-	*quic.Stream
-	qconn *quic.Conn
+type hysteriaStreamWrapper struct {
+	net.Conn
+	hyClient client.Client
 }
 
-func (q *quicStreamWrapper) LocalAddr() net.Addr {
-	return q.qconn.LocalAddr()
-}
-
-func (q *quicStreamWrapper) RemoteAddr() net.Addr {
-	return q.qconn.RemoteAddr()
-}
-
-func (q *quicStreamWrapper) Close() error {
-	q.Stream.CancelRead(0)
-	q.Stream.Close()
-	return q.qconn.CloseWithError(0, "closed")
+func (h *hysteriaStreamWrapper) Close() error {
+	h.Conn.Close()
+	return h.hyClient.Close()
 }

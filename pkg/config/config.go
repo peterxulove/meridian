@@ -45,9 +45,9 @@ func (c CipherID) String() string {
 type TransportType string
 
 const (
-	TransportQUIC     TransportType = "QUIC"
-	TransportWebSocket TransportType = "WebSocket"
-	TransportHTTPPOST  TransportType = "HTTP-POST"
+	TransportHysteria   TransportType = "Hysteria"
+	TransportWebSocket  TransportType = "WebSocket"
+	TransportHTTPPOST   TransportType = "HTTP-POST"
 )
 
 // PaddingMode defines traffic padding strategy.
@@ -102,6 +102,10 @@ type ClientConfig struct {
 	SessionLifetime   time.Duration `yaml:"session_lifetime" json:"session_lifetime"`
 	DialTimeout       time.Duration `yaml:"dial_timeout" json:"dial_timeout"`
 
+	// Hysteria v2
+	UpMbps   uint64 `yaml:"up_mbps" json:"up_mbps"`
+	DownMbps uint64 `yaml:"down_mbps" json:"down_mbps"`
+
 	// Local proxy settings (SOCKS/HTTP)
 	ListenAddr      string `yaml:"listen_addr" json:"listen_addr"`
 	ProxyProtocol   string `yaml:"proxy_protocol" json:"proxy_protocol"` // "socks5" or "http"
@@ -149,6 +153,10 @@ type ServerConfig struct {
 	StreamWindow     uint64        `yaml:"stream_window" json:"stream_window"`
 	KeepaliveInterval time.Duration `yaml:"keepalive_interval" json:"keepalive_interval"`
 	HandshakeTimeout time.Duration `yaml:"handshake_timeout" json:"handshake_timeout"`
+
+	// Hysteria v2
+	UpMbps   uint64 `yaml:"up_mbps" json:"up_mbps"`
+	DownMbps uint64 `yaml:"down_mbps" json:"down_mbps"`
 }
 
 // DestinationConfig defines an upstream proxy destination.
@@ -165,7 +173,7 @@ type DestinationConfig struct {
 // DefaultClientConfig returns sensible defaults.
 func DefaultClientConfig() ClientConfig {
 	return ClientConfig{
-		Transport:         TransportQUIC,
+		Transport:         TransportHysteria,
 		CipherSuite:       CipherMeridianChacha,
 		SNISpoof:          "www.google.com",
 		RealityMode:       true,
@@ -185,6 +193,8 @@ func DefaultClientConfig() ClientConfig {
 		ProxyProtocol:    "socks5",
 		WSSPath:          "/ws/",
 		MirrorPath:       "/upload",
+		UpMbps:           1000,
+		DownMbps:         1000,
 	}
 }
 
@@ -192,7 +202,7 @@ func DefaultClientConfig() ClientConfig {
 func DefaultServerConfig() ServerConfig {
 	return ServerConfig{
 		ListenAddr:       "0.0.0.0:443",
-		Transport:        TransportQUIC,
+		Transport:        TransportHysteria,
 		CipherSuite:      CipherMeridianChacha,
 		RealityMode:      false,
 		RealityEnabled:   false,
@@ -214,6 +224,8 @@ func DefaultServerConfig() ServerConfig {
 				Priority: 0,
 			},
 		},
+		UpMbps:   1000,
+		DownMbps: 1000,
 	}
 }
 

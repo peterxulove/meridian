@@ -10,7 +10,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"context"
 
 	"meridian/pkg/config"
 	"meridian/pkg/crypto"
@@ -18,16 +17,17 @@ import (
 	"meridian/pkg/mtp"
 	"meridian/pkg/transport"
 
-	"github.com/quic-go/quic-go"
+	"github.com/apernet/hysteria/core/v2/server"
 )
 
 // Server manages Meridian connections.
 type Server struct {
 	cfg     config.ServerConfig
 	udp     *net.UDPConn
-	conns   sync.Map
-	stopped atomic.Bool
-	wg      sync.WaitGroup
+	conns    sync.Map
+	hyServer server.Server
+	stopped  atomic.Bool
+	wg       sync.WaitGroup
 	stats   ServerStats
 }
 
@@ -51,58 +51,57 @@ func (s *Server) Start() error {
 	}
 	// Start TCP Tunnel listener concurrently for reliable proxying
 	go s.startTCP()
-	return s.startQUIC()
+	return s.startHysteria()
 }
 
-func (s *Server) startQUIC() error {
+func (s *Server) startHysteria() error {
 	tlsCfg, err := transport.ServerTLSConfig(s.cfg)
 	if err != nil {
 		return err
 	}
 	
-	listener, err := quic.ListenAddr(s.cfg.ListenAddr, tlsCfg, &quic.Config{
-		KeepAlivePeriod:            s.cfg.KeepaliveInterval,
-		MaxStreamReceiveWindow:     8 * 1024 * 1024,  // 8MB
-		MaxConnectionReceiveWindow: 20 * 1024 * 1024, // 20MB
+	udpAddr, err := net.ResolveUDPAddr("udp", s.cfg.ListenAddr)
+	if err != nil {
+		return err
+	}
+	conn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		return err
+	}
+	s.udp = conn
+
+	hyServer, err := server.NewServer(&server.Config{
+		Conn: conn,
+		TLSConfig: server.TLSConfig{
+			Certificates:   tlsCfg.Certificates,
+			GetCertificate: tlsCfg.GetCertificate,
+			ClientCAs:      tlsCfg.ClientCAs,
+		},
+		Authenticator: &dummyAuthenticator{password: s.cfg.Password},
+		Outbound:      &hysteriaOutbound{s: s},
+		BandwidthConfig: server.BandwidthConfig{
+			MaxTx: s.cfg.DownMbps * 1024 * 1024 / 8, // DownMbps server tx
+			MaxRx: s.cfg.UpMbps * 1024 * 1024 / 8,
+		},
+		DisableUDP: true,
 	})
 	if err != nil {
 		return err
 	}
-	fmt.Printf("  [QUIC] Listening on %s (tunnel server)\n", s.cfg.ListenAddr)
+	s.hyServer = hyServer
+
+	fmt.Printf("  [Hysteria v2] Listening on %s (tunnel server)\n", s.cfg.ListenAddr)
 
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		for {
-			if s.stopped.Load() {
-				break
+		if err := hyServer.Serve(); err != nil {
+			if !s.stopped.Load() {
+				fmt.Printf("[Hysteria v2] Serve failed: %v\n", err)
 			}
-			conn, err := listener.Accept(context.Background())
-			if err != nil {
-				if s.stopped.Load() {
-					break
-				}
-				continue
-			}
-			go s.handleQUICConnection(conn)
 		}
 	}()
 	return nil
-}
-
-func (s *Server) handleQUICConnection(conn *quic.Conn) {
-	if config.DebugMode {
-		fmt.Printf("[DEBUG] [QUIC] Accepted connection from %s\n", (*conn).RemoteAddr())
-	}
-	stream, err := (*conn).AcceptStream(context.Background())
-	if err != nil {
-		if config.DebugMode {
-			fmt.Printf("[DEBUG] [QUIC] AcceptStream failed: %v\n", err)
-		}
-		return
-	}
-	wrapper := &quicStreamWrapper{Stream: stream, qconn: conn}
-	s.handleTCPTunnel(wrapper)
 }
 
 func (s *Server) startWS() error {
@@ -195,6 +194,9 @@ func (s *Server) forwardFrame(frame *mfp.DataFrame, remote *net.UDPAddr) {
 // Stop signals the server to shut down and waits for all goroutines to exit.
 func (s *Server) Stop() {
 	s.stopped.Store(true)
+	if s.hyServer != nil {
+		s.hyServer.Close()
+	}
 	if s.udp != nil {
 		s.udp.Close()
 	}
@@ -481,24 +483,31 @@ func readTCPFrame(r io.Reader) ([]byte, error) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// QUIC Wrapper
+// Hysteria Outbound & Auth
 // ─────────────────────────────────────────────────────────────────────────────
 
-type quicStreamWrapper struct {
-	*quic.Stream
-	qconn *quic.Conn
+type dummyAuthenticator struct {
+	password string
 }
 
-func (q *quicStreamWrapper) LocalAddr() net.Addr {
-	return q.qconn.LocalAddr()
+func (a *dummyAuthenticator) Authenticate(addr net.Addr, auth string, tx uint64) (ok bool, id string) {
+	return auth == a.password, ""
 }
 
-func (q *quicStreamWrapper) RemoteAddr() net.Addr {
-	return q.qconn.RemoteAddr()
+type hysteriaOutbound struct {
+	s *Server
 }
 
-func (q *quicStreamWrapper) Close() error {
-	q.Stream.CancelRead(0)
-	q.Stream.Close()
-	return q.qconn.CloseWithError(0, "closed")
+func (h *hysteriaOutbound) TCP(reqAddr string) (net.Conn, error) {
+	c1, c2 := net.Pipe()
+	go h.s.handleTCPTunnel(c1)
+	return c2, nil
+}
+
+func (h *hysteriaOutbound) UDP(reqAddr string) (server.UDPConn, error) {
+	return nil, fmt.Errorf("udp not supported")
+}
+
+func (h *hysteriaOutbound) CheckUDP(reqAddr string) error {
+	return fmt.Errorf("udp not supported")
 }
