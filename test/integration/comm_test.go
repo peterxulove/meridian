@@ -247,7 +247,7 @@ func TestPaddingRoundTrip(t *testing.T) {
 func TestClientHelloBuildAndParse(t *testing.T) {
 	cfg := config.DefaultClientConfig()
 	cfg.ServerAddr = "127.0.0.1:15443"
-	cfg.Transport = config.TransportQUIC
+	cfg.Transport = config.TransportHysteria
 	cfg.PaddingMode = config.PaddingNone
 	cfg.RealityMode = false
 
