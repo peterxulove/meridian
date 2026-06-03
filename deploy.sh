@@ -186,7 +186,7 @@ configure_server() {
         $SUDO openssl req -x509 -newkey rsa:2048 -nodes \
             -keyout "$key_path" \
             -out "$cert_path" \
-            -subj "/CN=www.google.com" \
+            -subj "/CN=www.apple.com" \
             -days 3650 >/dev/null 2>&1
         $SUDO chmod 600 "$key_path"
         $SUDO chmod 644 "$cert_path"
@@ -287,7 +287,7 @@ cipher_suite: 1
 password: "${client_password}"
 
 # ─── REALITY Mode (anti-detection) ───
-sni_spoof: "www.google.com"
+sni_spoof: "www.apple.com"
 reality_mode: true
 reality_spki: "${client_spki}"
 reality_short_id: 12345
