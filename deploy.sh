@@ -30,6 +30,10 @@ NC='\033[0m'
 
 # Check OS and Architecture
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+if [ -f "/etc/openwrt_release" ]; then
+    OS="openwrt"
+fi
+
 ARCH="$(uname -m)"
 if [ "$ARCH" = "x86_64" ]; then
     ARCH="amd64"
@@ -51,12 +55,16 @@ if [ "$OS" = "linux" ]; then
     else
         SUDO=""
     fi
+elif [ "$OS" = "openwrt" ]; then
+    CONFIG_DIR="/etc/meridian"
+    BIN_DIR="/usr/sbin"
+    SUDO=""
 elif [ "$OS" = "darwin" ]; then
     CONFIG_DIR="$HOME/.meridian"
     BIN_DIR="/usr/local/bin"
     SUDO=""
 else
-    echo -e "${RED}[Error] Unsupported OS: $OS. This script supports Linux and macOS only.${NC}"
+    echo -e "${RED}[Error] Unsupported OS: $OS. This script supports Linux, OpenWrt/iStoreOS and macOS only.${NC}"
     exit 1
 fi
 
@@ -109,6 +117,11 @@ install_binary() {
     
     $SUDO mkdir -p "$BIN_DIR"
     
+    local platform="$OS"
+    if [ "$OS" = "openwrt" ]; then
+        platform="linux"
+    fi
+    
     # Check if we are running in the source repo and can build
     if command -v go >/dev/null 2>&1 && [ -f "go.mod" ]; then
         echo -e "Go compiler found. Building from source..."
@@ -116,15 +129,15 @@ install_binary() {
         $SUDO cp "$bin_name" "$target_bin"
         $SUDO chmod +x "$target_bin"
         rm -f "$bin_name"
-    # Check if prebuilt exists in current directory as meridian-${role}-${OS}-${ARCH}
-    elif [ -f "meridian-${role}-${OS}-${ARCH}" ]; then
+    # Check if prebuilt exists in current directory as meridian-${role}-${platform}-${ARCH}
+    elif [ -f "meridian-${role}-${platform}-${ARCH}" ]; then
         echo -e "Using prebuilt binary from current directory..."
-        $SUDO cp "meridian-${role}-${OS}-${ARCH}" "$target_bin"
+        $SUDO cp "meridian-${role}-${platform}-${ARCH}" "$target_bin"
         $SUDO chmod +x "$target_bin"
     # Check if prebuilt exists in dist/
-    elif [ -f "dist/meridian-${role}-${OS}-${ARCH}" ]; then
+    elif [ -f "dist/meridian-${role}-${platform}-${ARCH}" ]; then
         echo -e "Using prebuilt binary from dist/ directory..."
-        $SUDO cp "dist/meridian-${role}-${OS}-${ARCH}" "$target_bin"
+        $SUDO cp "dist/meridian-${role}-${platform}-${ARCH}" "$target_bin"
         $SUDO chmod +x "$target_bin"
     # Check if local built exists in root
     elif [ -f "meridian-${role}" ]; then
@@ -134,7 +147,7 @@ install_binary() {
     else
         # Try to download from GitHub releases
         local version="v1.5.0"
-        local asset_name="meridian-${role}-${OS}-${ARCH}"
+        local asset_name="meridian-${role}-${platform}-${ARCH}"
         if [ "$OS" = "windows" ]; then
             asset_name+=".exe"
         fi
@@ -338,6 +351,37 @@ EOF
         echo -e "${GREEN}Service status:${NC}"
         $SUDO systemctl status "$bin_name" --no-pager -n 3
         
+    elif [ "$OS" = "openwrt" ]; then
+        local service_file="/etc/init.d/${bin_name}"
+        cat <<EOF | $SUDO tee "$service_file" >/dev/null
+#!/etc/rc.common
+
+START=99
+USE_PROCD=1
+
+CONF_FILE="${CONFIG_DIR}/${role}.yaml"
+BIN_FILE="${BIN_DIR}/${bin_name}"
+
+start_service() {
+    if [ ! -f "\$CONF_FILE" ]; then
+        echo "Configuration file \$CONF_FILE not found."
+        return 1
+    fi
+
+    procd_open_instance
+    procd_set_param command "\$BIN_FILE" -config "\$CONF_FILE"
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_set_param respawn
+    procd_close_instance
+}
+EOF
+        $SUDO chmod +x "$service_file"
+        $SUDO "$service_file" enable
+        $SUDO "$service_file" start
+        echo -e "${GREEN}OpenWrt init.d service registered: ${service_file}${NC}"
+        echo -e "${GREEN}Service enabled and started.${NC}"
+
     elif [ "$OS" = "darwin" ]; then
         local plist_file="$HOME/Library/LaunchAgents/com.meridian.${role}.plist"
         cat <<EOF > "$plist_file"
@@ -389,6 +433,14 @@ uninstall_service() {
             $SUDO rm -f "/etc/systemd/system/${bin_name}.service"
             $SUDO systemctl daemon-reload
             echo -e "Removed systemd service."
+        fi
+    elif [ "$OS" = "openwrt" ]; then
+        local service_file="/etc/init.d/${bin_name}"
+        if [ -f "$service_file" ]; then
+            $SUDO "$service_file" stop || true
+            $SUDO "$service_file" disable || true
+            $SUDO rm -f "$service_file"
+            echo -e "Removed OpenWrt init.d service."
         fi
     elif [ "$OS" = "darwin" ]; then
         local plist_file="$HOME/Library/LaunchAgents/com.meridian.${role}.plist"
@@ -447,6 +499,8 @@ print_client_summary() {
     echo -e "To check client logs:"
     if [ "$OS" = "linux" ]; then
         echo -e "${CYAN}journalctl -u meridian-client -f${NC}"
+    elif [ "$OS" = "openwrt" ]; then
+        echo -e "${CYAN}logread -f | grep meridian-client${NC}"
     elif [ "$OS" = "darwin" ]; then
         echo -e "${CYAN}tail -f ${CONFIG_DIR}/client.log${NC}"
     fi
@@ -476,6 +530,19 @@ case "$ACTION" in
             systemctl status meridian-server --no-pager || echo "Server service not installed."
             echo -e "\n${BLUE}--- Client Status ---${NC}"
             systemctl status meridian-client --no-pager || echo "Client service not installed."
+        elif [ "$OS" = "openwrt" ]; then
+            echo -e "${BLUE}--- Server Status ---${NC}"
+            if [ -f "/etc/init.d/meridian-server" ]; then
+                /etc/init.d/meridian-server status || logread | grep meridian-server | tail -n 5
+            else
+                echo "Server service not installed."
+            fi
+            echo -e "\n${BLUE}--- Client Status ---${NC}"
+            if [ -f "/etc/init.d/meridian-client" ]; then
+                /etc/init.d/meridian-client status || logread | grep meridian-client | tail -n 5
+            else
+                echo "Client service not installed."
+            fi
         elif [ "$OS" = "darwin" ]; then
             echo -e "${BLUE}--- Launchd Services ---${NC}"
             launchctl list | grep meridian || echo "No active meridian agents found."
@@ -522,6 +589,19 @@ case "$ACTION" in
                     systemctl status meridian-server --no-pager -n 5 || echo "Server service not running/installed."
                     echo -e "\n${BLUE}--- Client Status ---${NC}"
                     systemctl status meridian-client --no-pager -n 5 || echo "Client service not running/installed."
+                elif [ "$OS" = "openwrt" ]; then
+                    echo -e "${BLUE}--- Server Status ---${NC}"
+                    if [ -f "/etc/init.d/meridian-server" ]; then
+                        /etc/init.d/meridian-server status || logread | grep meridian-server | tail -n 5
+                    else
+                        echo "Server service not running/installed."
+                    fi
+                    echo -e "\n${BLUE}--- Client Status ---${NC}"
+                    if [ -f "/etc/init.d/meridian-client" ]; then
+                        /etc/init.d/meridian-client status || logread | grep meridian-client | tail -n 5
+                    else
+                        echo "Client service not running/installed."
+                    fi
                 elif [ "$OS" = "darwin" ]; then
                     echo -e "${BLUE}--- Active Launchd Services ---${NC}"
                     launchctl list | grep meridian || echo "No active meridian agents found."
