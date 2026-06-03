@@ -117,6 +117,9 @@ type ClientConfig struct {
 
 	// WebSocket upgrade settings
 	WSSPath string `yaml:"wss_path" json:"wss_path"`
+
+	RenewalInterval  time.Duration `yaml:"renewal_interval" json:"renewal_interval"`
+	RenewalDataLimit uint64        `yaml:"renewal_data_limit" json:"renewal_data_limit"`
 }
 
 // ServerConfig is the server-side configuration.
@@ -157,6 +160,9 @@ type ServerConfig struct {
 	// Hysteria v2
 	UpMbps   uint64 `yaml:"up_mbps" json:"up_mbps"`
 	DownMbps uint64 `yaml:"down_mbps" json:"down_mbps"`
+
+	RenewalInterval  time.Duration `yaml:"renewal_interval" json:"renewal_interval"`
+	RenewalDataLimit uint64        `yaml:"renewal_data_limit" json:"renewal_data_limit"`
 }
 
 // DestinationConfig defines an upstream proxy destination.
@@ -195,6 +201,8 @@ func DefaultClientConfig() ClientConfig {
 		MirrorPath:       "/upload",
 		UpMbps:           1000,
 		DownMbps:         1000,
+		RenewalInterval:  5 * time.Minute,
+		RenewalDataLimit: 67108864, // 64MB
 	}
 }
 
@@ -226,6 +234,8 @@ func DefaultServerConfig() ServerConfig {
 		},
 		UpMbps:   1000,
 		DownMbps: 1000,
+		RenewalInterval:  5 * time.Minute,
+		RenewalDataLimit: 67108864, // 64MB
 	}
 }
 

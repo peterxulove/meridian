@@ -7,14 +7,13 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"os/signal"
-	"syscall"
 	"time"
 	"sync"
 
 	"meridian/pkg/anti"
 	"meridian/pkg/config"
 	"meridian/pkg/crypto"
+	"meridian/pkg/mtp"
 )
 
 func main() {
@@ -54,7 +53,7 @@ func main() {
 	RaiseFileLimit(65535)
 
 	sigch := make(chan os.Signal, 1)
-	signal.Notify(sigch, syscall.SIGINT, syscall.SIGTERM)
+	notifySignals(sigch)
 
 	if err := client.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error starting client: %v\n", err)
@@ -90,10 +89,11 @@ func flagParse() (cfgPath, listen string, showFP bool, debug bool) {
 
 // Client manages the Meridian upstream connection and the local SOCKS5 proxy.
 type Client struct {
-	cfg    config.ClientConfig
-	mu     sync.RWMutex
-	tunnel *TunnelClient
-	proxy  *Socks5Server
+	cfg          config.ClientConfig
+	mu           sync.RWMutex
+	tunnel       *TunnelClient
+	proxy        ProxyServer
+	sessionStore *mtp.SessionStore
 }
 
 // NewClient initialises a Client, generating a session ID if none is set.
@@ -105,12 +105,15 @@ func NewClient(cfg config.ClientConfig) (*Client, error) {
 		}
 		copy(cfg.SessionID[:], b)
 	}
-	return &Client{cfg: cfg}, nil
+	return &Client{
+		cfg:          cfg,
+		sessionStore: mtp.NewSessionStore(),
+	}, nil
 }
 
 func (c *Client) maintainTunnel() {
 	for {
-		tunnel := NewTunnelClient(c.cfg)
+		tunnel := NewTunnelClient(c.cfg, c.sessionStore)
 		if err := tunnel.Connect(); err != nil {
 			fmt.Printf("  [Tunnel] Connection failed: %v. Retrying in 5s...\n", err)
 			time.Sleep(5 * time.Second)
@@ -147,7 +150,12 @@ func (c *Client) Start() error {
 		return nil, fmt.Errorf("tunnel not connected or unavailable")
 	}
 
-	c.proxy = NewSocks5Server(c.cfg.ListenAddr, "", "", dialFn)
+	switch c.cfg.ProxyProtocol {
+	case "http":
+		c.proxy = NewHttpProxyServer(c.cfg.ListenAddr, "", "", dialFn)
+	default:
+		c.proxy = NewSocks5Server(c.cfg.ListenAddr, "", "", dialFn)
+	}
 	return c.proxy.Start()
 }
 

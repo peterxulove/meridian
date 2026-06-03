@@ -5,8 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"os/signal"
-	"syscall"
 
 	"meridian/pkg/anti"
 	"meridian/pkg/config"
@@ -47,7 +45,7 @@ func main() {
 	// Fix #12: signal channel was created but never registered with signal.Notify,
 	// causing <-sigch to block forever. Now registers SIGINT and SIGTERM.
 	sigch := make(chan os.Signal, 1)
-	signal.Notify(sigch, syscall.SIGINT, syscall.SIGTERM)
+	notifySignals(sigch)
 
 	if err := server.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error starting server: %v\n", err)

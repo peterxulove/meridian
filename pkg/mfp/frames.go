@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"meridian/pkg/config"
 	"meridian/pkg/crypto"
+	"sync"
+	"time"
 )
 
 const (
@@ -174,22 +176,33 @@ type Encoder struct {
 	Pool  *FramePool
 	Count uint64
 	seed  *[crypto.NonceSeedLen]byte
+
+	isUplink        bool
+	bytesProcessed  uint64
+	createdAt       time.Time
+	renewalLimit    uint64
+	renewalInterval time.Duration
+	generation      uint32
+	mu              sync.Mutex
 }
 
 // NewEncoder creates an uplink encoder (client→server), using NonceSeedUplink.
 func NewEncoder(keys *crypto.KeyMaterial) *Encoder {
-	return &Encoder{Keys: keys, Pool: NewFramePool(), seed: &keys.NonceSeedUplink}
+	return &Encoder{Keys: keys, Pool: NewFramePool(), seed: &keys.NonceSeedUplink, isUplink: true, createdAt: time.Now()}
 }
 
 // NewDownlinkEncoder creates a downlink encoder (server→client), using NonceSeedDownlk.
 func NewDownlinkEncoder(keys *crypto.KeyMaterial) *Encoder {
-	return &Encoder{Keys: keys, Pool: NewFramePool(), seed: &keys.NonceSeedDownlk}
+	return &Encoder{Keys: keys, Pool: NewFramePool(), seed: &keys.NonceSeedDownlk, isUplink: false, createdAt: time.Now()}
 }
 
 // Encode encrypts data for stream sid with the given flags.
 // PayloadLen in the header records the actual (pre-padding) data length so
 // the receiver can strip padding via Decoder.Decode.
 func (e *Encoder) Encode(sid uint32, flags byte, data []byte) ([]byte, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	seq := e.Count
 	e.Count++
 
@@ -210,10 +223,51 @@ func (e *Encoder) Encode(sid uint32, flags byte, data []byte) ([]byte, error) {
 		return nil, err
 	}
 
+	e.bytesProcessed += uint64(len(data))
+
 	buf := e.Pool.Get()
 	*buf = append((*buf)[:0], hb...)
 	*buf = append(*buf, ciphertext...)
 	return *buf, nil
+}
+
+func (e *Encoder) SetRenewal(limit uint64, interval time.Duration) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.renewalLimit = limit
+	e.renewalInterval = interval
+}
+
+func (e *Encoder) ShouldRotate() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.renewalLimit > 0 && e.bytesProcessed >= e.renewalLimit {
+		return true
+	}
+	if e.renewalInterval > 0 && time.Since(e.createdAt) >= e.renewalInterval {
+		return true
+	}
+	return false
+}
+
+func (e *Encoder) RotateKeys() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.generation++
+	newKeys, err := crypto.RotateKeyMaterial(e.Keys, e.generation)
+	if err != nil {
+		return err
+	}
+	e.Keys = newKeys
+	if e.isUplink {
+		e.seed = &newKeys.NonceSeedUplink
+	} else {
+		e.seed = &newKeys.NonceSeedDownlk
+	}
+	e.Count = 0
+	e.bytesProcessed = 0
+	e.createdAt = time.Now()
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -232,18 +286,26 @@ type Decoder struct {
 	Pool  *FramePool
 	Count uint64
 	seed  *[crypto.NonceSeedLen]byte // matches the encoder's seed for this direction
+
+	isUplink        bool
+	bytesProcessed  uint64
+	createdAt       time.Time
+	renewalLimit    uint64
+	renewalInterval time.Duration
+	generation      uint32
+	mu              sync.Mutex
 }
 
 // NewUplinkDecoder creates a decoder for server-side decryption of client→server frames.
 // It uses NonceSeedUplink, matching the client's Encoder.
 func NewUplinkDecoder(keys *crypto.KeyMaterial) *Decoder {
-	return &Decoder{Keys: keys, Pool: NewFramePool(), seed: &keys.NonceSeedUplink}
+	return &Decoder{Keys: keys, Pool: NewFramePool(), seed: &keys.NonceSeedUplink, isUplink: true, createdAt: time.Now()}
 }
 
 // NewDownlinkDecoder creates a decoder for client-side decryption of server→client frames.
 // It uses NonceSeedDownlk, matching the server's Encoder (when server sends downlink).
 func NewDownlinkDecoder(keys *crypto.KeyMaterial) *Decoder {
-	return &Decoder{Keys: keys, Pool: NewFramePool(), seed: &keys.NonceSeedDownlk}
+	return &Decoder{Keys: keys, Pool: NewFramePool(), seed: &keys.NonceSeedDownlk, isUplink: false, createdAt: time.Now()}
 }
 
 // NewDecoder is kept for backward compatibility; defaults to uplink (server-side) decoding.
@@ -261,6 +323,9 @@ func (d *Decoder) Decode(data []byte) (*DataFrame, error) {
 		return nil, err
 	}
 
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
 	nonce := crypto.GenerateNonce(d.seed, d.Count)
 	d.Count++
 
@@ -268,7 +333,49 @@ func (d *Decoder) Decode(data []byte) (*DataFrame, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	d.bytesProcessed += uint64(len(plain))
+
 	return &DataFrame{Header: *h, Data: plain}, nil
+}
+
+func (d *Decoder) SetRenewal(limit uint64, interval time.Duration) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.renewalLimit = limit
+	d.renewalInterval = interval
+}
+
+func (d *Decoder) ShouldRotate() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.renewalLimit > 0 && d.bytesProcessed >= d.renewalLimit {
+		return true
+	}
+	if d.renewalInterval > 0 && time.Since(d.createdAt) >= d.renewalInterval {
+		return true
+	}
+	return false
+}
+
+func (d *Decoder) RotateKeys() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.generation++
+	newKeys, err := crypto.RotateKeyMaterial(d.Keys, d.generation)
+	if err != nil {
+		return err
+	}
+	d.Keys = newKeys
+	if d.isUplink {
+		d.seed = &newKeys.NonceSeedUplink
+	} else {
+		d.seed = &newKeys.NonceSeedDownlk
+	}
+	d.Count = 0
+	d.bytesProcessed = 0
+	d.createdAt = time.Now()
+	return nil
 }
 
 // ---------------------------------------------------------------------------

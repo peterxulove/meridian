@@ -28,7 +28,8 @@ type Server struct {
 	hyServer server.Server
 	stopped  atomic.Bool
 	wg       sync.WaitGroup
-	stats   ServerStats
+	stats    ServerStats
+	sessionStore *mtp.SessionStore
 }
 
 // ServerStats tracks connection metrics.
@@ -41,7 +42,10 @@ type ServerStats struct {
 
 // NewServer creates a new Meridian server.
 func NewServer(cfg config.ServerConfig) (*Server, error) {
-	return &Server{cfg: cfg}, nil
+	return &Server{
+		cfg:          cfg,
+		sessionStore: mtp.NewSessionStore(),
+	}, nil
 }
 
 // Start begins listening on the configured address.
@@ -105,9 +109,29 @@ func (s *Server) startHysteria() error {
 }
 
 func (s *Server) startWS() error {
-	// WebSocket listener is not yet fully implemented.
-	// The stub returns an error so the caller knows it's unavailable.
-	return fmt.Errorf("server: WebSocket transport not yet implemented")
+	listener := transport.NewWSListener(s.cfg)
+	
+	go func() {
+		if err := listener.ListenAndServe(); err != nil {
+			if !s.stopped.Load() {
+				fmt.Printf("  [WebSocket] Listen error: %v\n", err)
+			}
+		}
+	}()
+
+	fmt.Printf("  [WebSocket] Listening on %s%s (tunnel server)\n", s.cfg.ListenAddr, s.cfg.WSSPath)
+
+	for {
+		if s.stopped.Load() {
+			break
+		}
+		conn, err := listener.Accept()
+		if err != nil {
+			continue
+		}
+		go s.handleTCPTunnel(conn)
+	}
+	return nil
 }
 
 func (s *Server) handlePacket(data []byte, remote *net.UDPAddr) {
@@ -290,42 +314,70 @@ func (s *Server) handleTCPTunnel(conn net.Conn) {
 		return
 	}
 
-	serverEK, err := crypto.GenerateKeyPair()
-	if err != nil {
-		return
+	var keys *crypto.KeyMaterial
+	var status byte = 1 // 1 = full handshake, 0 = resume accepted
+	var serverEKPub []byte = make([]byte, 32)
+	var serverRandomBytes []byte = make([]byte, 32)
+
+	if hs.IsResume {
+		if cached, ok := s.sessionStore.Lookup(hs.ClientID); ok {
+			keys = cached.Keys
+			status = 0
+		}
 	}
 
-	shared, err := crypto.SharedKey(
-		&crypto.KeyPair{PrivKey: serverEK.PrivKey},
-		hs.ClientECDHE,
-	)
-	if err != nil {
-		return
-	}
+	if status != 0 {
+		serverEK, err := crypto.GenerateKeyPair()
+		if err != nil {
+			return
+		}
 
-	serverRandomBytes, err := crypto.GenerateRandom(32)
-	if err != nil {
-		return
-	}
-	var serverRandom [32]byte
-	copy(serverRandom[:], serverRandomBytes)
+		shared, err := crypto.SharedKey(
+			&crypto.KeyPair{PrivKey: serverEK.PrivKey},
+			hs.ClientECDHE,
+		)
+		if err != nil {
+			return
+		}
 
-	keys, err := crypto.DeriveKeys(shared, hs.ClientRandom, serverRandom)
-	if err != nil {
-		return
+		serverRandomBytes, err = crypto.GenerateRandom(32)
+		if err != nil {
+			return
+		}
+		var serverRandom [32]byte
+		copy(serverRandom[:], serverRandomBytes)
+
+		keys, err = crypto.DeriveKeys(shared, hs.ClientRandom, serverRandom)
+		if err != nil {
+			return
+		}
+		serverEKPub = serverEK.PubKey
+
+		s.sessionStore.Store(hs.ClientID, &mtp.SessionEntry{
+			Keys:         keys,
+			ExpiresAt:    time.Now().Add(1 * time.Hour),
+			ClientRandom: hs.ClientRandom,
+			ServerRandom: serverRandom,
+		})
 	}
 
 	// Build & Send ServerHello
-	sh := buildServerHello(serverEK.PubKey, serverRandomBytes, hs.ClientID)
+	sh := buildServerHello(status, serverEKPub, serverRandomBytes, hs.ClientID)
 	if _, err := conn.Write(sh); err != nil {
 		return
 	}
 
-	fmt.Printf("  [TCP Handshake] OK from %s cipher=MERIDIAN-CHACHA\n", conn.RemoteAddr())
+	if config.DebugMode {
+		fmt.Printf("  [TCP Handshake] OK from %s cipher=MERIDIAN-CHACHA (resume=%v)\n", conn.RemoteAddr(), status == 0)
+	} else {
+		fmt.Printf("  [TCP Handshake] OK from %s cipher=MERIDIAN-CHACHA\n", conn.RemoteAddr())
+	}
 
 	// Create Encoder and Decoder
 	enc := mfp.NewDownlinkEncoder(keys)
+	enc.SetRenewal(s.cfg.RenewalDataLimit, s.cfg.RenewalInterval)
 	dec := mfp.NewUplinkDecoder(keys)
+	dec.SetRenewal(s.cfg.RenewalDataLimit, s.cfg.RenewalInterval)
 
 	// Map of active StreamID -> target connection
 	activeStreams := make(map[uint32]*activeStream)
@@ -353,6 +405,15 @@ func (s *Server) handleTCPTunnel(conn net.Conn) {
 			continue
 		}
 
+		if dec.ShouldRotate() {
+			if config.DebugMode {
+				fmt.Println("[DEBUG] Rotating keys on server decoder")
+			}
+			if err := dec.RotateKeys(); err != nil && config.DebugMode {
+				fmt.Printf("[DEBUG] Failed to rotate server decoder keys: %v\n", err)
+			}
+		}
+
 		sid := frame.Header.StreamID
 
 		if frame.Header.Type == mfp.TypeRESET {
@@ -378,6 +439,9 @@ func (s *Server) handleTCPTunnel(conn net.Conn) {
 					if err != nil {
 						writeMu.Lock()
 						respFrame, _ := enc.Encode(streamID, 0x08, []byte(err.Error()))
+						if enc.ShouldRotate() {
+							enc.RotateKeys()
+						}
 						conn.Write(respFrame)
 						writeMu.Unlock()
 						return
@@ -395,6 +459,9 @@ func (s *Server) handleTCPTunnel(conn net.Conn) {
 					// Send CONNECT SUCCESS frame (Flags = 0x01)
 					writeMu.Lock()
 					respFrame, _ := enc.Encode(streamID, 0x01, []byte("OK"))
+					if enc.ShouldRotate() {
+						enc.RotateKeys()
+					}
 					conn.Write(respFrame)
 					writeMu.Unlock()
 
@@ -412,6 +479,9 @@ func (s *Server) handleTCPTunnel(conn net.Conn) {
 						// Send RESET to client
 						writeMu.Lock()
 						rf, _ := enc.Encode(streamID, mfp.TypeRESET, nil)
+						if enc.ShouldRotate() {
+							enc.RotateKeys()
+						}
 						conn.Write(rf)
 						writeMu.Unlock()
 					}()
@@ -425,6 +495,12 @@ func (s *Server) handleTCPTunnel(conn net.Conn) {
 								writeMu.Lock()
 								df, errEnc := enc.Encode(streamID, 0x00, relayBuf[:rn])
 								if errEnc == nil {
+									if enc.ShouldRotate() {
+										if config.DebugMode {
+											fmt.Println("[DEBUG] Rotating keys on server encoder")
+										}
+										enc.RotateKeys()
+									}
 									conn.Write(df)
 								}
 								writeMu.Unlock()
@@ -450,11 +526,11 @@ func (s *Server) handleTCPTunnel(conn net.Conn) {
 	}
 }
 
-func buildServerHello(serverEKPub, serverRandom []byte, clientID [16]byte) []byte {
+func buildServerHello(status byte, serverEKPub, serverRandom []byte, clientID [16]byte) []byte {
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.BigEndian, uint32(0xDeadBeEF))
 	buf.WriteByte(1) // version
-	buf.WriteByte(0) // status = accept
+	buf.WriteByte(status) // status
 	buf.Write(serverRandom)
 	buf.Write(serverEKPub)
 	buf.Write(make([]byte, 32)) // server hash placeholder

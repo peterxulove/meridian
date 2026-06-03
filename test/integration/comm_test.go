@@ -263,7 +263,7 @@ func TestClientHelloBuildAndParse(t *testing.T) {
 	var crArr [32]byte
 	copy(crArr[:], cr)
 
-	wire, err := mtp.BuildClientHello(cfg, &crArr, clientKP.PubKey)
+	wire, err := mtp.BuildClientHello(cfg, &crArr, clientKP.PubKey, nil)
 	if err != nil {
 		t.Fatalf("BuildClientHello: %v", err)
 	}
@@ -367,7 +367,7 @@ func TestUDPClientServerHandshake(t *testing.T) {
 	var crArr [32]byte
 	copy(crArr[:], cr)
 
-	hello, err := mtp.BuildClientHello(cfg, &crArr, clientKP.PubKey)
+	hello, err := mtp.BuildClientHello(cfg, &crArr, clientKP.PubKey, nil)
 	if err != nil {
 		t.Fatalf("BuildClientHello: %v", err)
 	}

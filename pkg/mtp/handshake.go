@@ -48,6 +48,7 @@ type Handshake struct {
 	SessionLT        uint32
 	Extensions       []Extension
 	Keys             *crypto.KeyMaterial
+	IsResume         bool
 }
 
 // GenerateKeyPair wraps crypto.GenerateKeyPair for callers that import mtp.
@@ -64,13 +65,16 @@ func GenerateRandomBytes(n int) ([]byte, error) { return crypto.GenerateRandom(n
 //
 // Fix: ClientHello hash (offset 72) is SHA256(ciphers || clientRandom || clientECDHE)
 // per spec §3.2, not SHA256(buf[120:end]).
-func BuildClientHello(cfg config.ClientConfig, cr *[32]byte, pubECDHE []byte) ([]byte, error) {
+func BuildClientHello(cfg config.ClientConfig, cr *[32]byte, pubECDHE []byte, resumeKeys *crypto.KeyMaterial) ([]byte, error) {
 	buf := bytes.NewBuffer(make([]byte, 0, 256))
 
 	// Magic (4) + Version (1) + Flags (1) + ClientMTU (2) = 8 bytes
 	binary.Write(buf, binary.BigEndian, MagicValue)
 	buf.WriteByte(CurrentVer)
 	flags := byte(0x00)
+	if resumeKeys != nil {
+		flags |= FlagResume
+	}
 	if cfg.Transport == config.TransportWebSocket {
 		flags |= FlagWS
 	}
@@ -148,6 +152,7 @@ func ParseClientHello(data []byte) (*Handshake, error) {
 	}
 
 	hs := &Handshake{}
+	hs.IsResume = (data[OffFlags] & FlagResume) != 0
 	copy(hs.ClientRandom[:], data[OffCRand:OffCRand+32])
 	hs.ClientECDHE = make([]byte, crypto.ECDHKeyLen) // Fix: fixed 32 bytes, not data[40] length
 	copy(hs.ClientECDHE, data[OffECDHE:OffECDHE+crypto.ECDHKeyLen])

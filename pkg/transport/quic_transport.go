@@ -9,80 +9,11 @@ import (
 	"io"
 	"net"
 	"strings"
-	"time"
 
-	"github.com/gorilla/websocket"
 	"meridian/pkg/config"
 	"meridian/pkg/crypto"
 )
 
-// ---------------------------------------------------------------------------
-// WSConnection — WebSocket adapter implementing net.Conn
-// ---------------------------------------------------------------------------
-
-// WSConnection wraps a gorilla WebSocket connection and exposes a net.Conn interface.
-type WSConnection struct {
-	conn   *websocket.Conn
-	buf    []byte // leftover bytes from a partially consumed message
-	closed bool
-}
-
-// Read implements io.Reader.
-// Fix #11: previous code returned (0, nil) on any websocket error, which caused
-// callers to spin in a busy loop waiting for data that never arrives. Now errors
-// are propagated so callers can detect connection closure.
-func (c *WSConnection) Read(b []byte) (int, error) {
-	// Drain any leftover bytes from a previous message first.
-	if len(c.buf) > 0 {
-		n := copy(b, c.buf)
-		c.buf = c.buf[n:]
-		return n, nil
-	}
-
-	_, msg, err := c.conn.ReadMessage()
-	if err != nil {
-		return 0, err // Fix: propagate error instead of returning (0, nil)
-	}
-	n := copy(b, msg)
-	if n < len(msg) {
-		c.buf = msg[n:] // save unread bytes for next Read call
-	}
-	return n, nil
-}
-
-// Write implements io.Writer.
-// Fix #10: previous code always returned (0, nil) regardless of outcome.
-// net.Conn callers rely on the returned byte count to detect short writes.
-func (c *WSConnection) Write(b []byte) (int, error) {
-	err := c.conn.WriteMessage(websocket.BinaryMessage, b)
-	if err != nil {
-		return 0, err // Fix: report error
-	}
-	return len(b), nil // Fix: return actual bytes written
-}
-
-func (c *WSConnection) Close() error {
-	c.closed = true
-	return c.conn.Close()
-}
-
-func (c *WSConnection) LocalAddr() net.Addr  { return c.conn.LocalAddr() }
-func (c *WSConnection) RemoteAddr() net.Addr { return c.conn.RemoteAddr() }
-
-func (c *WSConnection) SetDeadline(t time.Time) error {
-	if err := c.conn.SetReadDeadline(t); err != nil {
-		return err
-	}
-	return c.conn.SetWriteDeadline(t)
-}
-
-func (c *WSConnection) SetReadDeadline(t time.Time) error {
-	return c.conn.SetReadDeadline(t)
-}
-
-func (c *WSConnection) SetWriteDeadline(t time.Time) error {
-	return c.conn.SetWriteDeadline(t)
-}
 
 // HTTPPOSTTransport is a stub for the HTTP-POST mirror mode transport.
 type HTTPPOSTTransport struct{ config config.ClientConfig }

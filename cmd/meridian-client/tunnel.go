@@ -31,14 +31,16 @@ type TunnelClient struct {
 	streamIDAlloc uint32
 	closed        atomic.Bool
 	handshakeDone chan struct{}
+	sessionStore  *mtp.SessionStore
 }
 
 // NewTunnelClient creates a new TunnelClient.
-func NewTunnelClient(cfg config.ClientConfig) *TunnelClient {
+func NewTunnelClient(cfg config.ClientConfig, sessionStore *mtp.SessionStore) *TunnelClient {
 	return &TunnelClient{
 		cfg:           cfg,
 		activeStreams: make(map[uint32]*StreamConn),
 		handshakeDone: make(chan struct{}),
+		sessionStore:  sessionStore,
 	}
 }
 
@@ -81,6 +83,13 @@ func (tc *TunnelClient) Connect() error {
 			return fmt.Errorf("tunnel: Hysteria TCP dial failed: %w", err)
 		}
 		conn = &hysteriaStreamWrapper{Conn: stream, hyClient: hyClient}
+	} else if tc.cfg.Transport == config.TransportWebSocket || tc.cfg.Transport == "WebSocket" {
+		wsURL := "wss://" + tc.cfg.ServerAddr + tc.cfg.WSSPath
+		wsConn, err := transport.WSDial(wsURL, tc.cfg)
+		if err != nil {
+			return fmt.Errorf("tunnel: WebSocket dial failed: %w", err)
+		}
+		conn = wsConn
 	} else {
 		tcpConn, err := net.DialTimeout("tcp", tc.cfg.ServerAddr, tc.cfg.DialTimeout)
 		if err != nil {
@@ -91,7 +100,16 @@ func (tc *TunnelClient) Connect() error {
 	tc.tunnelConn = conn
 
 	// ── MTP Handshake (Client Side) ───────────────────────────────────────
-	ek, err := crypto.GenerateKeyPair()
+	var keys *crypto.KeyMaterial
+	var resumeKeys *crypto.KeyMaterial
+	var ek *crypto.KeyPair
+
+	if cached, ok := tc.sessionStore.Lookup(tc.cfg.SessionID); ok {
+		resumeKeys = cached.Keys
+	}
+
+	var err error
+	ek, err = crypto.GenerateKeyPair()
 	if err != nil {
 		conn.Close()
 		return fmt.Errorf("tunnel: key generation failed: %w", err)
@@ -105,7 +123,7 @@ func (tc *TunnelClient) Connect() error {
 	var crArr [32]byte
 	copy(crArr[:], cr)
 
-	hello, err := mtp.BuildClientHello(tc.cfg, &crArr, ek.PubKey)
+	hello, err := mtp.BuildClientHello(tc.cfg, &crArr, ek.PubKey, resumeKeys)
 	if err != nil {
 		conn.Close()
 		return fmt.Errorf("tunnel: BuildClientHello failed: %w", err)
@@ -135,25 +153,44 @@ func (tc *TunnelClient) Connect() error {
 
 	serverRandom := respBuf[6:38]
 	serverEKPub := respBuf[38:70]
+	status := respBuf[5]
 
-	// Compute shared secret
-	shared, err := crypto.SharedKey(ek, serverEKPub)
-	if err != nil {
-		conn.Close()
-		return fmt.Errorf("tunnel: SharedKey computation failed: %w", err)
-	}
+	if resumeKeys != nil && status == 0 {
+		// Server accepted resume
+		keys = resumeKeys
+		if config.DebugMode {
+			fmt.Printf("[DEBUG] [Tunnel] 0-RTT session resumed successfully\n")
+		}
+	} else {
+		// Compute shared secret
+		shared, err := crypto.SharedKey(ek, serverEKPub)
+		if err != nil {
+			conn.Close()
+			return fmt.Errorf("tunnel: SharedKey computation failed: %w", err)
+		}
 
-	// Derive Keys
-	var srArr [32]byte
-	copy(srArr[:], serverRandom)
-	keys, err := crypto.DeriveKeys(shared, crArr, srArr)
-	if err != nil {
-		conn.Close()
-		return fmt.Errorf("tunnel: DeriveKeys failed: %w", err)
+		// Derive Keys
+		var srArr [32]byte
+		copy(srArr[:], serverRandom)
+		keys, err = crypto.DeriveKeys(shared, crArr, srArr)
+		if err != nil {
+			conn.Close()
+			return fmt.Errorf("tunnel: DeriveKeys failed: %w", err)
+		}
+
+		// Store session for future resume
+		tc.sessionStore.Store(tc.cfg.SessionID, &mtp.SessionEntry{
+			Keys:         keys,
+			ExpiresAt:    time.Now().Add(1 * time.Hour), // use negotiated lifetime later
+			ClientRandom: crArr,
+			ServerRandom: srArr,
+		})
 	}
 
 	tc.encoder = mfp.NewEncoder(keys)
+	tc.encoder.SetRenewal(tc.cfg.RenewalDataLimit, tc.cfg.RenewalInterval)
 	tc.decoder = mfp.NewDownlinkDecoder(keys)
+	tc.decoder.SetRenewal(tc.cfg.RenewalDataLimit, tc.cfg.RenewalInterval)
 
 	if config.DebugMode {
 		fmt.Printf("[DEBUG] [Tunnel] Handshake successful over %s! Cipher: MERIDIAN-CHACHA\n", tc.cfg.Transport)
@@ -190,6 +227,12 @@ func (tc *TunnelClient) DialStream(ctx context.Context, targetAddr string) (net.
 	// Send CONNECT frame
 	tc.mu.Lock()
 	connFrame, err := tc.encoder.Encode(sid, 0x01, []byte(targetAddr)) // Flags = 0x01: Connect Request
+	if err == nil && tc.encoder.ShouldRotate() {
+		if config.DebugMode {
+			fmt.Println("[DEBUG] Rotating keys on client encoder (connect)")
+		}
+		tc.encoder.RotateKeys()
+	}
 	if err != nil {
 		tc.mu.Unlock()
 		tc.removeStream(sid)
@@ -244,6 +287,15 @@ func (tc *TunnelClient) readLoop() {
 		frame, err := tc.decoder.Decode(frameData)
 		if err != nil {
 			continue
+		}
+
+		if tc.decoder.ShouldRotate() {
+			if config.DebugMode {
+				fmt.Println("[DEBUG] Rotating keys on client decoder")
+			}
+			if err := tc.decoder.RotateKeys(); err != nil && config.DebugMode {
+				fmt.Printf("[DEBUG] Failed to rotate decoder keys: %v\n", err)
+			}
 		}
 
 		sid := frame.Header.StreamID
@@ -326,6 +378,12 @@ func (sc *StreamConn) Write(b []byte) (int, error) {
 
 	sc.client.mu.Lock()
 	frame, err := sc.client.encoder.Encode(sc.sid, 0x00, b)
+	if err == nil && sc.client.encoder.ShouldRotate() {
+		if config.DebugMode {
+			fmt.Println("[DEBUG] Rotating keys on client encoder")
+		}
+		sc.client.encoder.RotateKeys()
+	}
 	if err != nil {
 		sc.client.mu.Unlock()
 		return 0, err
@@ -347,6 +405,9 @@ func (sc *StreamConn) Close() error {
 		sc.client.mu.Lock()
 		frame, err := sc.client.encoder.Encode(sc.sid, mfp.TypeRESET, nil)
 		if err == nil {
+			if sc.client.encoder.ShouldRotate() {
+				sc.client.encoder.RotateKeys()
+			}
 			sc.client.tunnelConn.Write(frame)
 		}
 		sc.client.mu.Unlock()

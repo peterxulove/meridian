@@ -3,6 +3,7 @@ package transport
 import (
 	"errors"
 	"net"
+	"net/http"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -24,11 +25,46 @@ func (l *WSListener) ListenAndServe() error {
 	if l.config.WSSPath != "" {
 		path = l.config.WSSPath
 	}
-	_ = path
-	return errors.New("transport: WebSocket server not yet implemented")
+
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool {
+			return true // Allow all origins for the tunnel
+		},
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		wsConn := &WSConn{conn: conn}
+		l.connch <- wsConn
+	})
+
+	server := &http.Server{
+		Addr:    l.config.ListenAddr,
+		Handler: mux,
+	}
+
+	if l.config.ServerCertFile != "" && l.config.ServerKeyFile != "" {
+		return server.ListenAndServeTLS(l.config.ServerCertFile, l.config.ServerKeyFile)
+	}
+	return server.ListenAndServe()
 }
 
-func (l *WSListener) Close() error { return nil }
+func (l *WSListener) Accept() (net.Conn, error) {
+	conn, ok := <-l.connch
+	if !ok {
+		return nil, errors.New("listener closed")
+	}
+	return conn, nil
+}
+
+func (l *WSListener) Close() error { 
+	close(l.connch)
+	return nil 
+}
 
 // ---------------------------------------------------------------------------
 // WSConn — second WebSocket adapter (used by websocket_transport.go callers)
@@ -91,7 +127,16 @@ func (c *WSConn) SetWriteDeadline(t time.Time) error {
 }
 
 // WSDial dials a WebSocket server and returns a WSConn.
-// Currently a stub; a production implementation would perform the HTTP upgrade.
-func WSDial(serverURL, path string) (*WSConn, error) {
-	return nil, errors.New("transport: WSDial not yet implemented")
+func WSDial(serverURL string, cfg config.ClientConfig) (*WSConn, error) {
+	dialer := websocket.DefaultDialer
+	// Apply TLS config
+	tlsConfig, err := ClientTLSConfig(cfg)
+	if err == nil {
+		dialer.TLSClientConfig = tlsConfig
+	}
+	conn, _, err := dialer.Dial(serverURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	return &WSConn{conn: conn}, nil
 }

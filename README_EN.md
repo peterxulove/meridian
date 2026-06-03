@@ -46,6 +46,15 @@ Meridian is a custom secure proxy protocol designed to deliver **undetectable en
 
 ## Changelog
 
+### v1.5.0 (2026-06-03)
+
+#### ✨ New Features
+
+- **Windows Platform Support**: Rewrote signal handling logic; both client and server now compile and run flawlessly on Windows.
+- **WebSocket Transport Backend**: Integrated WebSocket support. The server can tunnel traffic over WSS, and the client can fallback to WebSocket to bypass UDP blocking.
+- **0-RTT Session Resumption**: Added an in-memory `SessionStore` to the transport layer. Reconnecting clients can now reuse previously negotiated keys to skip expensive ECDHE calculations.
+- **Periodic Key Rotation (PFS)**: Both ends of the encrypted tunnel now automatically rotate traffic keys via HKDF every 64MB or 5 minutes to ensure long-term post-compromise security.
+- **HTTP Proxy Protocol Support**: The client can now act as a forward HTTP/HTTPS proxy by configuring `proxy_protocol: "http"`.
 ### v1.3.5.1 (2026-06-03)
 
 #### 🐛 Bug Fixes
@@ -627,11 +636,11 @@ go vet ./...
 - [x] CLI flags support
 - [x] Graceful signal shutdown
 - [x] GitHub Actions automated release
-- [ ] WebSocket transport backend
-- [ ] 0-RTT session resumption
-- [ ] Periodic key rotation
-- [ ] Windows platform support
-- [ ] HTTP proxy protocol support
+- [x] WebSocket transport backend ✅ v1.5.0
+- [x] 0-RTT session resumption ✅ v1.5.0
+- [x] Periodic key rotation ✅ v1.5.0
+- [x] Windows platform support ✅ v1.5.0
+- [x] HTTP proxy protocol support ✅ v1.5.0
 
 ---
 
