@@ -46,6 +46,34 @@ Meridian 是一个自定义安全代理协议，设计目标是在恶劣的网�
 
 ## 更新日志
 
+### v1.6.0（2026-10-21）
+
+#### 🔒 安全修复
+
+- **TCP 隧道密码认证**：此前 TCP 隧道路径不校验密码（只有 Hysteria 的 UDP 路径校验），服务端实际是一个开放代理。现在 ClientHello 新增 `0x0007 AUTH` 扩展，服务端校验 HMAC-SHA256 标签（绑定 timestamp + clientRandom + ECDHE，防重放，120 秒窗口）。
+- **控制帧类型修复**：`Encode()` 恒定写入 `TypeDATA`，导致 `PING`/`PONG`/`RESET` 被写进 `Flags` 字段而类型丢失。新增 `EncodeType()`，控制帧现在能正确被对端识别。
+
+#### ✨ 新增功能
+
+- **HTTP-POST 传输服务端实现**：此前只有客户端，`transport: "HTTP-POST"` 在服务端无法工作。现已补齐会话化的服务端（`Mir-Session` 头绑定会话、响应体承载下行、`Mir-Poll` 长轮询、空闲会话回收）。
+- **keepalive 真正生效**：客户端按 `keepalive_interval` 发 PING，服务端回 PONG，客户端记录并跳过。
+- **Padding/Jitter/方向均衡接线**：此前配置项是死代码，完全不生效。现在两端按配置接线；同时修复零值 `PaddingConfig`（`mode` 缺省）被误判为启用填充并破坏互通的问题。
+- **真实 TLS 指纹**：`ApplyFingerprint()` 现在真正改写 `*tls.Config`（此前配置项空转）；无证书时改为生成 ECDSA P-256 自签证书而非静默降级。
+
+#### 🐛 Bug 修复
+
+- **方向均衡会静默摧毁隧道（v1.6.0 修复）**：`DummyFrame()` 返回的是 14 字节裸头部（无密文、无 AEAD tag）。对端解密必然失败，且旧代码在失败时仍推进 nonce 计数器，导致该方向后续帧**全部**认证失败。现在 dummy 帧经 `(*Encoder).DummyFrame()` 正常加密成 KEEPALIVE 帧，对端识别后跳过。
+- **解密失败仍消耗 nonce**：`Decoder.Decode` 在认证失败时已 `Count++`，任何一帧失败即让该方向永久失步。
+- **WebSocket ALPN 不匹配**：客户端发 `meridian-1/h3`，服务端标准 `http.Server` 无对应 NextProtos，握手失败（`tls: no application protocol`）。
+- **HTTP-POST 读取死锁**：`Read` 持锁调用 `Write` 导致 `sync.Mutex` 自死锁。改为独立的 `pollOnce()`（此 bug 是该传输完全不可用的直接原因）。
+- **删除 UDP 死代码**：`handlePacket`/`doHandshake`/`forwardFrame` 无人调用且握手是未完成 TODO（UDP socket 由 Hysteria 库独占），已删除并留下说明。
+
+#### 🧪 测试
+
+- 新增 `pkg/mtp/handshake_test.go`（认证正反例、重放、过期、畸形扩展）
+- 新增 `pkg/mfp/frames_test.go`（padding 往返、抖动边界、方向均衡、密钥轮换、控制帧类型）
+- 新增 `pkg/transport/httppost_transport_test.go` 与 `httppost_e2e_test.go`（会话复用、pull 模式往返）
+
 ### v1.5.0（2026-06-03）
 
 #### ✨ 新增功能
@@ -448,12 +476,19 @@ listen_addr: "0.0.0.0:80"
 transport: "HTTP-POST"
 cipher_suite: 2
 password: "your-strong-random-password-here"
+mirror_path: "/api/v1/storage/upload"   # 客户端上传帧的路径，两端必须一致
 destinations:
   - name: "direct"
     addr: "127.0.0.1:8080"
     protocol: "direct"
     rule: "all"
 ```
+
+> ⚠️ **两端 padding 配置必须一致**
+> `padding_mode` 会改变线上帧格式（填充后带 2 字节长度前缀）。两端不一致会导致对端无法解帧。
+>
+> ⚠️ **HTTP-POST 是 pull 模式**
+> 下行数据只能搭在请求的响应里返回，空闲时客户端会发空上传（`Mir-Poll`）轮询。因此该模式的延迟高于 QUIC/WebSocket，仅在极端环境使用。
 
 #### 🔹 客户端 (`client.http.yaml`)
 ```yaml
@@ -464,6 +499,7 @@ password: "your-strong-random-password-here"
 upload_url: "http://your-server-ip/api/v1/storage/upload"
 mirror_boundary: "----WebKitFormBoundaryT8z736aFmE1yB"
 mirror_path: "/api/v1/storage/upload"
+keepalive_interval: "5s"
 listen_addr: "0.0.0.0:1080"
 proxy_protocol: "socks5"
 ```

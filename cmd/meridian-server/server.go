@@ -4,6 +4,7 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -22,13 +23,14 @@ import (
 
 // Server manages Meridian connections.
 type Server struct {
-	cfg     config.ServerConfig
-	udp     *net.UDPConn
-	conns    sync.Map
-	hyServer server.Server
-	stopped  atomic.Bool
-	wg       sync.WaitGroup
-	stats    ServerStats
+	cfg          config.ServerConfig
+	udp          *net.UDPConn
+	conns        sync.Map
+	hyServer     server.Server
+	stopped      atomic.Bool
+	wg           sync.WaitGroup
+	stats        ServerStats
+	mirror       *transport.MirrorListener
 	sessionStore *mtp.SessionStore
 }
 
@@ -53,6 +55,9 @@ func (s *Server) Start() error {
 	if s.cfg.Transport == config.TransportWebSocket {
 		return s.startWS()
 	}
+	if s.cfg.Transport == config.TransportHTTPPOST || string(s.cfg.Transport) == "HTTP-POST" {
+		return s.startHTTPPOST()
+	}
 	// Start TCP Tunnel listener concurrently for reliable proxying
 	go s.startTCP()
 	return s.startHysteria()
@@ -63,7 +68,7 @@ func (s *Server) startHysteria() error {
 	if err != nil {
 		return err
 	}
-	
+
 	udpAddr, err := net.ResolveUDPAddr("udp", s.cfg.ListenAddr)
 	if err != nil {
 		return err
@@ -108,9 +113,40 @@ func (s *Server) startHysteria() error {
 	return nil
 }
 
+// startHTTPPOST serves the HTTP-POST mirror transport: the client uploads
+// each Meridian frame as a multipart form POST and reads downlink bytes from
+// the response body. The listener turns those short requests back into
+// long-lived sessions, which are driven by the same handleTCPTunnel path.
+func (s *Server) startHTTPPOST() error {
+	listener := transport.NewMirrorListener(s.cfg)
+	s.mirror = listener
+
+	go func() {
+		if err := listener.ListenAndServe(); err != nil {
+			if !s.stopped.Load() {
+				fmt.Printf("  [HTTP-POST] Listen error: %v\n", err)
+			}
+		}
+	}()
+
+	fmt.Printf("  [HTTP-POST] Listening on %s%s (tunnel server)\n", s.cfg.ListenAddr, listener.Path())
+
+	for {
+		if s.stopped.Load() {
+			break
+		}
+		conn, err := listener.Accept()
+		if err != nil {
+			continue
+		}
+		go s.handleTCPTunnel(conn)
+	}
+	return nil
+}
+
 func (s *Server) startWS() error {
 	listener := transport.NewWSListener(s.cfg)
-	
+
 	go func() {
 		if err := listener.ListenAndServe(); err != nil {
 			if !s.stopped.Load() {
@@ -134,86 +170,15 @@ func (s *Server) startWS() error {
 	return nil
 }
 
-func (s *Server) handlePacket(data []byte, remote *net.UDPAddr) {
-	if len(data) < 14 {
-		return
-	}
-
-	// Fix #24: use crypto.Magic constant instead of a duplicated literal.
-	if binary.BigEndian.Uint32(data[0:4]) != crypto.Magic {
-		return
-	}
-
-	s.stats.Handled.Add(1)
-	s.stats.In.Add(uint64(len(data)))
-
-	// Distinguish handshake packets (version byte at offset 4) from data frames.
-	if data[4] == crypto.CurrentVersion {
-		s.doHandshake(data, remote)
-	} else {
-		frame, err := mfp.ParseFrame(data)
-		if err == nil {
-			s.forwardFrame(frame, remote)
-		}
-	}
-}
-
-func (s *Server) doHandshake(data []byte, remote *net.UDPAddr) {
-	// Parse client hello using the fixed MTP parser.
-	hs, err := mtp.ParseClientHello(data)
-	if err != nil {
-		fmt.Printf("  [Handshake] Parse error from %s: %v\n", remote, err)
-		return
-	}
-
-	// Generate server ECDHE key pair.
-	// Fix: GenerateKeyPair now returns (*KeyPair, error) after the crypto fix.
-	serverEK, err := crypto.GenerateKeyPair()
-	if err != nil {
-		fmt.Printf("  [Handshake] Key generation failed: %v\n", err)
-		return
-	}
-
-	// Compute shared secret via X25519.
-	shared, err := crypto.SharedKey(
-		&crypto.KeyPair{PrivKey: serverEK.PrivKey},
-		hs.ClientECDHE,
-	)
-	if err != nil {
-		fmt.Printf("  [Handshake] SharedKey failed: %v\n", err)
-		return
-	}
-
-	// Generate server random.
-	serverRandomBytes, err := crypto.GenerateRandom(32)
-	if err != nil {
-		fmt.Printf("  [Handshake] GenerateRandom failed: %v\n", err)
-		return
-	}
-	var serverRandom [32]byte
-	copy(serverRandom[:], serverRandomBytes)
-
-	// Derive session keys.
-	keys, err := crypto.DeriveKeys(shared, hs.ClientRandom, serverRandom)
-	if err != nil {
-		fmt.Printf("  [Handshake] DeriveKeys failed: %v\n", err)
-		return
-	}
-	_ = keys // keys used by the per-connection encoder/decoder (not yet wired)
-
-	s.stats.Active.Add(1)
-	defer s.stats.Active.Add(^uint64(0))
-
-	fmt.Printf("  [Handshake] OK from %s cipher=MERIDIAN-CHACHA\n", remote.String())
-	// TODO: send ServerHello with serverRandom, serverEK.PubKey, negotiated cipher, derived keys.
-}
-
-func (s *Server) forwardFrame(frame *mfp.DataFrame, remote *net.UDPAddr) {
-	// TODO: look up the session by remote address, decrypt, and forward to the
-	// configured upstream destination.
-	_ = frame
-	_ = remote
-}
+// The UDP socket created in startHysteria is owned entirely by the Hysteria
+// server, which parses and dispatches every datagram itself. Meridian's own
+// MTP/MFP framing runs over the TCP-like stream Hysteria exposes (see
+// hysteriaOutbound.TCP → handleTCPTunnel), so there is no separate UDP packet
+// path to handle here.
+//
+// The former handlePacket/doHandshake/forwardFrame trio was dead code: nothing
+// called it, and its handshake path was an unfinished TODO. It was removed
+// rather than left as a misleading stub.
 
 // Stop signals the server to shut down and waits for all goroutines to exit.
 func (s *Server) Stop() {
@@ -314,6 +279,18 @@ func (s *Server) handleTCPTunnel(conn net.Conn) {
 		return
 	}
 
+	// ── Authenticate the client ────────────────────────────────────────────
+	// The TCP listener is reachable by anyone who can route to this port, so
+	// the password must be checked here too — the Hysteria authenticator only
+	// covers the UDP path. Without this the server is an open proxy.
+	if err := authenticateHello(hs, s.cfg.Password); err != nil {
+		fmt.Printf("  [TCP Handshake] Auth failed from %s: %v\n", conn.RemoteAddr(), err)
+		// Report a generic failure so unauthenticated peers cannot probe which
+		// inputs are valid.
+		conn.Write([]byte{0x00})
+		return
+	}
+
 	var keys *crypto.KeyMaterial
 	var status byte = 1 // 1 = full handshake, 0 = resume accepted
 	var serverEKPub []byte = make([]byte, 32)
@@ -379,9 +356,25 @@ func (s *Server) handleTCPTunnel(conn net.Conn) {
 	dec := mfp.NewUplinkDecoder(keys)
 	dec.SetRenewal(s.cfg.RenewalDataLimit, s.cfg.RenewalInterval)
 
+	// Mirror the client's anti-detection settings. Padding mode must match on
+	// both sides or the length prefix cannot be stripped on decode.
+	padCfg := mfp.PaddingConfig{
+		Mode:     s.cfg.PaddingMode,
+		BaseSize: s.cfg.BasePayloadSize,
+		MaxSize:  s.cfg.MaxPayloadSize,
+		Balanced: s.cfg.DirectionBalance,
+	}
+	enc.SetPadding(padCfg)
+	dec.SetPadding(padCfg)
+	if s.cfg.DirectionBalance {
+		bal := mfp.NewDirectionBalancer(true)
+		enc.SetBalancer(bal)
+		dec.SetBalancer(bal)
+	}
+
 	// Map of active StreamID -> target connection
 	activeStreams := make(map[uint32]*activeStream)
-	var mu sync.Mutex // protects activeStreams
+	var mu sync.Mutex      // protects activeStreams
 	var writeMu sync.Mutex // protects concurrent writing to conn
 
 	defer func() {
@@ -415,6 +408,27 @@ func (s *Server) handleTCPTunnel(conn net.Conn) {
 		}
 
 		sid := frame.Header.StreamID
+
+		// Keepalive: answer client PINGs so idle tunnels survive NAT timeouts.
+		// Stream 0 is the control stream and never maps to a target connection.
+		if frame.Header.Type == mfp.TypePING {
+			writeMu.Lock()
+			pong, encErr := enc.EncodeType(mfp.TypePONG, 0, 0, frame.Data)
+			if encErr == nil {
+				if enc.ShouldRotate() {
+					enc.RotateKeys()
+				}
+				conn.Write(pong)
+			}
+			writeMu.Unlock()
+			continue
+		}
+
+		// Dummy frames injected for direction balancing are well-formed AEAD
+		// frames, but they carry no stream data — just skip them.
+		if frame.Header.Type == mfp.TypeKEEPALIVE {
+			continue
+		}
 
 		if frame.Header.Type == mfp.TypeRESET {
 			mu.Lock()
@@ -478,7 +492,7 @@ func (s *Server) handleTCPTunnel(conn net.Conn) {
 						mu.Unlock()
 						// Send RESET to client
 						writeMu.Lock()
-						rf, _ := enc.Encode(streamID, mfp.TypeRESET, nil)
+						rf, _ := enc.EncodeType(mfp.TypeRESET, streamID, 0, nil)
 						if enc.ShouldRotate() {
 							enc.RotateKeys()
 						}
@@ -529,17 +543,31 @@ func (s *Server) handleTCPTunnel(conn net.Conn) {
 func buildServerHello(status byte, serverEKPub, serverRandom []byte, clientID [16]byte) []byte {
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.BigEndian, uint32(0xDeadBeEF))
-	buf.WriteByte(1) // version
+	buf.WriteByte(1)      // version
 	buf.WriteByte(status) // status
 	buf.Write(serverRandom)
 	buf.Write(serverEKPub)
-	buf.Write(make([]byte, 32)) // server hash placeholder
+	buf.Write(make([]byte, 32))                    // server hash placeholder
 	binary.Write(buf, binary.BigEndian, uint16(1)) // cipher = CHACHA
-	buf.Write(make([]byte, 32)) // cert hash placeholder
+	buf.Write(make([]byte, 32))                    // cert hash placeholder
 	buf.Write(clientID[:])
 	binary.Write(buf, binary.BigEndian, uint32(3600)) // session lifetime
-	buf.Write([]byte{0, 0, 0, 0}) // hash tag
+	buf.Write([]byte{0, 0, 0, 0})                     // hash tag
 	return buf.Bytes()
+}
+
+// authenticateHello validates the auth extension carried in a ClientHello
+// against the configured password. It is a no-op when no password is set,
+// which keeps passwordless test environments working.
+func authenticateHello(hs *mtp.Handshake, password string) error {
+	if password == "" {
+		return nil
+	}
+	ext := mtp.FindExtension(hs.Extensions, mtp.ExtAuth)
+	if ext == nil {
+		return errors.New("no auth extension")
+	}
+	return mtp.VerifyAuth(ext.Data, password, &hs.ClientRandom, hs.ClientECDHE, time.Now())
 }
 
 // readTCPFrame reads a complete MFP frame (header + encrypted payload + auth tag) from r.

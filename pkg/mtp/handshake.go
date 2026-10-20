@@ -3,9 +3,12 @@ package mtp
 import (
 	"bytes"
 	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/binary"
 	"errors"
+	"math"
+	"time"
 
 	"meridian/pkg/config"
 	"meridian/pkg/crypto"
@@ -19,16 +22,32 @@ const (
 	FlagPad    = byte(0x04)
 
 	// Wire offsets within ClientHello (per spec §3.2)
-	OffMagic  = 0
-	OffVer    = 4
-	OffFlags  = 5
-	OffMTU    = 6
-	OffCRand  = 8
-	OffECDHE  = 40
-	OffHash   = 72
-	OffSID    = 104
-	OffCiph   = 120
+	OffMagic = 0
+	OffVer   = 4
+	OffFlags = 5
+	OffMTU   = 6
+	OffCRand = 8
+	OffECDHE = 40
+	OffHash  = 72
+	OffSID   = 104
+	OffCiph  = 120
 )
+
+// Extension IDs.
+const (
+	ExtReality     = 0x0001
+	ExtTraffic     = 0x0002
+	ExtFingerprint = 0x0004
+	ExtBandwidth   = 0x0006
+	ExtAuth        = 0x0007
+)
+
+// AuthTagSize is the size of the auth tag carried in extension 0x0007.
+// Layout: [4-byte unix timestamp LE][32-byte HMAC-SHA256].
+const AuthTagSize = 4 + 32
+
+// AuthSkew is how far a client timestamp may drift from the server clock.
+const AuthSkew = 120 * time.Second
 
 // Extension is a variable-length TLS-style extension.
 type Extension struct {
@@ -113,6 +132,7 @@ func BuildClientHello(cfg config.ClientConfig, cr *[32]byte, pubECDHE []byte, re
 	writeExt(buf, 0x0004, extFP(cfg))
 	writeExt(buf, 0x0002, extTr(cfg))
 	writeExt(buf, 0x0006, extBW())
+	writeExt(buf, ExtAuth, extAuth(cfg, cr, pubECDHE))
 
 	// Back-fill CLIENT_HASH = SHA256(ciphers || clientRandom || clientECDHE)
 	// per spec §3.2: "SHA256(CIPHERS || CLIENT_RANDOM || CLIENT_ECDHE)"
@@ -158,7 +178,47 @@ func ParseClientHello(data []byte) (*Handshake, error) {
 	copy(hs.ClientECDHE, data[OffECDHE:OffECDHE+crypto.ECDHKeyLen])
 	copy(hs.ClientID[:], data[OffSID:OffSID+16])
 	hs.SessionLT = 3600 // default; server may override
+
+	// Extensions follow the fixed 10-byte cipher list; the trailing 4 bytes
+	// of the message are the HASH_TAG, so parse only up to that.
+	hs.Extensions = ParseExtensions(data, OffCiph+10)
 	return hs, nil
+}
+
+// ParseExtensions walks the TLV extension chain starting at offset and
+// returns every well-formed entry. Malformed trailing bytes are ignored so a
+// peer sending an unknown extension does not break the handshake.
+func ParseExtensions(data []byte, offset int) []Extension {
+	var out []Extension
+	// Reserve room for the trailing 4-byte HASH_TAG.
+	end := len(data) - 4
+	if end < offset {
+		return out
+	}
+	pos := offset
+	for pos+4 <= end {
+		id := binary.BigEndian.Uint16(data[pos : pos+2])
+		n := int(binary.BigEndian.Uint16(data[pos+2 : pos+4]))
+		pos += 4
+		if n < 0 || pos+n > end {
+			return out
+		}
+		cp := make([]byte, n)
+		copy(cp, data[pos:pos+n])
+		out = append(out, Extension{ID: id, Data: cp})
+		pos += n
+	}
+	return out
+}
+
+// FindExtension returns the first extension with the given ID, or nil.
+func FindExtension(exts []Extension, id uint16) *Extension {
+	for i := range exts {
+		if exts[i].ID == id {
+			return &exts[i]
+		}
+	}
+	return nil
 }
 
 // writeExt appends an extension (ID + length + data) to buf.
@@ -237,6 +297,77 @@ func extBW() func(*bytes.Buffer) {
 		binary.Write(b, binary.BigEndian, uint64(1_000_000_000)) // upload BPS
 		binary.Write(b, binary.BigEndian, uint64(1_000_000_000)) // download BPS
 		binary.Write(b, binary.BigEndian, uint16(30))            // adjust interval (s)
+	}
+}
+
+// AuthTag builds the auth payload for extension 0x0007.
+//
+// The tag is HMAC-SHA256(password, timestamp || clientRandom || clientECDHE)
+// where timestamp is the current unix time. Binding the tag to the client
+// random and ECDHE key prevents replay of a captured tag in a different
+// session, and the timestamp lets the server reject stale handshakes.
+func AuthTag(password string, cr *[32]byte, pubECDHE []byte, now time.Time) []byte {
+	ts := now.Unix()
+	if ts < 0 {
+		ts = 0
+	}
+	// Cap at uint32 so the wire field stays 4 bytes on all platforms.
+	if ts > math.MaxUint32 {
+		ts = math.MaxUint32
+	}
+
+	mac := crypto.HMAC256([]byte(password), authInput(uint32(ts), cr, pubECDHE))
+
+	out := make([]byte, 0, AuthTagSize)
+	var tsBytes [4]byte
+	binary.BigEndian.PutUint32(tsBytes[:], uint32(ts))
+	out = append(out, tsBytes[:]...)
+	out = append(out, mac[:]...)
+	return out
+}
+
+func authInput(ts uint32, cr *[32]byte, pubECDHE []byte) []byte {
+	in := make([]byte, 0, 4+32+len(pubECDHE))
+	var tsBytes [4]byte
+	binary.BigEndian.PutUint32(tsBytes[:], ts)
+	in = append(in, tsBytes[:]...)
+	in = append(in, cr[:]...)
+	in = append(in, pubECDHE...)
+	return in
+}
+
+// VerifyAuth checks an auth tag produced by AuthTag against the shared
+// password and the client random / ECDHE key from the same ClientHello.
+//
+// An empty tag is accepted only when password is empty, which keeps the
+// no-password test environments working while making a configured server
+// reject unauthenticated clients.
+func VerifyAuth(tag []byte, password string, cr *[32]byte, pubECDHE []byte, now time.Time) error {
+	if password == "" {
+		return nil
+	}
+	if len(tag) != AuthTagSize {
+		return errors.New("mtp: missing or malformed auth tag")
+	}
+
+	ts := binary.BigEndian.Uint32(tag[0:4])
+	delta := math.Abs(float64(now.Unix()) - float64(ts))
+	if delta > AuthSkew.Seconds() {
+		return errors.New("mtp: auth timestamp outside allowed window")
+	}
+
+	expected := crypto.HMAC256([]byte(password), authInput(ts, cr, pubECDHE))
+	if subtle.ConstantTimeCompare(expected[:], tag[4:36]) != 1 {
+		return errors.New("mtp: auth tag mismatch")
+	}
+	return nil
+}
+
+// extAuth builds the AUTH extension (0x0007) for a ClientHello.
+func extAuth(cfg config.ClientConfig, cr *[32]byte, pubECDHE []byte) func(*bytes.Buffer) {
+	return func(b *bytes.Buffer) {
+		tag := AuthTag(cfg.Password, cr, pubECDHE, time.Now())
+		b.Write(tag)
 	}
 }
 

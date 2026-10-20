@@ -46,6 +46,37 @@ Meridian is a custom secure proxy protocol designed to deliver **undetectable en
 
 ## Changelog
 
+### v1.6.0 (2026-10-21)
+
+#### 🔒 Security Fixes
+
+- **Password auth on the TCP tunnel**: the TCP path never checked the password (only Hysteria's UDP path did), which made the server an open proxy. ClientHello now carries a `0x0007 AUTH` extension and the server verifies an HMAC-SHA256 tag bound to timestamp + client random + ECDHE, with replay protection and a 120s window.
+- **Control-frame type fix**: `Encode()` always wrote `TypeDATA`, so `PING`/`PONG`/`RESET` leaked into the `Flags` field and the peer never saw a typed control frame. Added `EncodeType()`.
+
+#### ✨ New Features
+
+- **HTTP-POST server implementation**: the transport previously had only a client, so `transport: "HTTP-POST"` never worked server-side. Sessions are now reconstructed from many short requests (`Mir-Session` header, downlink on the response body, `Mir-Poll` long-poll, idle reaping).
+- **Keepalive actually works**: the client sends PING every `keepalive_interval`, the server answers with PONG, the client logs and skips them.
+- **Padding / jitter / direction balancing wired up**: these config options used to be dead code. Both ends now honour them; a zero-value `PaddingConfig` (missing `padding_mode`) is no longer misread as "padding enabled", which silently broke interop.
+- **Real TLS fingerprints**: `ApplyFingerprint()` now genuinely rewrites the `*tls.Config` instead of being a no-op; a server with no configured cert now generates an ECDSA P-256 self-signed certificate instead of silently degrading.
+
+#### 🐛 Bug Fixes
+
+- **WebSocket ALPN mismatch**: the client offered `meridian-1`/`h3` while the server's plain `http.Server` had no matching NextProtos, so the handshake failed with `tls: no application protocol`.
+- **Removed UDP dead code**: `handlePacket`/`doHandshake`/`forwardFrame` were unreachable with an unfinished handshake TODO (the UDP socket is owned by the Hysteria library). Deleted, with a note explaining why.
+
+#### 🐛 Bug fixes picked up during end-to-end verification
+
+- **Direction balancing silently killed the tunnel**: `DummyFrame()` returned 14 raw header bytes with no ciphertext and no AEAD tag. The peer's decryption necessarily failed, and the decoder advanced the nonce counter even on failure, so *every* subsequent frame in that direction was rejected too. Dummy frames are now encrypted normally via `(*Encoder).DummyFrame()` as KEEPALIVE frames, which the peer recognises and skips.
+- **Decryption failure consumed a nonce**: `Decoder.Decode` incremented its counter before authentication, so one bad frame permanently desynchronised that direction.
+- **HTTP-POST read deadlock**: `Read` called `Write` while holding the transport lock, self-deadlocking on `sync.Mutex`. Replaced with a dedicated `pollOnce()` — this is why that transport was entirely unusable.
+
+#### 🧪 Tests
+
+- `pkg/mtp/handshake_test.go` (auth positive/negative, replay, expiry, malformed extensions)
+- `pkg/mfp/frames_test.go` (padding round-trip, jitter bounds, direction balance, key rotation, control frame types)
+- `pkg/transport/httppost_transport_test.go` and `httppost_e2e_test.go` (session reuse, pull-mode round-trip)
+
 ### v1.5.0 (2026-06-03)
 
 #### ✨ New Features
@@ -443,12 +474,19 @@ listen_addr: "0.0.0.0:80"
 transport: "HTTP-POST"
 cipher_suite: 2
 password: "your-strong-random-password-here"
+mirror_path: "/api/v1/storage/upload"   # upload path; must match on both ends
 destinations:
   - name: "direct"
     addr: "127.0.0.1:8080"
     protocol: "direct"
     rule: "all"
 ```
+
+> ⚠️ **Padding must match on both ends**
+> `padding_mode` changes the wire format (padded frames carry a 2-byte length prefix). A mismatch leaves the peer unable to strip the prefix.
+>
+> ⚠️ **HTTP-POST is pull-based**
+> Downlink bytes can only ride back inside a request response, so an idle client sends empty `Mir-Poll` uploads to poll. Latency is therefore higher than QUIC/WebSocket — use it only in hostile environments.
 
 #### 🔹 Client (`client.http.yaml`)
 ```yaml
@@ -459,6 +497,7 @@ password: "your-strong-random-password-here"
 upload_url: "http://your-server-ip/api/v1/storage/upload"
 mirror_boundary: "----WebKitFormBoundaryT8z736aFmE1yB"
 mirror_path: "/api/v1/storage/upload"
+keepalive_interval: "5s"
 listen_addr: "0.0.0.0:1080"
 proxy_protocol: "socks5"
 ```

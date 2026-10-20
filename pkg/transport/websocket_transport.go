@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"crypto/tls"
 	"errors"
 	"net"
 	"net/http"
@@ -48,6 +49,14 @@ func (l *WSListener) ListenAndServe() error {
 	}
 
 	if l.config.ServerCertFile != "" && l.config.ServerKeyFile != "" {
+		// Mirror the tunnel ALPN list. Without it the client's
+		// NextProtos{"meridian-1","h3"} has nothing to negotiate against and
+		// the handshake dies with "tls: no application protocol".
+		// http/1.1 comes first: gorilla's dialer upgrades over HTTP/1.1, so
+		// negotiating a tunnel-only ALPN makes the handshake itself fail.
+		server.TLSConfig = &tls.Config{
+			NextProtos: []string{"http/1.1", "meridian-1"},
+		}
 		return server.ListenAndServeTLS(l.config.ServerCertFile, l.config.ServerKeyFile)
 	}
 	return server.ListenAndServe()
@@ -61,9 +70,9 @@ func (l *WSListener) Accept() (net.Conn, error) {
 	return conn, nil
 }
 
-func (l *WSListener) Close() error { 
+func (l *WSListener) Close() error {
 	close(l.connch)
-	return nil 
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -107,7 +116,7 @@ func (c *WSConn) Write(b []byte) (int, error) {
 	return len(b), nil // Fix: return actual byte count
 }
 
-func (c *WSConn) Close() error { c.closed = true; return c.conn.Close() }
+func (c *WSConn) Close() error         { c.closed = true; return c.conn.Close() }
 func (c *WSConn) LocalAddr() net.Addr  { return c.conn.LocalAddr() }
 func (c *WSConn) RemoteAddr() net.Addr { return c.conn.RemoteAddr() }
 
@@ -128,12 +137,23 @@ func (c *WSConn) SetWriteDeadline(t time.Time) error {
 
 // WSDial dials a WebSocket server and returns a WSConn.
 func WSDial(serverURL string, cfg config.ClientConfig) (*WSConn, error) {
-	dialer := websocket.DefaultDialer
-	// Apply TLS config
 	tlsConfig, err := ClientTLSConfig(cfg)
-	if err == nil {
-		dialer.TLSClientConfig = tlsConfig
+	if err != nil {
+		return nil, err
 	}
+
+	// The WebSocket upgrade is a plain HTTP/1.1 handshake, so the ALPN must
+	// advertise http/1.1. Reusing the QUIC tunnel list ("meridian-1","h3")
+	// makes gorilla reject the negotiated protocol even though TLS succeeds.
+	tlsConfig.NextProtos = []string{"http/1.1", "meridian-1"}
+
+	// websocket.DefaultDialer is a shared package-level value; mutating its
+	// TLSClientConfig would leak this config into every other dialer user.
+	dialer := &websocket.Dialer{
+		TLSClientConfig:  tlsConfig,
+		HandshakeTimeout: 15 * time.Second,
+	}
+
 	conn, _, err := dialer.Dial(serverURL, nil)
 	if err != nil {
 		return nil, err

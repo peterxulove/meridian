@@ -32,6 +32,9 @@ type TunnelClient struct {
 	closed        atomic.Bool
 	handshakeDone chan struct{}
 	sessionStore  *mtp.SessionStore
+	padCfg        mfp.PaddingConfig
+	balancer      *mfp.DirectionBalancer
+	closeCh       chan struct{}
 }
 
 // NewTunnelClient creates a new TunnelClient.
@@ -53,7 +56,7 @@ func (tc *TunnelClient) Connect() error {
 		if err != nil {
 			return fmt.Errorf("tunnel: TLS config error: %w", err)
 		}
-		
+
 		serverAddr, err := net.ResolveUDPAddr("udp", tc.cfg.ServerAddr)
 		if err != nil {
 			return fmt.Errorf("tunnel: resolve UDP addr failed: %w", err)
@@ -76,7 +79,7 @@ func (tc *TunnelClient) Connect() error {
 		if err != nil {
 			return fmt.Errorf("tunnel: Hysteria client creation failed: %w", err)
 		}
-		
+
 		stream, err := hyClient.TCP("dummy:80")
 		if err != nil {
 			hyClient.Close()
@@ -90,6 +93,13 @@ func (tc *TunnelClient) Connect() error {
 			return fmt.Errorf("tunnel: WebSocket dial failed: %w", err)
 		}
 		conn = wsConn
+	} else if tc.cfg.Transport == config.TransportHTTPPOST || tc.cfg.Transport == "HTTP-POST" {
+		postTransport := transport.NewHTTPPOSTTransport(tc.cfg)
+		postConn, err := postTransport.Dial(tc.cfg.ServerAddr)
+		if err != nil {
+			return fmt.Errorf("tunnel: HTTP-POST dial failed: %w", err)
+		}
+		conn = postConn
 	} else {
 		tcpConn, err := net.DialTimeout("tcp", tc.cfg.ServerAddr, tc.cfg.DialTimeout)
 		if err != nil {
@@ -128,7 +138,6 @@ func (tc *TunnelClient) Connect() error {
 		conn.Close()
 		return fmt.Errorf("tunnel: BuildClientHello failed: %w", err)
 	}
-
 	// Write ClientHello
 	if _, err := conn.Write(hello); err != nil {
 		conn.Close()
@@ -138,10 +147,17 @@ func (tc *TunnelClient) Connect() error {
 	// Read ServerHello
 	respBuf := make([]byte, 1024)
 	conn.SetReadDeadline(time.Now().Add(tc.cfg.HandshakeTimeout))
-	_, err = io.ReadAtLeast(conn, respBuf, 136) // Min ServerHello size
-	if err != nil {
-		conn.Close()
-		return fmt.Errorf("tunnel: failed to read ServerHello: %w", err)
+	// HTTP-POST returns downlink bytes in discrete response bodies, so a
+	// single Read may not fill the whole ServerHello. Accumulate until we
+	// have at least the minimum size rather than relying on one read.
+	var readTotal int
+	for readTotal < 136 {
+		n, rerr := conn.Read(respBuf[readTotal:])
+		if rerr != nil {
+			conn.Close()
+			return fmt.Errorf("tunnel: failed to read ServerHello: %w", rerr)
+		}
+		readTotal += n
 	}
 	conn.SetReadDeadline(time.Time{})
 
@@ -192,6 +208,23 @@ func (tc *TunnelClient) Connect() error {
 	tc.decoder = mfp.NewDownlinkDecoder(keys)
 	tc.decoder.SetRenewal(tc.cfg.RenewalDataLimit, tc.cfg.RenewalInterval)
 
+	// Wire the anti-detection settings from config. Both sides must agree on
+	// the padding mode, otherwise the receiver cannot strip the length prefix.
+	tc.padCfg = mfp.PaddingConfig{
+		Mode:     tc.cfg.PaddingMode,
+		BaseSize: tc.cfg.BasePayloadSize,
+		MaxSize:  tc.cfg.MaxPayloadSize,
+		Balanced: tc.cfg.DirectionBalance,
+	}
+	tc.encoder.SetPadding(tc.padCfg)
+	tc.decoder.SetPadding(tc.padCfg)
+	tc.encoder.SetJitterMS(tc.cfg.TimingJitterMS)
+	if tc.cfg.DirectionBalance {
+		tc.balancer = mfp.NewDirectionBalancer(true)
+		tc.encoder.SetBalancer(tc.balancer)
+		tc.decoder.SetBalancer(tc.balancer)
+	}
+
 	if config.DebugMode {
 		fmt.Printf("[DEBUG] [Tunnel] Handshake successful over %s! Cipher: MERIDIAN-CHACHA\n", tc.cfg.Transport)
 	} else {
@@ -200,6 +233,12 @@ func (tc *TunnelClient) Connect() error {
 
 	// Start read loop
 	go tc.readLoop()
+
+	// Keepalive keeps the tunnel alive through NAT/firewall idle timeouts and
+	// gives the balancer a reason to emit traffic when it is enabled.
+	if tc.cfg.KeepaliveInterval > 0 {
+		go tc.keepaliveLoop()
+	}
 
 	return nil
 }
@@ -276,6 +315,84 @@ func (tc *TunnelClient) removeStream(sid uint32) {
 	tc.mu.Unlock()
 }
 
+// keepaliveLoop sends a PING on the control stream every KeepaliveInterval so
+// idle tunnels are not dropped by NAT or stateful firewalls, and injects dummy
+// frames when direction balancing is enabled.
+func (tc *TunnelClient) keepaliveLoop() {
+	ticker := time.NewTicker(tc.cfg.KeepaliveInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-tc.done():
+			return
+		case <-ticker.C:
+			tc.sendKeepalive()
+		}
+	}
+}
+
+func (tc *TunnelClient) sendKeepalive() {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+
+	if tc.closed.Load() || tc.encoder == nil || tc.tunnelConn == nil {
+		return
+	}
+
+	// Stream 0 is the control stream; PING carries a timestamp payload.
+	payload := make([]byte, 8)
+	binary.BigEndian.PutUint64(payload, uint64(time.Now().UnixNano()))
+
+	frame, err := tc.encoder.EncodeType(mfp.TypePING, 0, 0, payload)
+	if err != nil {
+		return
+	}
+	if tc.encoder.ShouldRotate() {
+		tc.encoder.RotateKeys()
+	}
+	tc.tunnelConn.Write(frame)
+
+	// Direction balancing: pad the send side with a dummy frame when the
+	// uplink/downlink ratio looks suspiciously one-sided.
+	if tc.encoder.WantsDummy() {
+		// Must go through the encoder so the frame carries a valid AEAD tag and
+		// an in-order nonce; a raw header-only frame cannot be authenticated by
+		// the peer and used to break the whole direction.
+		dummy, err := tc.encoder.DummyFrame()
+		if err == nil {
+			tc.tunnelConn.Write(dummy)
+		}
+	}
+}
+
+// writeFrame writes an encoded frame to the tunnel, optionally pausing for
+// jitterNanos first to randomise packet timing.
+//
+// Callers must hold tc.mu. The jitter sleep runs in a goroutine-free way by
+// releasing nothing: jitter is at most a few tens of milliseconds and holding
+// the write lock for it is what makes pacing deterministic under concurrency.
+func (tc *TunnelClient) writeFrame(frame []byte, jitterNanos int64) (int, error) {
+	if jitterNanos > 0 {
+		timer := time.NewTimer(time.Duration(jitterNanos))
+		select {
+		case <-timer.C:
+		case <-tc.done():
+			timer.Stop()
+			return 0, errors.New("tunnel: closed during jitter wait")
+		}
+	}
+	return tc.tunnelConn.Write(frame)
+}
+
+// done returns a channel that is closed when the tunnel shuts down.
+func (tc *TunnelClient) done() <-chan struct{} {
+	if tc.closeCh == nil {
+		tc.closeCh = make(chan struct{})
+	}
+	return tc.closeCh
+}
+
 func (tc *TunnelClient) readLoop() {
 	defer tc.Close()
 	for {
@@ -301,6 +418,21 @@ func (tc *TunnelClient) readLoop() {
 		sid := frame.Header.StreamID
 		flags := frame.Header.Flags
 
+		// PONG answers our keepalive; it carries no stream data.
+		if frame.Header.Type == mfp.TypePONG {
+			continue
+		}
+
+		// Dummy frames injected for direction balancing carry no data.
+		if frame.Header.Type == mfp.TypeKEEPALIVE {
+			continue
+		}
+
+		// Note received bytes so direction balancing can compare directions.
+		if tc.balancer != nil {
+			tc.encoder.NoteRecv(uint64(len(frame.Data)))
+		}
+
 		tc.mu.Lock()
 		sc, exists := tc.activeStreams[sid]
 		tc.mu.Unlock()
@@ -322,6 +454,9 @@ func (tc *TunnelClient) readLoop() {
 // Close gracefully closes the tunnel client.
 func (tc *TunnelClient) Close() {
 	if tc.closed.CompareAndSwap(false, true) {
+		if tc.closeCh != nil {
+			close(tc.closeCh)
+		}
 		if tc.tunnelConn != nil {
 			tc.tunnelConn.Close()
 		}
@@ -384,11 +519,12 @@ func (sc *StreamConn) Write(b []byte) (int, error) {
 		}
 		sc.client.encoder.RotateKeys()
 	}
+	jitter := sc.client.encoder.JitterDelay()
 	if err != nil {
 		sc.client.mu.Unlock()
 		return 0, err
 	}
-	_, err = sc.client.tunnelConn.Write(frame)
+	_, err = sc.client.writeFrame(frame, jitter)
 	sc.client.mu.Unlock()
 
 	if err != nil {
@@ -403,7 +539,7 @@ func (sc *StreamConn) Close() error {
 		sc.client.removeStream(sc.sid)
 		// Send RESET frame to server
 		sc.client.mu.Lock()
-		frame, err := sc.client.encoder.Encode(sc.sid, mfp.TypeRESET, nil)
+		frame, err := sc.client.encoder.EncodeType(mfp.TypeRESET, sc.sid, 0, nil)
 		if err == nil {
 			if sc.client.encoder.ShouldRotate() {
 				sc.client.encoder.RotateKeys()
@@ -422,10 +558,10 @@ func (sc *StreamConn) CloseFromServer() {
 	})
 }
 
-func (sc *StreamConn) LocalAddr() net.Addr            { return &net.TCPAddr{IP: net.IPv4zero, Port: 0} }
-func (sc *StreamConn) RemoteAddr() net.Addr           { return &net.TCPAddr{IP: net.IPv4zero, Port: 0} }
-func (sc *StreamConn) SetDeadline(t time.Time) error  { return nil }
-func (sc *StreamConn) SetReadDeadline(t time.Time) error { return nil }
+func (sc *StreamConn) LocalAddr() net.Addr                { return &net.TCPAddr{IP: net.IPv4zero, Port: 0} }
+func (sc *StreamConn) RemoteAddr() net.Addr               { return &net.TCPAddr{IP: net.IPv4zero, Port: 0} }
+func (sc *StreamConn) SetDeadline(t time.Time) error      { return nil }
+func (sc *StreamConn) SetReadDeadline(t time.Time) error  { return nil }
 func (sc *StreamConn) SetWriteDeadline(t time.Time) error { return nil }
 
 // readTCPFrame reads a complete MFP frame (header + encrypted payload + auth tag) from r.

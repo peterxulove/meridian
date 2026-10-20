@@ -157,6 +157,23 @@ Registered extensions:
     8 bytes: UPLOAD_BPS [uint64]
     8 bytes: DOWNLOAD_BPS [uint64]
     2 bytes: ADJUST_INTERVAL [uint16, seconds]
+
+  0x0007: AUTH (password authentication)
+    8 bytes: TIMESTAMP [uint64, unix seconds, network order]
+    32 bytes: AUTH_TAG [HMAC-SHA256, see below]
+
+    AUTH_TAG = HMAC-SHA256(
+      key  = password,
+      data = TIMESTAMP || CLIENT_RANDOM(32) || CLIENT_ECDHE(32)
+    )
+
+    Binding the tag to the client random and the ECDHE public key prevents an
+    attacker from replaying a captured tag on a different session. The server
+    rejects tags whose timestamp is older than 120 seconds (or in the future by
+    more than 120 seconds), and compares the tag in constant time.
+
+    When no password is configured the server skips this check entirely, which
+    keeps passwordless deployments working.
 ```
 
 ### 3.5 ServerHello
@@ -248,6 +265,27 @@ Offset  Size    Name            Description
 | 0x08| RESET      | Both        | Stream reset |
 | 0xFF| KEEPALIVE  | Both        | Null frame (padding placeholder) |
 
+KEEPALIVE doubles as the direction-balancing dummy frame. It is a normal
+authenticated frame with an empty payload: an unencrypted, tag-less header is
+*not* a legal dummy frame, because the receiver cannot authenticate it.
+
+### 4.2.1 Typed control frames
+
+`Type` and `Flags` are separate header fields and must not be conflated.
+PING / PONG / RESET are control frames carried on stream 0 (the control
+stream) and are encoded with an explicit type; a DATA frame's `Flags` field
+carries per-stream semantics instead:
+
+| Flags | Meaning for DATA frames |
+|-------|-------------------------|
+| 0x00  | stream payload          |
+| 0x01  | CONNECT accepted        |
+| 0x08  | CONNECT failed (payload is the error string) |
+
+An implementation that writes a control type into `Flags` silently turns the
+frame into an ordinary DATA frame, and the peer will never dispatch it to the
+keepalive or stream-teardown handler.
+
 ### 4.3 Frame Format (after header)
 
 ```
@@ -259,15 +297,40 @@ Offset  Size    Name            Description
   Total encrypted block = payload + 16
 ```
 
+#### Nonce counter semantics
+
+Each direction derives its nonce from a per-direction seed and a monotonically
+increasing counter. The counter must advance **only** when a frame is
+successfully authenticated:
+
+```
+nonce = SHA256(seed || counter)[:12]
+plaintext, ok = AEAD_Decrypt(key, nonce, frame[14:])
+if !ok { discard frame; do NOT increment counter }
+counter++
+```
+
+Advancing the counter on failure is fatal: a single unauthenticated frame
+(truncated packet, an unencrypted dummy, a replayed record) permanently
+desynchronises the direction, and every later legitimate frame is then tried
+with a wrong nonce and rejected in turn. Since the transport is reliable and
+ordered, a failed frame always means loss of sync, so the correct response is to
+drop the frame and preserve the counter.
+
 ### 4.4 Payload Padding (anti-volume analysis)
 
 When padding mode is enabled (ClientHello flag bit 2):
 
 ```
-actual_payload = application_data
-padding_bytes  = random bytes (0 to max_pad_size)
-padded_payload = actual_payload || padding_bytes
+actual_payload   = [2-byte actual length, network order] || application_data
+padding_bytes    = random bytes (0 to max_pad_size)
+padded_payload   = actual_payload || padding_bytes
 ```
+
+The 2-byte length prefix lets the receiver recover the real payload without any
+out-of-band framing. Both ends must agree on the padding mode: a sender that
+pads while the receiver does not strip the prefix silently corrupts the stream,
+and vice versa.
 
 - **Normal mode**: payload = actual_data, variable size
 - **Fixed mode**: all payloads are EXACTLY `BASE_SIZE` bytes (0 padding removed, overflows split)
@@ -391,6 +454,34 @@ Content-Type: application/octet-stream
 ```
 
 Traffic looks like a cloud storage upload. Repeated POSTs mimic normal cloud backup behavior.
+
+#### Session binding
+
+HTTP is request/response, so a long-lived tunnel has to be rebuilt from many
+short requests. The server allocates a session id on the first upload and
+returns it in the `Mir-Session` header; every later upload carries that header
+so it joins the same tunnel instead of opening a new one.
+
+```
+Client                                    Server
+  |-- POST /upload (no Mir-Session) ------->|   allocate session, queue uplink
+  |<-- 200 OK, Mir-Session: <id> -----------|
+  |-- POST /upload, Mir-Session: <id> ----->|   feed uplink, drain downlink
+  |<-- 200 OK [downlink bytes] --------------|
+  |-- POST /upload, Mir-Poll: 1 ----------->|   long-poll for downlink
+  |<-- 200 OK [downlink bytes or empty] ----|
+  |-- DELETE /upload, Mir-Session: <id> --->|   release session
+```
+
+- The response body carries whatever downlink bytes are pending, so an upload
+  doubles as a poll for downlink data.
+- A request with `Mir-Poll: 1` and no payload long-polls (bounded, default
+  2s) instead of returning empty immediately, which keeps the client's polling
+  rate low without adding latency to real traffic.
+- Sessions idle for more than 5 minutes are reaped.
+
+Because `Read` on the client polls by issuing an upload, the poll path must not
+re-enter the code that takes the transport lock while it is already held.
 
 ---
 

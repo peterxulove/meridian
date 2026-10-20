@@ -28,13 +28,14 @@ const (
 // FrameHeader is the 14-byte MFP frame header.
 //
 // Wire layout (per spec §4.1):
-//   Offset  Size  Field
-//   0       1     Type
-//   1       2     PayloadLen
-//   3       4     StreamID
-//   7       1     Flags
-//   8       4     Sequence
-//   12      2     Extended
+//
+//	Offset  Size  Field
+//	0       1     Type
+//	1       2     PayloadLen
+//	3       4     StreamID
+//	7       1     Flags
+//	8       4     Sequence
+//	12      2     Extended
 type FrameHeader struct {
 	Type       byte
 	PayloadLen uint16
@@ -59,7 +60,7 @@ func EncodeHeader(h *FrameHeader) []byte {
 	buf[0] = h.Type
 	binary.BigEndian.PutUint16(buf[1:3], h.PayloadLen)
 	binary.BigEndian.PutUint32(buf[3:7], h.StreamID)
-	buf[7] = h.Flags                              // Flags  @ offset 7 (1 byte)
+	buf[7] = h.Flags                                   // Flags  @ offset 7 (1 byte)
 	binary.BigEndian.PutUint32(buf[8:12], h.Sequence)  // Sequence @ offset 8 (4 bytes)
 	binary.BigEndian.PutUint16(buf[12:14], h.Extended) // Extended @ offset 12 (2 bytes)
 	return buf
@@ -75,7 +76,7 @@ func DecodeHeader(data []byte) (*FrameHeader, error) {
 		Type:       data[0],
 		PayloadLen: binary.BigEndian.Uint16(data[1:3]),
 		StreamID:   binary.BigEndian.Uint32(data[3:7]),
-		Flags:      data[7],                              // Fix: was data[7] overlapping with Sequence
+		Flags:      data[7],                             // Fix: was data[7] overlapping with Sequence
 		Sequence:   binary.BigEndian.Uint32(data[8:12]), // Fix: was data[7:11]
 		Extended:   binary.BigEndian.Uint16(data[12:14]),
 	}, nil
@@ -184,6 +185,18 @@ type Encoder struct {
 	renewalInterval time.Duration
 	generation      uint32
 	mu              sync.Mutex
+
+	// Anti-detection: traffic padding. PaddingNone (zero value) keeps the
+	// wire format byte-identical to pre-padding behaviour, so callers that
+	// never call SetPadding are unaffected.
+	padCfg PaddingConfig
+	// JitterNanos is the maximum artificial send delay applied after
+	// encoding. Zero disables jitter.
+	jitterNanos int64
+	// balancer, when non-nil, tracks direction symmetry for dummy injection.
+	balancer *DirectionBalancer
+	// SentBytes counts pre-padding bytes handed to Encode.
+	sentBytes uint64
 }
 
 // NewEncoder creates an uplink encoder (client→server), using NonceSeedUplink.
@@ -197,18 +210,50 @@ func NewDownlinkEncoder(keys *crypto.KeyMaterial) *Encoder {
 }
 
 // Encode encrypts data for stream sid with the given flags.
-// PayloadLen in the header records the actual (pre-padding) data length so
-// the receiver can strip padding via Decoder.Decode.
+// When padding is enabled the header PayloadLen records the *padded* length
+// (which is what the receiver's framer needs) and the original length is
+// carried in a 2-byte prefix inside the payload, recovered by Decoder.Decode.
+// With padding disabled the behaviour is unchanged from earlier versions.
+// Encode encrypts a DATA frame for stream sid with the given flags.
 func (e *Encoder) Encode(sid uint32, flags byte, data []byte) ([]byte, error) {
+	return e.EncodeType(TypeDATA, sid, flags, data)
+}
+
+// EncodeType encrypts a frame with an explicit wire type.
+//
+// Encode always writes TypeDATA into the header, so control frames (PING,
+// PONG, RESET) must use this method — otherwise the type constant lands in the
+// Flags field and the peer never sees a typed control frame.
+func (e *Encoder) EncodeType(typ byte, sid uint32, flags byte, data []byte) ([]byte, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	seq := e.Count
 	e.Count++
 
+	e.sentBytes += uint64(len(data))
+	if e.balancer != nil {
+		e.balancer.Sent += uint64(len(data))
+	}
+
+	payload := data
+	// Enabled() treats the empty mode as "no padding" so a zero-value
+	// PaddingConfig cannot accidentally activate padding.
+	if e.padCfg.Enabled() {
+		padded, err := PadPayload(data, e.padCfg)
+		if err != nil {
+			return nil, err
+		}
+		payload = padded
+	} else if e.jitterNanos > 0 {
+		// Jitter without padding still needs a private copy because the
+		// caller may reuse its buffer once Encode returns.
+		payload = append([]byte(nil), data...)
+	}
+
 	header := &FrameHeader{
-		Type:       TypeDATA,
-		PayloadLen: uint16(len(data)),
+		Type:       typ,
+		PayloadLen: uint16(len(payload)),
 		StreamID:   sid,
 		Sequence:   uint32(seq),
 		Flags:      flags,
@@ -218,7 +263,7 @@ func (e *Encoder) Encode(sid uint32, flags byte, data []byte) ([]byte, error) {
 	// Fix #6: derive a unique nonce per packet using the direction-specific seed.
 	nonce := crypto.GenerateNonce(e.seed, seq)
 
-	ciphertext, err := crypto.AEADEncrypt(&e.Keys.TrafficEncKey, nonce, data)
+	ciphertext, err := crypto.AEADEncrypt(&e.Keys.TrafficEncKey, nonce, payload)
 	if err != nil {
 		return nil, err
 	}
@@ -236,6 +281,89 @@ func (e *Encoder) SetRenewal(limit uint64, interval time.Duration) {
 	defer e.mu.Unlock()
 	e.renewalLimit = limit
 	e.renewalInterval = interval
+}
+
+// SetPadding enables traffic padding. Passing PaddingNone keeps the wire
+// format unchanged, which is what the test configs rely on.
+func (e *Encoder) SetPadding(cfg PaddingConfig) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.padCfg = cfg.Normalize()
+}
+
+// SetJitterMS sets the maximum artificial delay (milliseconds) applied before
+// a caller should write an encoded frame. Zero disables jitter.
+func (e *Encoder) SetJitterMS(ms float64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if ms <= 0 {
+		e.jitterNanos = 0
+		return
+	}
+	e.jitterNanos = int64(ms * 1e6)
+}
+
+// JitterDelay returns a random delay in [0, jitter] nanoseconds for the
+// caller to wait on before writing. Returns 0 when jitter is disabled.
+// It deliberately does not sleep: the caller owns the write lock and should
+// decide how to pace without holding it across a sleep.
+func (e *Encoder) JitterDelay() int64 {
+	e.mu.Lock()
+	maxDelay := e.jitterNanos
+	e.mu.Unlock()
+	if maxDelay <= 0 {
+		return 0
+	}
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return 0
+	}
+	v := int64(binary.BigEndian.Uint64(b[:]) >> 1) // keep positive
+	if v <= 0 {
+		return 0
+	}
+	return v % maxDelay
+}
+
+// SetBalancer attaches a DirectionBalancer used to decide when dummy frames
+// should be injected to mask asymmetric traffic.
+func (e *Encoder) SetBalancer(b *DirectionBalancer) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.balancer = b
+}
+
+// NoteRecv records bytes received on the opposite direction so the balancer
+// can compare directions.
+func (e *Encoder) NoteRecv(n uint64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.balancer != nil {
+		e.balancer.Recv += n
+	}
+}
+
+// WantsDummy reports whether traffic is asymmetric enough to warrant a dummy
+// frame. Callers should send DummyFrame() when it returns true.
+func (e *Encoder) WantsDummy() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.balancer != nil && e.balancer.ShouldSendDummy()
+}
+
+// DummyFrame builds a properly encrypted KEEPALIVE frame for direction
+// balancing.
+//
+// The previous package-level DummyFrame() returned 14 raw bytes with no
+// ciphertext and no AEAD tag. Because Decoder.Decode decrypts every frame it
+// reads, such a frame could not be authenticated: the receiving side dropped
+// it, and — before the nonce fix — it also burned a nonce, desynchronising the
+// direction so all subsequent frames failed too.
+//
+// Encoding the dummy through the normal path gives it a valid tag and an
+// in-order nonce, so the peer decodes it as an ordinary KEEPALIVE and skips it.
+func (e *Encoder) DummyFrame() ([]byte, error) {
+	return e.EncodeType(TypeKEEPALIVE, 0, 0, nil)
 }
 
 func (e *Encoder) ShouldRotate() bool {
@@ -294,6 +422,15 @@ type Decoder struct {
 	renewalInterval time.Duration
 	generation      uint32
 	mu              sync.Mutex
+
+	// padCfg mirrors the peer encoder's padding config. When Mode is not
+	// PaddingNone, Decode strips the 2-byte length prefix written by
+	// PadPayload so callers see the original plaintext.
+	padCfg PaddingConfig
+	// recvBytes counts plaintext bytes delivered to the caller.
+	recvBytes uint64
+	// balancer mirrors the encoder's, used purely for byte accounting.
+	balancer *DirectionBalancer
 }
 
 // NewUplinkDecoder creates a decoder for server-side decryption of client→server frames.
@@ -326,15 +463,35 @@ func (d *Decoder) Decode(data []byte) (*DataFrame, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
+	// A frame that fails authentication must not consume a nonce. Advancing the
+	// counter on failure desynchronises this direction permanently: the next
+	// legitimate frame is tried with the wrong nonce and rejected in turn. This
+	// is what happens when an unauthenticated dummy frame (DummyFrame carries no
+	// AEAD tag) reaches a decoder.
 	nonce := crypto.GenerateNonce(d.seed, d.Count)
-	d.Count++
 
 	plain, err := crypto.AEADDecrypt(&d.Keys.TrafficEncKey, nonce, data[14:])
 	if err != nil {
 		return nil, err
 	}
+	d.Count++
+
+	// Strip padding when enabled. The 2-byte prefix encodes the original
+	// length, letting us drop the random tail added by the peer.
+	// Mirrors Encoder.Encode: only strip when the peer actually pads.
+	if d.padCfg.Enabled() {
+		stripped, err := UnpadPayload(plain, d.padCfg)
+		if err != nil {
+			return nil, err
+		}
+		plain = stripped
+	}
 
 	d.bytesProcessed += uint64(len(plain))
+	d.recvBytes += uint64(len(plain))
+	if d.balancer != nil {
+		d.balancer.Recv += uint64(len(plain))
+	}
 
 	return &DataFrame{Header: *h, Data: plain}, nil
 }
@@ -344,6 +501,21 @@ func (d *Decoder) SetRenewal(limit uint64, interval time.Duration) {
 	defer d.mu.Unlock()
 	d.renewalLimit = limit
 	d.renewalInterval = interval
+}
+
+// SetPadding mirrors the peer encoder's padding config so Decode can strip
+// the length prefix and return the original plaintext.
+func (d *Decoder) SetPadding(cfg PaddingConfig) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.padCfg = cfg.Normalize()
+}
+
+// SetBalancer attaches a DirectionBalancer for received-byte accounting.
+func (d *Decoder) SetBalancer(b *DirectionBalancer) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.balancer = b
 }
 
 func (d *Decoder) ShouldRotate() bool {
@@ -388,6 +560,33 @@ type PaddingConfig struct {
 	BaseSize uint32
 	MaxSize  uint32
 	Balanced bool
+}
+
+// Normalize returns cfg with empty/zero fields filled in so that a
+// zero-value PaddingConfig behaves as "no padding" rather than accidentally
+// matching the padding branch ("" != PaddingNone).
+//
+// Callers should prefer this when building a PaddingConfig from config files,
+// where padding_mode may be absent.
+func (cfg PaddingConfig) Normalize() PaddingConfig {
+	if cfg.Mode == "" {
+		cfg.Mode = config.PaddingNone
+	}
+	if cfg.BaseSize == 0 {
+		cfg.BaseSize = 1400
+	}
+	if cfg.MaxSize == 0 {
+		cfg.MaxSize = 1452
+	}
+	if cfg.MaxSize < cfg.BaseSize {
+		cfg.MaxSize = cfg.BaseSize
+	}
+	return cfg
+}
+
+// Enabled reports whether padding is active for this configuration.
+func (cfg PaddingConfig) Enabled() bool {
+	return cfg.Mode != config.PaddingNone && cfg.Mode != ""
 }
 
 // PadPayload pads data according to the padding mode.
@@ -482,12 +681,16 @@ func (t *PacketTimer) Delay() int64 {
 		return 0
 	}
 	rnd := make([]byte, 8)
-	rand.Read(rnd) //nolint:errcheck // best-effort jitter
+	rand.Read(rnd)                                //nolint:errcheck // best-effort jitter
 	v := int64(binary.BigEndian.Uint64(rnd) >> 1) // ensure positive
 	return v % int64(t.JitterMS*1e6)
 }
 
-// DummyFrame builds a 14-byte KEEPALIVE frame for direction balancing.
+// DummyFrame is kept only for source compatibility and must not be sent on the
+// wire: it produces a 14-byte header with no ciphertext and no AEAD tag, which
+// the receiving decoder cannot authenticate. Use (*Encoder).DummyFrame.
+//
+// Deprecated: use (*Encoder).DummyFrame instead.
 func DummyFrame() ([]byte, error) {
 	b := make([]byte, 14)
 	b[0] = TypeKEEPALIVE

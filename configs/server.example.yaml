@@ -22,6 +22,7 @@ fingerprint: "chrome_win"
 padding_mode: "random"
 base_payload_size: 1400
 max_payload_size: 1452
+direction_balance: false
 timing_jitter_ms: 30.0
 
 # ─── Connection Limits ───
