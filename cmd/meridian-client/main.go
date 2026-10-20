@@ -7,13 +7,23 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"time"
 	"sync"
+	"time"
 
 	"meridian/pkg/anti"
 	"meridian/pkg/config"
 	"meridian/pkg/crypto"
 	"meridian/pkg/mtp"
+)
+
+// Version and BuildTime are overridden at link time by the release workflow:
+//
+//	go build -ldflags "-X main.Version=v1.6.0 -X main.BuildTime=..."
+//
+// The defaults keep a plain `go build` from printing an empty version.
+var (
+	Version   = "dev"
+	BuildTime = "unknown"
 )
 
 func main() {
@@ -35,7 +45,7 @@ func main() {
 		cfg.ListenAddr = listen
 	}
 
-	fmt.Printf("Meridian Client v1.0.1\n")
+	fmt.Printf("Meridian Client %s\n", Version)
 	fmt.Printf("  Server:    %s\n", cfg.ServerAddr)
 	fmt.Printf("  Transport: %s\n", cfg.Transport)
 	fmt.Printf("  Cipher:    %s\n", cfg.CipherSuite)
@@ -119,7 +129,7 @@ func (c *Client) maintainTunnel() {
 			time.Sleep(5 * time.Second)
 			continue
 		}
-		
+
 		c.mu.Lock()
 		c.tunnel = tunnel
 		c.mu.Unlock()

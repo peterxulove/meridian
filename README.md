@@ -74,6 +74,13 @@ Meridian 是一个自定义安全代理协议，设计目标是在恶劣的网�
 - 新增 `pkg/mfp/frames_test.go`（padding 往返、抖动边界、方向均衡、密钥轮换、控制帧类型）
 - 新增 `pkg/transport/httppost_transport_test.go` 与 `httppost_e2e_test.go`（会话复用、pull 模式往返）
 
+#### 🔧 构建与发布
+
+- **版本号真正注入**：此前两端把版本写死为 `v1.0.0`/`v1.0.1`，workflow 里的 `-X main.Version` 因没有对应变量而完全空转。现在 `Version`/`BuildTime` 是可注入变量，默认 `dev`。
+- **`build.sh` 参数化**：版本不再硬编码为 `v1.3.0`，默认取当前 git tag，也可 `./build.sh v1.6.0` 指定；同时生成 `SHA256SUMS`。
+- **`SHA256SUMS` 自引用修复**：此前把 `SHA256SUMS` 自身也纳入校验（对空文件取哈希），导致 `shasum -c` 必然失败。现在生成时排除自身。
+- **`deploy.sh` 版本可覆盖**：`MERIDIAN_VERSION` 环境变量可指定下载版本，默认 `v1.6.0`。
+
 ### v1.5.0（2026-06-03）
 
 #### ✨ 新增功能
@@ -685,7 +692,7 @@ go vet ./...
 - [x] HKDF-SHA256 密钥派生
 - [x] MFP 帧协议编解码
 - [x] ClientHello 构建与解析
-- [x] UDP 服务端握手接收
+- [x] 服务端握手接收（Hysteria v2 承载 UDP，MTP 握手在其流上完成）
 - [x] **完整 SOCKS5 代理服务（RFC 1928 + RFC 1929）** ✅ v1.0.2
 - [x] **局域网代理服务（0.0.0.0 监听）** ✅ v1.0.2
 - [x] **配置文件 SPKI Hex 解析修复** ✅ v1.0.1
@@ -701,6 +708,10 @@ go vet ./...
 - [x] 密钥定期轮换 ✅ v1.5.0
 - [x] Windows 平台支持 ✅ v1.5.0
 - [x] HTTP 代理协议支持 ✅ v1.5.0
+- [x] **TCP 隧道密码认证** ✅ v1.6.0
+- [x] **HTTP-POST 传输服务端** ✅ v1.6.0
+- [x] **方向均衡 / Nonce 失步修复** ✅ v1.6.0
+- [x] **版本号构建注入** ✅ v1.6.0
 
 ---
 

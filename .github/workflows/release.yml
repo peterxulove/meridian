@@ -117,7 +117,9 @@ jobs:
       - name: 生成 SHA256 校验和
         run: |
           cd dist
-          sha256sum * > SHA256SUMS
+          # Exclude SHA256SUMS itself: globbing it would hash the previous
+          # (or empty) file and make the checksum file fail its own check.
+          sha256sum $(ls | grep -v '^SHA256SUMS$') > SHA256SUMS
           cat SHA256SUMS
 
       - name: 从 CHANGELOG 或 tag message 提取 Release Notes

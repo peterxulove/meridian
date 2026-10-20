@@ -10,6 +10,16 @@ import (
 	"meridian/pkg/config"
 )
 
+// Version and BuildTime are overridden at link time by the release workflow:
+//
+//	go build -ldflags "-X main.Version=v1.6.0 -X main.BuildTime=..."
+//
+// The defaults keep a plain `go build` from printing an empty version.
+var (
+	Version   = "dev"
+	BuildTime = "unknown"
+)
+
 func main() {
 	cfgPath, listen, showFP, debug := flagParse()
 	config.DebugMode = debug
@@ -29,7 +39,7 @@ func main() {
 		cfg.ListenAddr = listen
 	}
 
-	fmt.Printf("Meridian Server v1.0.0\n")
+	fmt.Printf("Meridian Server %s\n", Version)
 	fmt.Printf("  Listen:    %s\n", cfg.ListenAddr)
 	fmt.Printf("  Transport: %s\n", cfg.Transport)
 	fmt.Printf("  Cipher:    %s\n", cfg.CipherSuite)

@@ -146,7 +146,7 @@ install_binary() {
         $SUDO chmod +x "$target_bin"
     else
         # Try to download from GitHub releases
-        local version="v1.5.0"
+        local version="${MERIDIAN_VERSION:-v1.6.0}"
         local asset_name="meridian-${role}-${platform}-${ARCH}"
         if [ "$OS" = "windows" ]; then
             asset_name+=".exe"

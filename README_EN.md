@@ -77,6 +77,13 @@ Meridian is a custom secure proxy protocol designed to deliver **undetectable en
 - `pkg/mfp/frames_test.go` (padding round-trip, jitter bounds, direction balance, key rotation, control frame types)
 - `pkg/transport/httppost_transport_test.go` and `httppost_e2e_test.go` (session reuse, pull-mode round-trip)
 
+#### 🔧 Build & Release
+
+- **Version is actually injected**: both binaries used to hardcode `v1.0.0`/`v1.0.1`, while the workflow's `-X main.Version` was a no-op because no such variable existed. `Version`/`BuildTime` are now real injectable variables defaulting to `dev`.
+- **`build.sh` takes a version argument**: no longer pinned to `v1.3.0`. It defaults to the current git tag, or accepts `./build.sh v1.6.0`, and regenerates `SHA256SUMS`.
+- **`SHA256SUMS` self-reference fixed**: the checksum file used to include itself (hashing an empty file), so `shasum -c` always failed. It now excludes itself.
+- **`deploy.sh` version override**: the `MERIDIAN_VERSION` environment variable selects the download version, defaulting to `v1.6.0`.
+
 ### v1.5.0 (2026-06-03)
 
 #### ✨ New Features
@@ -683,7 +690,7 @@ go vet ./...
 - [x] HKDF-SHA256 key derivation
 - [x] MFP frame protocol encode/decode
 - [x] ClientHello build and parse
-- [x] UDP server handshake reception
+- [x] Server handshake reception (UDP is owned by Hysteria v2; MTP handshake runs on its stream)
 - [x] **Full SOCKS5 proxy server (RFC 1928 + RFC 1929)** ✅ v1.0.2
 - [x] **LAN-wide proxy service (0.0.0.0 listen)** ✅ v1.0.2
 - [x] **Config SPKI hex parsing fix** ✅ v1.0.1
@@ -699,6 +706,10 @@ go vet ./...
 - [x] Periodic key rotation ✅ v1.5.0
 - [x] Windows platform support ✅ v1.5.0
 - [x] HTTP proxy protocol support ✅ v1.5.0
+- [x] **Password auth on the TCP tunnel** ✅ v1.6.0
+- [x] **HTTP-POST transport server** ✅ v1.6.0
+- [x] **Direction balancing / nonce desync fixes** ✅ v1.6.0
+- [x] **Version injected at build time** ✅ v1.6.0
 
 ---
 
