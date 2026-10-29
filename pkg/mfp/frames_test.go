@@ -157,6 +157,48 @@ func TestJitterWithinBounds(t *testing.T) {
 	}
 }
 
+// TestJitterSkipsBulkFrames keeps artificial delay off the data path. Sleeping
+// once per 32KB write serialises the tunnel and caps throughput far below the
+// link rate, while providing no meaningful cover for bulk transfers.
+func TestJitterSkipsBulkFrames(t *testing.T) {
+	keys := testKeys(t)
+	enc := NewEncoder(keys)
+	enc.SetJitterMS(30)
+
+	for i := 0; i < 100; i++ {
+		if d := enc.JitterDelayFor(32 * 1024); d != 0 {
+			t.Fatalf("bulk frame received %d ns jitter, want 0", d)
+		}
+	}
+	if d := enc.JitterDelayFor(512); d < 0 || d >= int64(30*1e6) {
+		t.Fatalf("small frame jitter %d out of range", d)
+	}
+}
+
+// TestRandomPaddingDoesNotInflateBulkFrames protects the hot path from the old
+// behaviour of adding a full BaseSize block to every frame, including 32KB
+// data frames.
+func TestRandomPaddingDoesNotInflateBulkFrames(t *testing.T) {
+	cfg := PaddingConfig{Mode: config.PaddingRandom, BaseSize: 1400, MaxSize: 1452}
+	data := make([]byte, 32*1024)
+
+	padded, err := PadPayload(data, cfg)
+	if err != nil {
+		t.Fatalf("PadPayload: %v", err)
+	}
+	if overhead := len(padded) - len(data); overhead < 2 || overhead > 54 {
+		t.Fatalf("bulk padding overhead = %d bytes, want 2..54", overhead)
+	}
+
+	recovered, err := UnpadPayload(padded, cfg)
+	if err != nil {
+		t.Fatalf("UnpadPayload: %v", err)
+	}
+	if len(recovered) != len(data) {
+		t.Fatalf("recovered length = %d, want %d", len(recovered), len(data))
+	}
+}
+
 // TestBalancerTriggersOnAsymmetry covers the direction-balancing decision.
 func TestBalancerTriggersOnAsymmetry(t *testing.T) {
 	b := NewDirectionBalancer(true)

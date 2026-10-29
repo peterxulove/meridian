@@ -288,6 +288,9 @@ func (e *Encoder) encodeLocked(typ byte, sid uint32, flags byte, data []byte) ([
 		// caller may reuse its buffer once Encode returns.
 		payload = append([]byte(nil), data...)
 	}
+	if len(payload) > 65535 {
+		return nil, fmt.Errorf("mfp: payload too large for frame header: %d", len(payload))
+	}
 
 	header := &FrameHeader{
 		Type:       typ,
@@ -346,10 +349,23 @@ func (e *Encoder) SetJitterMS(ms float64) {
 // It deliberately does not sleep: the caller owns the write lock and should
 // decide how to pace without holding it across a sleep.
 func (e *Encoder) JitterDelay() int64 {
+	return e.jitterDelayLocked(false)
+}
+
+// JitterDelayFor returns a random delay only for small, latency-insensitive
+// frames. Bulk data must not sleep once per frame: a 30ms jitter applied to
+// every 32KB write serialises the whole tunnel and caps it far below the link
+// rate. Large frames already dominate the traffic shape, so skipping jitter
+// there preserves the anti-detection benefit without throttling throughput.
+func (e *Encoder) JitterDelayFor(payloadLen int) int64 {
+	return e.jitterDelayLocked(payloadLen >= 8*1024)
+}
+
+func (e *Encoder) jitterDelayLocked(skip bool) int64 {
 	e.mu.Lock()
 	maxDelay := e.jitterNanos
 	e.mu.Unlock()
-	if maxDelay <= 0 {
+	if skip || maxDelay <= 0 {
 		return 0
 	}
 	var b [8]byte
@@ -665,20 +681,27 @@ func PadPayload(data []byte, cfg PaddingConfig) ([]byte, error) {
 		return p, nil
 
 	default: // PaddingRandom
-		// Layout: [2-byte actual length (BE)] [actual data] [random padding]
+		// Layout: [2-byte actual length (BE)] [actual data] [random padding].
+		// Small frames are padded up to BaseSize; large frames only receive a
+		// small random tail up to MaxSize. The old code added a full BaseSize
+		// to every frame, including 32KB bulk frames, wasting bandwidth and
+		// generating unnecessary crypto/rand traffic on the hot path.
 		actualLen := uint16(len(data))
-		padded := cfg.BaseSize
+		minimum := cfg.BaseSize
+		if payloadLen := uint32(len(data)) + 2; payloadLen > minimum {
+			minimum = payloadLen
+		}
+
+		extra := uint32(0)
 		if cfg.MaxSize > cfg.BaseSize {
-			// Compute a random amount of additional padding in [0, MaxSize-BaseSize].
 			diff := cfg.MaxSize - cfg.BaseSize + 1
 			rnd := make([]byte, 4)
 			if _, err := rand.Read(rnd); err != nil { // Fix #19: crypto/rand
 				return nil, fmt.Errorf("mfp: rand.Read for padding failed: %w", err)
 			}
-			extra := binary.BigEndian.Uint32(rnd) % diff
-			padded += extra
+			extra = binary.BigEndian.Uint32(rnd) % diff
 		}
-		totalLen := 2 + uint32(len(data)) + padded
+		totalLen := minimum + extra
 		p := make([]byte, totalLen)
 		binary.BigEndian.PutUint16(p[0:2], actualLen)
 		copy(p[2:], data)

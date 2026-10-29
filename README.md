@@ -46,6 +46,23 @@ Meridian 是一个自定义安全代理协议，设计目标是在恶劣的网�
 
 ## 更新日志
 
+### v1.6.3（2026-10-29）
+
+#### 🚀 高吞吐
+
+- **多隧道并行**：新增 `tunnel_connections`。此前所有 SOCKS 流都复用一条外层 TCP/QUIC 流，单流 BDP 会把整条代理限制在约 150–250 Mbps；现在按负载把用户流分配到多条独立隧道，实测 111 → Oracle 8 路并发从约 200 Mbps 提升到约 576 Mbps。
+- **QUIC + WebSocket 混合监听**：服务端新增 `transport: "QUIC+WebSocket"`，同一端口同时提供 UDP QUIC 和 TCP/WSS，老客户端无需立即切换。
+- **WebSocket 热路径优化**：改为流式读取 WebSocket message，去掉每帧整块分配与复制；读写缓冲提升到 64KB。
+- **大帧填充修正**：随机填充不再给每个 32KB 数据帧额外加上 1400 字节，只保留小帧填充和最多 52 字节随机尾部。
+- **批量数据不再逐帧 sleep**：`timing_jitter_ms` 只作用于小帧，避免上行被每帧最多 30ms 的延迟串行化。
+- **带宽默认值改为自动**：`up_mbps`/`down_mbps` 默认 `0`，QUIC 使用自适应 BBR；固定填 1000 会触发 Brutal 过冲，实测反而更慢。
+
+#### 🔧 部署
+
+- `deploy.sh update` 改为强制从 GitHub Release 安装指定版本，避免当前目录里的旧 `dist/` 二进制把客户端降级。
+- 新增 `./deploy.sh optimize client|server`：保留密码、SPKI、地址和本地端口，只切换高吞吐传输与并行参数。
+- 默认发布版本更新为 `v1.6.3`，`deploy.sh version` 可查看已安装核心版本。
+
 ### v1.6.0（2026-10-21）
 
 #### 🔒 安全修复
@@ -79,7 +96,7 @@ Meridian 是一个自定义安全代理协议，设计目标是在恶劣的网�
 - **版本号真正注入**：此前两端把版本写死为 `v1.0.0`/`v1.0.1`，workflow 里的 `-X main.Version` 因没有对应变量而完全空转。现在 `Version`/`BuildTime` 是可注入变量，默认 `dev`。
 - **`build.sh` 参数化**：版本不再硬编码为 `v1.3.0`，默认取当前 git tag，也可 `./build.sh v1.6.0` 指定；同时生成 `SHA256SUMS`。
 - **`SHA256SUMS` 自引用修复**：此前把 `SHA256SUMS` 自身也纳入校验（对空文件取哈希），导致 `shasum -c` 必然失败。现在生成时排除自身。
-- **`deploy.sh` 版本可覆盖**：`MERIDIAN_VERSION` 环境变量可指定下载版本，默认 `v1.6.0`。
+- **`deploy.sh` 版本可覆盖**：`MERIDIAN_VERSION` 环境变量可指定下载版本。
 
 ### v1.5.0（2026-06-03）
 
@@ -167,9 +184,44 @@ Meridian 是一个自定义安全代理协议，设计目标是在恶劣的网�
 
 | 传输方式 | 适用场景 | 说明 |
 |---------|---------|------|
-| **QUIC**（默认） | 开放或半开放网络 | 最佳性能，多路复用流 |
-| **WebSocket** | 网络封锁 UDP/QUIC | 伪装为标准 WSS 流量 |
+| **QUIC+WebSocket**（服务端推荐） | 大多数环境 | 同一端口同时提供 UDP QUIC 与 TCP/WSS |
+| **WebSocket**（高吞吐客户端推荐） | 500 Mbps 以上、UDP 受限 | 多隧道并行，伪装为标准 WSS 流量 |
+| **QUIC** | 低延迟、UDP 质量好 | 单流受 BDP 限制，适合交互而非高速下载 |
 | **HTTP-POST** | 强力 DPI 环境 | 模拟云存储上传行为 |
+
+### 高吞吐部署（500 Mbps+）
+
+单条 TCP/QUIC 流受带宽时延积限制，实测 111 → Oracle 单条约 196–250 Mbps；把所有用户流复用到一条外层隧道不会突破这个上限。高吞吐配置使用 4 条独立 WSS 隧道并按负载分配用户流：
+
+```bash
+# 服务端：保留现有密码/证书，只开启 TCP/WSS 混合监听
+./deploy.sh optimize server
+
+# 客户端：保留现有密码、SPKI、地址和本地端口，开启 4 条 WebSocket 隧道
+./deploy.sh optimize client
+
+# 更新核心（配置不变，强制使用最新 Release）
+./deploy.sh update server
+./deploy.sh update client
+```
+
+关键配置：
+
+```yaml
+# server.yaml
+transport: "QUIC+WebSocket"
+wss_path: "/ws/"
+
+# client.yaml
+transport: "WebSocket"
+wss_path: "/ws/"
+tunnel_connections: 4
+timing_jitter_ms: 0.0
+up_mbps: 0
+down_mbps: 0
+```
+
+> 实测同一服务器、同一文件：单条 TCP/QUIC 隧道约 200 Mbps；4 条 TCP 隧道 8 路并发约 576 Mbps。线路本身没有 500 Mbps 问题时，瓶颈是单流而不是 Meridian 加解密。
 
 ---
 
@@ -237,8 +289,10 @@ chmod +x deploy.sh
 **支持的指令：**
 * `./deploy.sh`：打开交互式部署主菜单。
 * `./deploy.sh status`：查看目前所有 Meridian 服务运行状态。
+* `./deploy.sh version`：查看配置目标版本与已安装核心版本。
 * `./deploy.sh update client`：只更新客户端核心，保留现有 `client.yaml`、证书与服务定义；新核心启动失败会自动回滚。
 * `./deploy.sh update server`：只更新服务端核心，保留现有 `server.yaml`、证书与服务定义。
+* `./deploy.sh optimize client|server`：保留凭据，切换高吞吐传输与并行参数。
 * `./deploy.sh uninstall`：快捷卸载已安装的客户端或服务端。
 
 ---
@@ -356,13 +410,13 @@ git config --global http.https://github.com.proxy socks5://主机IP:1080
 
 根据所部署的网络环境，Meridian 提供了三种传输层协议的配置方案：
 
-1. **QUIC (REALITY) 模式**：基于 QUIC/UDP，性能最强，抗封锁效果最好，**推荐默认方案**。
-2. **WebSocket (WSS) 模式**：基于 TCP/TLS，适合 UDP 受限环境。
+1. **QUIC + WebSocket 混合模式**：服务端推荐，同一端口兼容 UDP QUIC 与 TCP/WSS。
+2. **WebSocket (WSS) 多隧道模式**：500 Mbps 以上或 UDP 受限环境推荐。
 3. **HTTP-POST 模式**：模拟大文件上传，极端环境下使用。
 
 ---
 
-### 1. QUIC (REALITY) 模式（默认推荐）
+### 1. QUIC (REALITY) 模式（低延迟）
 
 #### 🔹 服务端 (`server.quic.yaml`)
 ```yaml
@@ -385,7 +439,9 @@ fingerprint: "chrome_win"          # chrome_win / firefox_mac / curl_linux
 padding_mode: "random"             # none / fixed / random
 base_payload_size: 1400
 max_payload_size: 1452
-timing_jitter_ms: 30.0
+timing_jitter_ms: 0.0
+up_mbps: 0
+down_mbps: 0
 
 # ─── 连接与性能控制 ───
 max_clients: 1000
@@ -422,7 +478,9 @@ padding_mode: "random"
 base_payload_size: 1400
 max_payload_size: 1452
 direction_balance: true
-timing_jitter_ms: 30.0
+timing_jitter_ms: 0.0
+up_mbps: 0
+down_mbps: 0
 
 # ─── 连接优化 ───
 keepalive_interval: "30s"
@@ -452,7 +510,7 @@ password: "your-strong-random-password-here"
 wss_path: "/v2/connection"
 fingerprint: "firefox_mac"
 padding_mode: "random"
-timing_jitter_ms: 15.0
+timing_jitter_ms: 0.0
 destinations:
   - name: "direct"
     addr: "127.0.0.1:8080"
@@ -471,6 +529,8 @@ reality_mode: false
 sni_spoof: "your-server-domain.com"
 fingerprint: "firefox_mac"
 padding_mode: "random"
+timing_jitter_ms: 0.0
+tunnel_connections: 4
 listen_addr: "0.0.0.0:1080"
 proxy_protocol: "socks5"
 ```
@@ -714,6 +774,7 @@ go vet ./...
 - [x] **HTTP-POST 传输服务端** ✅ v1.6.0
 - [x] **方向均衡 / Nonce 失步修复** ✅ v1.6.0
 - [x] **版本号构建注入** ✅ v1.6.0
+- [x] **多隧道并行 / QUIC+WebSocket 混合监听** ✅ v1.6.3
 
 ---
 

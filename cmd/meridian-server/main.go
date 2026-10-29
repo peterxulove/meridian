@@ -21,9 +21,13 @@ var (
 )
 
 func main() {
-	cfgPath, listen, showFP, debug := flagParse()
+	cfgPath, listen, showFP, showVersion, debug := flagParse()
 	config.DebugMode = debug
 
+	if showVersion {
+		fmt.Printf("Meridian Server %s (%s)\n", Version, BuildTime)
+		return
+	}
 	if showFP {
 		fmt.Println("Available TLS Fingerprints:")
 		anti.PrintFingerprints()
@@ -71,10 +75,11 @@ func main() {
 
 // flagParse parses command-line flags.
 // Fix #14: was an empty function; CLI flags had no effect.
-func flagParse() (cfgPath, listen string, showFP bool, debug bool) {
+func flagParse() (cfgPath, listen string, showFP, showVersion bool, debug bool) {
 	flag.StringVar(&cfgPath, "config", "server.yaml", "path to server config file")
 	flag.StringVar(&listen, "listen", "", "override listen address (e.g. 0.0.0.0:443)")
 	flag.BoolVar(&showFP, "fingerprints", false, "list available TLS fingerprints and exit")
+	flag.BoolVar(&showVersion, "version", false, "print version and exit")
 	flag.BoolVar(&debug, "debug", false, "enable debug logging")
 	flag.Parse()
 	return

@@ -12,6 +12,8 @@
 
 set -e
 
+DEFAULT_RELEASE_VERSION="v1.6.3"
+
 # Re-execute with bash if run with sh
 if [ -z "$BASH_VERSION" ]; then
     exec bash "$0" "$@"
@@ -107,9 +109,61 @@ calculate_spki_hex() {
     fi
 }
 
-# Build or copy executable
+# Return the release version to install unless the caller overrides it.
+release_version() {
+    echo "${MERIDIAN_VERSION:-$DEFAULT_RELEASE_VERSION}"
+}
+
+# Download a release asset atomically. A failed/partial download must never
+# replace a working binary.
+download_binary() {
+    local role="$1"
+    local platform="$2"
+    local target_bin="$3"
+    local version
+    version="$(release_version)"
+    local asset_name="meridian-${role}-${platform}-${ARCH}"
+    local download_url="https://github.com/peterxulove/meridian/releases/download/${version}/${asset_name}"
+    local tmp_download="${target_bin}.download.$$"
+
+    echo -e "Downloading ${version}: ${download_url}"
+    if command -v curl >/dev/null 2>&1; then
+        if ! $SUDO curl --fail --location --retry 3 --retry-all-errors \
+            --connect-timeout 10 --max-time 180 \
+            -o "$tmp_download" "$download_url"; then
+            $SUDO rm -f "$tmp_download"
+            return 1
+        fi
+    elif command -v wget >/dev/null 2>&1; then
+        local attempt=1
+        while [ "$attempt" -le 3 ]; do
+            if $SUDO wget -O "$tmp_download" "$download_url"; then
+                break
+            fi
+            $SUDO rm -f "$tmp_download"
+            [ "$attempt" -eq 3 ] && return 1
+            attempt=$((attempt + 1))
+            sleep 2
+        done
+    else
+        echo -e "${RED}[Error] Neither curl nor wget found. Cannot download binary.${NC}"
+        return 1
+    fi
+
+    if [ ! -s "$tmp_download" ]; then
+        $SUDO rm -f "$tmp_download"
+        return 1
+    fi
+    $SUDO chmod +x "$tmp_download"
+    $SUDO mv -f "$tmp_download" "$target_bin"
+}
+
+# Build or copy executable. source=release forces the signed GitHub release
+# path, which prevents update_core from silently installing an older local
+# dist/ binary.
 install_binary() {
     local role="$1" # "server" or "client"
+    local source="${2:-auto}"
     local bin_name="meridian-${role}"
     local target_bin="${BIN_DIR}/${bin_name}"
     
@@ -122,8 +176,13 @@ install_binary() {
         platform="linux"
     fi
     
+    if [ "$source" = "release" ]; then
+        download_binary "$role" "$platform" "$target_bin" || {
+            echo -e "${RED}[Error] Failed to download $(release_version) for ${platform}/${ARCH}.${NC}"
+            return 1
+        }
     # Check if we are running in the source repo and can build
-    if command -v go >/dev/null 2>&1 && [ -f "go.mod" ]; then
+    elif command -v go >/dev/null 2>&1 && [ -f "go.mod" ]; then
         echo -e "Go compiler found. Building from source..."
         go build -ldflags "-s -w" -o "$bin_name" "./cmd/meridian-${role}"
         $SUDO cp "$bin_name" "$target_bin"
@@ -145,31 +204,17 @@ install_binary() {
         $SUDO cp "meridian-${role}" "$target_bin"
         $SUDO chmod +x "$target_bin"
     else
-        # Try to download from GitHub releases
-        local version="${MERIDIAN_VERSION:-v1.6.0}"
-        local asset_name="meridian-${role}-${platform}-${ARCH}"
-        if [ "$OS" = "windows" ]; then
-            asset_name+=".exe"
-        fi
-        local download_url="https://github.com/peterxulove/meridian/releases/download/${version}/${asset_name}"
-        
-        echo -e "No local binary or Go compiler found. Attempting to download ${version} from GitHub..."
-        echo -e "Download URL: ${download_url}"
-        
-        if command -v curl >/dev/null 2>&1; then
-            $SUDO curl -L -o "$target_bin" "$download_url"
-        elif command -v wget >/dev/null 2>&1; then
-            $SUDO wget -O "$target_bin" "$download_url"
-        else
-            echo -e "${RED}[Error] Neither curl nor wget found. Cannot download binary.${NC}"
-            echo -e "Please install Go, curl, wget, or compile/place binaries manually."
-            exit 1
-        fi
-        
-        $SUDO chmod +x "$target_bin"
+        echo -e "No local binary or Go compiler found. Attempting release download..."
+        download_binary "$role" "$platform" "$target_bin" || {
+            echo -e "${RED}[Error] Failed to download $(release_version) for ${platform}/${ARCH}.${NC}"
+            return 1
+        }
     fi
     
     echo -e "${GREEN}Binary installed to $target_bin${NC}"
+    if "$target_bin" -version >/dev/null 2>&1; then
+        echo -e "  Version: $("$target_bin" -version)"
+    fi
 }
 
 # Config Server
@@ -205,9 +250,10 @@ configure_server() {
     cat <<EOF | $SUDO tee "$server_yaml" >/dev/null
 # Meridian Server - Auto-generated configuration
 listen_addr: "0.0.0.0:443"
-transport: "QUIC"
+transport: "QUIC+WebSocket"
 cipher_suite: 1
 password: "${password}"
+wss_path: "/ws/"
 
 # ─── REALITY Mode (anti-detection) ───
 reality_mode: true
@@ -223,7 +269,9 @@ fingerprint: "chrome_win"
 padding_mode: "random"
 base_payload_size: 1400
 max_payload_size: 1452
-timing_jitter_ms: 30.0
+timing_jitter_ms: 0.0
+up_mbps: 0
+down_mbps: 0
 
 # ─── Connection Limits ───
 max_clients: 1000
@@ -277,14 +325,23 @@ configure_client() {
     
     read -rp "5. Local Listen Port [default: 1080]: " client_port
     client_port="${client_port:-1080}"
+
+    read -rp "6. Tunnel connections for throughput (1-16) [default: 4]: " client_lanes
+    client_lanes="${client_lanes:-4}"
+    case "$client_lanes" in
+        ''|*[!0-9]*) client_lanes=4 ;;
+    esac
+    if [ "$client_lanes" -lt 1 ]; then client_lanes=1; fi
+    if [ "$client_lanes" -gt 16 ]; then client_lanes=16; fi
     
     local client_yaml="${CONFIG_DIR}/client.yaml"
     cat <<EOF | $SUDO tee "$client_yaml" >/dev/null
 # Meridian Client - Auto-generated configuration
 server_addr: "${client_server_addr}"
-transport: "QUIC"
+transport: "WebSocket"
 cipher_suite: 1
 password: "${client_password}"
+wss_path: "/ws/"
 
 # ─── REALITY Mode (anti-detection) ───
 sni_spoof: "www.apple.com"
@@ -299,15 +356,20 @@ padding_mode: "random"
 base_payload_size: 1400
 max_payload_size: 1452
 direction_balance: false
-timing_jitter_ms: 30.0
+timing_jitter_ms: 0.0
 
 # ─── Connection ───
 keepalive_interval: "30s"
 handshake_timeout: "10s"
 stream_window: 1048576
 max_concurrent_streams: 100
+tunnel_connections: ${client_lanes}
 session_lifetime: "1h"
 dial_timeout: "15s"
+
+# 0 = adaptive BBR; set explicit Mbps only for a known QUIC link.
+up_mbps: 0
+down_mbps: 0
 
 # ─── Local Proxy ───
 listen_addr: "0.0.0.0:${client_port}"
@@ -316,6 +378,76 @@ EOF
     
     $SUDO chmod 600 "$client_yaml"
     echo -e "${GREEN}Configuration generated: $client_yaml${NC}"
+}
+
+# Set a top-level scalar in a YAML file without touching passwords, SPKI,
+# addresses or comments. Missing keys are appended.
+set_yaml_key() {
+    local file="$1"
+    local key="$2"
+    local value="$3"
+    local tmp_file
+    tmp_file="$(mktemp)"
+
+    $SUDO awk -v key="$key" -v value="$value" '
+        BEGIN { found = 0 }
+        $0 ~ ("^" key ":") { print key ": " value; found = 1; next }
+        { print }
+        END { if (!found) print key ": " value }
+    ' "$file" > "$tmp_file"
+    $SUDO cp "$tmp_file" "$file"
+    $SUDO chmod 600 "$file"
+    rm -f "$tmp_file"
+}
+
+# Switch an existing installation to the high-throughput transport while
+# preserving all credentials and local proxy settings.
+optimize_config() {
+    local role="$1"
+    local config_file="${CONFIG_DIR}/${role}.yaml"
+    local backup_file="${config_file}.bak.$(date +%Y%m%d%H%M%S)"
+
+    if [ ! -f "$config_file" ]; then
+        echo -e "${RED}[Error] $config_file not found.${NC}"
+        return 1
+    fi
+
+    # Always install the release that understands the new transport names
+    # before switching the configuration.
+    if ! update_core "$role"; then
+        echo -e "${RED}[Error] Core update failed; configuration was not changed.${NC}"
+        return 1
+    fi
+
+    $SUDO cp -p "$config_file" "$backup_file"
+    echo -e "Configuration backup: ${backup_file}"
+
+    if [ "$role" = "server" ]; then
+        set_yaml_key "$config_file" "transport" '"QUIC+WebSocket"'
+        set_yaml_key "$config_file" "wss_path" '"/ws/"'
+    else
+        set_yaml_key "$config_file" "transport" '"WebSocket"'
+        set_yaml_key "$config_file" "wss_path" '"/ws/"'
+        set_yaml_key "$config_file" "tunnel_connections" "4"
+    fi
+
+    set_yaml_key "$config_file" "padding_mode" '"random"'
+    set_yaml_key "$config_file" "base_payload_size" "1400"
+    set_yaml_key "$config_file" "max_payload_size" "1452"
+    set_yaml_key "$config_file" "timing_jitter_ms" "0.0"
+    set_yaml_key "$config_file" "up_mbps" "0"
+    set_yaml_key "$config_file" "down_mbps" "0"
+
+    echo -e "${BLUE}Restarting meridian-${role}...${NC}"
+    if restart_service "$role"; then
+        echo -e "${GREEN}High-throughput settings applied; credentials preserved.${NC}"
+        return 0
+    fi
+
+    $SUDO cp -p "$backup_file" "$config_file"
+    restart_service "$role" || true
+    echo -e "${RED}[Error] The service did not restart. Configuration was rolled back.${NC}"
+    return 1
 }
 
 # Start Service (Systemd / Launchd)
@@ -522,7 +654,7 @@ update_core() {
 
     # install_binary only writes ${BIN_DIR}/${bin_name}; it never touches
     # ${CONFIG_DIR}, so client.yaml and any certificates stay untouched.
-    if ! install_binary "$role"; then
+    if ! install_binary "$role" release; then
         echo -e "${RED}[Error] Failed to install the new binary. Restoring previous version...${NC}"
         $SUDO mv -f "$backup_bin" "$target_bin"
         return 1
@@ -646,6 +778,28 @@ case "$ACTION" in
             launchctl list | grep meridian || echo "No active meridian agents found."
         fi
         ;;
+    version)
+        echo -e "Configured release: $(release_version)"
+        for role in client server; do
+            bin="${BIN_DIR}/meridian-${role}"
+            if [ -x "$bin" ]; then
+                echo "Installed ${role}: $("$bin" -version 2>/dev/null || echo unknown)"
+            else
+                echo "Installed ${role}: not installed"
+            fi
+        done
+        ;;
+    optimize)
+        role="${2:-}"
+        if [ -z "$role" ]; then
+            echo -e "Usage: $0 optimize [client|server]"
+            exit 1
+        fi
+        case "$role" in
+            client|server) optimize_config "$role" ;;
+            *) echo -e "${RED}Usage: $0 optimize [client|server]${NC}"; exit 1 ;;
+        esac
+        ;;
     *)
         # Interactive Menu
         echo "What would you like to deploy?"
@@ -656,7 +810,8 @@ case "$ACTION" in
         echo "5. Update Client Core (keep config)"
         echo "6. Update Server Core (keep config)"
         echo "7. Exit"
-        read -rp "Choice [1-7]: " choice
+        echo "8. Enable high-throughput transport (keep credentials)"
+        read -rp "Choice [1-8]: " choice
         
         case "$choice" in
             1)
@@ -716,6 +871,17 @@ case "$ACTION" in
             7)
                 echo "Goodbye."
                 exit 0
+                ;;
+            8)
+                echo -e "Select role to optimize:"
+                echo "1. Server"
+                echo "2. Client"
+                read -rp "Choice [1-2]: " opt_choice
+                case "$opt_choice" in
+                    1) optimize_config "server" ;;
+                    2) optimize_config "client" ;;
+                    *) echo "Invalid choice"; exit 1 ;;
+                esac
                 ;;
             *)
                 echo -e "${RED}Invalid choice.${NC}"

@@ -2,9 +2,10 @@
 # ======================================================
 
 server_addr: "server.example.com:443"
-transport: "QUIC"
+transport: "WebSocket"
 cipher_suite: 1
 password: "your-strong-random-password-here"
+wss_path: "/ws/"
 
 # ─── REALITY Mode (anti-detection) ───
 sni_spoof: "www.google.com"
@@ -19,15 +20,21 @@ padding_mode: "random"
 base_payload_size: 1400
 max_payload_size: 1452
 direction_balance: false
-timing_jitter_ms: 30.0
+timing_jitter_ms: 0.0
 
 # ─── Connection ───
 keepalive_interval: "30s"
 handshake_timeout: "10s"
 stream_window: 1048576
 max_concurrent_streams: 100
+# Several independent outer transports avoid the single-stream BDP ceiling.
+tunnel_connections: 4
 session_lifetime: "1h"
 dial_timeout: "15s"
+
+# Only used by the QUIC transport. 0 selects adaptive BBR.
+up_mbps: 0
+down_mbps: 0
 
 # ─── Local SOCKS5 Proxy ───
 # 0.0.0.0 — all LAN devices (phones, tablets, other computers) can connect

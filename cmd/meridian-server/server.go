@@ -31,6 +31,7 @@ type Server struct {
 	wg           sync.WaitGroup
 	stats        ServerStats
 	mirror       *transport.MirrorListener
+	ws           *transport.WSListener
 	sessionStore *mtp.SessionStore
 }
 
@@ -52,15 +53,26 @@ func NewServer(cfg config.ServerConfig) (*Server, error) {
 
 // Start begins listening on the configured address.
 func (s *Server) Start() error {
-	if s.cfg.Transport == config.TransportWebSocket {
+	switch s.cfg.Transport {
+	case config.TransportWebSocket:
 		return s.startWS()
-	}
-	if s.cfg.Transport == config.TransportHTTPPOST || string(s.cfg.Transport) == "HTTP-POST" {
+	case config.TransportHTTPPOST:
 		return s.startHTTPPOST()
+	case config.TransportHybrid:
+		// QUIC is UDP and WebSocket is TCP, so both can share the same port.
+		// This lets existing QUIC clients keep working while new clients use
+		// the higher-throughput TCP lane pool.
+		go func() {
+			if err := s.startWS(); err != nil && !s.stopped.Load() {
+				fmt.Printf("  [WebSocket] Listen error: %v\n", err)
+			}
+		}()
+		return s.startHysteria()
+	default:
+		// Legacy raw-TCP fallback for configurations that predate WebSocket.
+		go s.startTCP()
+		return s.startHysteria()
 	}
-	// Start TCP Tunnel listener concurrently for reliable proxying
-	go s.startTCP()
-	return s.startHysteria()
 }
 
 func (s *Server) startHysteria() error {
@@ -146,6 +158,7 @@ func (s *Server) startHTTPPOST() error {
 
 func (s *Server) startWS() error {
 	listener := transport.NewWSListener(s.cfg)
+	s.ws = listener
 
 	go func() {
 		if err := listener.ListenAndServe(); err != nil {
@@ -188,6 +201,9 @@ func (s *Server) Stop() {
 	}
 	if s.udp != nil {
 		s.udp.Close()
+	}
+	if s.ws != nil {
+		_ = s.ws.Close()
 	}
 	s.conns.Range(func(k, v interface{}) bool {
 		if c, ok := v.(io.Closer); ok {
@@ -638,7 +654,7 @@ func (s *Server) handleTCPTunnel(conn net.Conn) {
 								_ = send(mfp.TypeRESET, streamID, 0, nil)
 							}
 						}()
-						relayBuf := make([]byte, 32*1024)
+						relayBuf := make([]byte, 60*1024)
 						for {
 							rn, err := targetConn.Read(relayBuf)
 							if rn > 0 {

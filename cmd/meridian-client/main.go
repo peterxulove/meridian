@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"meridian/pkg/anti"
@@ -27,9 +28,13 @@ var (
 )
 
 func main() {
-	cfgPath, listen, showFP, debug := flagParse()
+	cfgPath, listen, showFP, showVersion, debug := flagParse()
 	config.DebugMode = debug
 
+	if showVersion {
+		fmt.Printf("Meridian Client %s (%s)\n", Version, BuildTime)
+		return
+	}
 	if showFP {
 		fmt.Println("Available TLS Fingerprints:")
 		anti.PrintFingerprints()
@@ -88,10 +93,11 @@ func main() {
 }
 
 // flagParse parses command-line flags.
-func flagParse() (cfgPath, listen string, showFP bool, debug bool) {
+func flagParse() (cfgPath, listen string, showFP, showVersion bool, debug bool) {
 	flag.StringVar(&cfgPath, "config", "client.yaml", "path to client config file")
 	flag.StringVar(&listen, "listen", "", "override local SOCKS5 listen address (e.g. 0.0.0.0:1080)")
 	flag.BoolVar(&showFP, "fingerprints", false, "list available TLS fingerprints and exit")
+	flag.BoolVar(&showVersion, "version", false, "print version and exit")
 	flag.BoolVar(&debug, "debug", false, "enable debug logging")
 	flag.Parse()
 	return
@@ -101,9 +107,13 @@ func flagParse() (cfgPath, listen string, showFP bool, debug bool) {
 type Client struct {
 	cfg          config.ClientConfig
 	mu           sync.RWMutex
-	tunnel       *TunnelClient
+	tunnels      []*TunnelClient
+	laneSessions [][16]byte
+	tunnelCursor atomic.Uint32
+	stopping     atomic.Bool
+	stopCh       chan struct{}
+	stopOnce     sync.Once
 	proxy        ProxyServer
-	sessionStore *mtp.SessionStore
 }
 
 // NewClient initialises a Client, generating a session ID if none is set.
@@ -115,49 +125,126 @@ func NewClient(cfg config.ClientConfig) (*Client, error) {
 		}
 		copy(cfg.SessionID[:], b)
 	}
+	laneCount := config.NormalizeTunnelConnections(cfg.TunnelConnections)
+	cfg.TunnelConnections = laneCount
+	sessions := make([][16]byte, laneCount)
+	sessions[0] = cfg.SessionID
+	for i := 1; i < laneCount; i++ {
+		b, err := crypto.GenerateRandom(16)
+		if err != nil {
+			return nil, fmt.Errorf("client: failed to generate lane session ID: %w", err)
+		}
+		copy(sessions[i][:], b)
+	}
 	return &Client{
 		cfg:          cfg,
-		sessionStore: mtp.NewSessionStore(),
+		tunnels:      make([]*TunnelClient, laneCount),
+		laneSessions: sessions,
+		stopCh:       make(chan struct{}),
 	}, nil
 }
 
-func (c *Client) maintainTunnel() {
-	for {
-		tunnel := NewTunnelClient(c.cfg, c.sessionStore)
+func (c *Client) maintainTunnel(lane int) {
+	cfg := c.cfg
+	cfg.SessionID = c.laneSessions[lane]
+	store := mtp.NewSessionStore()
+
+	for !c.stopping.Load() {
+		tunnel := NewTunnelClient(cfg, store)
 		if err := tunnel.Connect(); err != nil {
-			fmt.Printf("  [Tunnel] Connection failed: %v. Retrying in 5s...\n", err)
-			time.Sleep(5 * time.Second)
+			fmt.Printf("  [Tunnel %d/%d] Connection failed: %v. Retrying in 5s...\n",
+				lane+1, len(c.tunnels), err)
+			select {
+			case <-time.After(5 * time.Second):
+			case <-c.stopCh:
+				return
+			}
 			continue
 		}
 
 		c.mu.Lock()
-		c.tunnel = tunnel
+		c.tunnels[lane] = tunnel
 		c.mu.Unlock()
 
-		// Wait until tunnel is closed
-		for !tunnel.closed.Load() {
+		for !tunnel.closed.Load() && !c.stopping.Load() {
 			time.Sleep(1 * time.Second)
 		}
-		fmt.Printf("  [Tunnel] Disconnected. Reconnecting...\n")
+		c.mu.Lock()
+		if c.tunnels[lane] == tunnel {
+			c.tunnels[lane] = nil
+		}
+		c.mu.Unlock()
+		if !c.stopping.Load() {
+			fmt.Printf("  [Tunnel %d/%d] Disconnected. Reconnecting...\n", lane+1, len(c.tunnels))
+		}
 	}
+}
+
+func (c *Client) pickTunnel() (*TunnelClient, int) {
+	c.mu.RLock()
+	tunnels := make([]*TunnelClient, len(c.tunnels))
+	copy(tunnels, c.tunnels)
+	c.mu.RUnlock()
+
+	start := int(c.tunnelCursor.Add(1)-1) % len(tunnels)
+	var best *TunnelClient
+	bestLane := -1
+	var bestLoad int64
+
+	for offset := 0; offset < len(tunnels); offset++ {
+		lane := (start + offset) % len(tunnels)
+		tunnel := tunnels[lane]
+		if tunnel == nil || tunnel.closed.Load() {
+			continue
+		}
+		load := tunnel.ActiveLoad()
+		if best == nil || load < bestLoad {
+			best = tunnel
+			bestLane = lane
+			bestLoad = load
+		}
+	}
+	return best, bestLane
+}
+
+func (c *Client) dial(ctx context.Context, network, addr string) (net.Conn, error) {
+	tunnel, lane := c.pickTunnel()
+	if tunnel == nil {
+		return nil, fmt.Errorf("tunnel not connected or unavailable")
+	}
+
+	conn, err := tunnel.DialStream(ctx, addr)
+	if err == nil {
+		return conn, nil
+	}
+
+	// A lane may have died between selection and use. Try the remaining lanes
+	// once so a transient reconnect does not surface as a proxy failure.
+	c.mu.RLock()
+	tunnels := make([]*TunnelClient, len(c.tunnels))
+	copy(tunnels, c.tunnels)
+	c.mu.RUnlock()
+	for i, candidate := range tunnels {
+		if i == lane || candidate == nil || candidate == tunnel || candidate.closed.Load() {
+			continue
+		}
+		if next, nextErr := candidate.DialStream(ctx, addr); nextErr == nil {
+			return next, nil
+		}
+	}
+	return nil, err
 }
 
 // Start performs the initial handshake with the Meridian server and
 // starts the SOCKS5 proxy listener.
 func (c *Client) Start() error {
-	// Start secure multiplexed tunnel maintenance in background
-	go c.maintainTunnel()
+	for lane := range c.tunnels {
+		go c.maintainTunnel(lane)
+	}
 
 	// ── Step 4: Start SOCKS5 proxy ────────────────────────────────────────
 	dialFn := func(ctx context.Context, network, addr string) (net.Conn, error) {
-		c.mu.RLock()
-		t := c.tunnel
-		c.mu.RUnlock()
-
-		if t != nil && !t.closed.Load() {
-			return t.DialStream(ctx, addr)
-		}
-		return nil, fmt.Errorf("tunnel not connected or unavailable")
+		return c.dial(ctx, network, addr)
 	}
 
 	switch c.cfg.ProxyProtocol {
@@ -171,14 +258,22 @@ func (c *Client) Start() error {
 
 // Stop closes the upstream tunnel connection and the SOCKS5 listener.
 func (c *Client) Stop() {
+	c.stopOnce.Do(func() {
+		c.stopping.Store(true)
+		close(c.stopCh)
+	})
 	if c.proxy != nil {
 		c.proxy.Stop()
 	}
 	c.mu.RLock()
-	if c.tunnel != nil {
-		c.tunnel.Close()
-	}
+	tunnels := make([]*TunnelClient, len(c.tunnels))
+	copy(tunnels, c.tunnels)
 	c.mu.RUnlock()
+	for _, tunnel := range tunnels {
+		if tunnel != nil {
+			tunnel.Close()
+		}
+	}
 }
 
 // mustParsePort converts a port string to int; returns 443 on error.

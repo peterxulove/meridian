@@ -47,6 +47,7 @@ type TransportType string
 const (
 	TransportHysteria  TransportType = "QUIC"
 	TransportWebSocket TransportType = "WebSocket"
+	TransportHybrid    TransportType = "QUIC+WebSocket"
 	TransportHTTPPOST  TransportType = "HTTP-POST"
 )
 
@@ -99,8 +100,13 @@ type ClientConfig struct {
 	HandshakeTimeout    time.Duration `yaml:"handshake_timeout" json:"handshake_timeout"`
 	StreamWindow        uint64        `yaml:"stream_window" json:"stream_window"`
 	MaxConcurrentStream uint32        `yaml:"max_concurrent_streams" json:"max_concurrent_streams"`
-	SessionLifetime     time.Duration `yaml:"session_lifetime" json:"session_lifetime"`
-	DialTimeout         time.Duration `yaml:"dial_timeout" json:"dial_timeout"`
+	// TunnelConnections is the number of independent outer transports. A
+	// single TCP/QUIC stream is BDP-limited, so multiplexing every user stream
+	// onto one outer connection caps aggregate throughput. Deploying several
+	// lanes and distributing streams across them removes that bottleneck.
+	TunnelConnections int           `yaml:"tunnel_connections" json:"tunnel_connections"`
+	SessionLifetime   time.Duration `yaml:"session_lifetime" json:"session_lifetime"`
+	DialTimeout       time.Duration `yaml:"dial_timeout" json:"dial_timeout"`
 
 	// Hysteria v2
 	UpMbps   uint64 `yaml:"up_mbps" json:"up_mbps"`
@@ -195,21 +201,25 @@ func DefaultClientConfig() ClientConfig {
 		BasePayloadSize:     1400,
 		MaxPayloadSize:      1452,
 		DirectionBalance:    false,
-		TimingJitterMS:      30.0,
+		TimingJitterMS:      0.0,
 		KeepaliveInterval:   30 * time.Second,
 		HandshakeTimeout:    10 * time.Second,
 		StreamWindow:        1048576, // 1MB
 		MaxConcurrentStream: 100,
+		TunnelConnections:   1,
 		SessionLifetime:     time.Hour,
 		DialTimeout:         15 * time.Second,
 		ListenAddr:          "127.0.0.1:1080",
 		ProxyProtocol:       "socks5",
 		WSSPath:             "/ws/",
 		MirrorPath:          "/upload",
-		UpMbps:              1000,
-		DownMbps:            1000,
-		RenewalInterval:     5 * time.Minute,
-		RenewalDataLimit:    67108864, // 64MB
+		// Zero selects Hysteria's adaptive BBR path. A hardcoded optimistic
+		// rate switches it to Brutal, which overshoots unknown links and can be
+		// slower than BBR; explicit caps remain available for known links.
+		UpMbps:           0,
+		DownMbps:         0,
+		RenewalInterval:  5 * time.Minute,
+		RenewalDataLimit: 67108864, // 64MB
 	}
 }
 
@@ -225,7 +235,7 @@ func DefaultServerConfig() ServerConfig {
 		PaddingMode:       PaddingRandom,
 		BasePayloadSize:   1400,
 		MaxPayloadSize:    1452,
-		TimingJitterMS:    30.0,
+		TimingJitterMS:    0.0,
 		MaxClients:        1000,
 		StreamWindow:      1048576,
 		KeepaliveInterval: 30 * time.Second,
@@ -239,11 +249,22 @@ func DefaultServerConfig() ServerConfig {
 				Priority: 0,
 			},
 		},
-		UpMbps:           1000,
-		DownMbps:         1000,
+		UpMbps:           0,
+		DownMbps:         0,
 		RenewalInterval:  5 * time.Minute,
 		RenewalDataLimit: 67108864, // 64MB
 	}
+}
+
+// NormalizeTunnelConnections clamps the lane count to a safe range.
+func NormalizeTunnelConnections(n int) int {
+	if n <= 0 {
+		return 1
+	}
+	if n > 16 {
+		return 16
+	}
+	return n
 }
 
 // LoadClientConfig reads a YAML/JSON config file and returns a ClientConfig.

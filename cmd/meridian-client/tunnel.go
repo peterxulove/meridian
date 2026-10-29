@@ -37,6 +37,7 @@ type TunnelClient struct {
 	balancer      *mfp.DirectionBalancer
 	closeCh       chan struct{}
 	lastRecv      atomic.Int64
+	activeLoad    atomic.Int64
 }
 
 const (
@@ -54,6 +55,10 @@ const (
 	// maxDecodeFailures is the point at which the tunnel is assumed to be
 	// desynchronised and is torn down for a clean reconnect.
 	maxDecodeFailures = 16
+	// maxFrameDataSize leaves room for the 2-byte padding length prefix and
+	// the small random tail while keeping the frame below the uint16 payload
+	// limit.
+	maxFrameDataSize = 60 * 1024
 )
 
 // NewTunnelClient creates a new TunnelClient.
@@ -70,6 +75,9 @@ func NewTunnelClient(cfg config.ClientConfig, sessionStore *mtp.SessionStore) *T
 // Connect establishes the TCP or QUIC connection and performs the MTP handshake.
 func (tc *TunnelClient) Connect() error {
 	var conn net.Conn
+	if tc.cfg.Transport == config.TransportHybrid {
+		return errors.New("tunnel: client transport must be QUIC or WebSocket, not QUIC+WebSocket")
+	}
 
 	if tc.cfg.Transport == config.TransportHysteria || tc.cfg.Transport == "QUIC" || tc.cfg.Transport == "Hysteria" {
 		tlsCfg, err := transport.ClientTLSConfig(tc.cfg)
@@ -281,6 +289,7 @@ func (tc *TunnelClient) DialStream(ctx context.Context, targetAddr string) (net.
 
 	tc.mu.Lock()
 	tc.activeStreams[sid] = sc
+	tc.activeLoad.Add(1)
 	tc.mu.Unlock()
 
 	// Send CONNECT frame (Flags = 0x01: connect request).
@@ -328,8 +337,17 @@ func (tc *TunnelClient) abortStream(sid uint32) {
 
 func (tc *TunnelClient) removeStream(sid uint32) {
 	tc.mu.Lock()
-	delete(tc.activeStreams, sid)
+	if _, ok := tc.activeStreams[sid]; ok {
+		delete(tc.activeStreams, sid)
+		tc.activeLoad.Add(-1)
+	}
 	tc.mu.Unlock()
+}
+
+// ActiveLoad returns the number of user streams currently assigned to this
+// outer tunnel. The client uses it to keep lanes evenly loaded.
+func (tc *TunnelClient) ActiveLoad() int64 {
+	return tc.activeLoad.Load()
 }
 
 // keepaliveLoop sends a PING on the control stream every KeepaliveInterval so
@@ -401,16 +419,6 @@ func (tc *TunnelClient) sendKeepalive() {
 // then writes both while holding the tunnel write lock. Encoding and writing
 // are serialised so frames from different streams can never interleave.
 func (tc *TunnelClient) sendFrame(typ byte, sid uint32, flags byte, data []byte, jitterNanos int64) error {
-	tc.writeMu.Lock()
-	defer tc.writeMu.Unlock()
-
-	if tc.closed.Load() {
-		return net.ErrClosed
-	}
-	if tc.encoder == nil || tc.tunnelConn == nil {
-		return errors.New("tunnel: not connected")
-	}
-
 	if jitterNanos > 0 {
 		timer := time.NewTimer(time.Duration(jitterNanos))
 		select {
@@ -419,6 +427,16 @@ func (tc *TunnelClient) sendFrame(typ byte, sid uint32, flags byte, data []byte,
 			timer.Stop()
 			return errors.New("tunnel: closed during jitter wait")
 		}
+	}
+
+	tc.writeMu.Lock()
+	defer tc.writeMu.Unlock()
+
+	if tc.closed.Load() {
+		return net.ErrClosed
+	}
+	if tc.encoder == nil || tc.tunnelConn == nil {
+		return errors.New("tunnel: not connected")
 	}
 
 	frame, boundary, err := tc.encoder.EncodeTypeAndRenew(typ, sid, flags, data)
@@ -580,6 +598,7 @@ func (tc *TunnelClient) Close() {
 		streams = append(streams, sc)
 	}
 	tc.activeStreams = make(map[uint32]*StreamConn)
+	tc.activeLoad.Store(0)
 	tc.mu.Unlock()
 
 	for _, sc := range streams {
@@ -630,11 +649,20 @@ func (sc *StreamConn) Write(b []byte) (int, error) {
 	default:
 	}
 
-	jitter := sc.client.encoder.JitterDelay()
-	if err := sc.client.sendFrame(mfp.TypeDATA, sc.sid, 0, b, jitter); err != nil {
-		return 0, err
+	written := 0
+	for len(b) > 0 {
+		chunk := b
+		if len(chunk) > maxFrameDataSize {
+			chunk = chunk[:maxFrameDataSize]
+		}
+		jitter := sc.client.encoder.JitterDelayFor(len(chunk))
+		if err := sc.client.sendFrame(mfp.TypeDATA, sc.sid, 0, chunk, jitter); err != nil {
+			return written, err
+		}
+		written += len(chunk)
+		b = b[len(chunk):]
 	}
-	return len(b), nil
+	return written, nil
 }
 
 func (sc *StreamConn) Close() error {

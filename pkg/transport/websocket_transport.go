@@ -3,8 +3,10 @@ package transport
 import (
 	"crypto/tls"
 	"errors"
+	"io"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -15,10 +17,17 @@ import (
 type WSListener struct {
 	config config.ServerConfig
 	connch chan net.Conn
+	done   chan struct{}
+	srv    *http.Server
+	once   sync.Once
 }
 
 func NewWSListener(cfg config.ServerConfig) *WSListener {
-	return &WSListener{config: cfg, connch: make(chan net.Conn, 50)}
+	return &WSListener{
+		config: cfg,
+		connch: make(chan net.Conn, 50),
+		done:   make(chan struct{}),
+	}
 }
 
 func (l *WSListener) ListenAndServe() error {
@@ -28,6 +37,8 @@ func (l *WSListener) ListenAndServe() error {
 	}
 
 	upgrader := websocket.Upgrader{
+		ReadBufferSize:  64 * 1024,
+		WriteBufferSize: 64 * 1024,
 		CheckOrigin: func(r *http.Request) bool {
 			return true // Allow all origins for the tunnel
 		},
@@ -40,13 +51,21 @@ func (l *WSListener) ListenAndServe() error {
 			return
 		}
 		wsConn := &WSConn{conn: conn}
-		l.connch <- wsConn
+		select {
+		case l.connch <- wsConn:
+		case <-l.done:
+			_ = wsConn.Close()
+		case <-time.After(5 * time.Second):
+			_ = wsConn.Close()
+		}
 	})
 
 	server := &http.Server{
-		Addr:    l.config.ListenAddr,
-		Handler: mux,
+		Addr:              l.config.ListenAddr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
 	}
+	l.srv = server
 
 	if l.config.ServerCertFile != "" && l.config.ServerKeyFile != "" {
 		// Mirror the tunnel ALPN list. Without it the client's
@@ -63,15 +82,21 @@ func (l *WSListener) ListenAndServe() error {
 }
 
 func (l *WSListener) Accept() (net.Conn, error) {
-	conn, ok := <-l.connch
-	if !ok {
+	select {
+	case conn := <-l.connch:
+		return conn, nil
+	case <-l.done:
 		return nil, errors.New("listener closed")
 	}
-	return conn, nil
 }
 
 func (l *WSListener) Close() error {
-	close(l.connch)
+	l.once.Do(func() {
+		close(l.done)
+		if l.srv != nil {
+			_ = l.srv.Close()
+		}
+	})
 	return nil
 }
 
@@ -81,42 +106,69 @@ func (l *WSListener) Close() error {
 
 // WSConn is a net.Conn adapter around a gorilla WebSocket connection.
 type WSConn struct {
-	conn   *websocket.Conn
-	buf    []byte // leftover bytes from a partially consumed message
-	closed bool
+	conn    *websocket.Conn
+	reader  io.Reader
+	writeMu sync.Mutex
+	once    sync.Once
 }
 
 // Read implements io.Reader.
-// Fix #11: previous code discarded the error from ReadMessage and returned (copy(b,msg), nil).
-// If msg is empty on error, this would loop infinitely. Now errors are propagated.
+// It reads directly from the current WebSocket message instead of calling
+// ReadMessage, which allocated and copied every frame before the caller could
+// consume it. At 500 Mbps that extra copy is measurable.
 func (c *WSConn) Read(b []byte) (int, error) {
-	if len(c.buf) > 0 {
-		n := copy(b, c.buf)
-		c.buf = c.buf[n:]
-		return n, nil
+	for {
+		if c.reader != nil {
+			n, err := c.reader.Read(b)
+			if err == io.EOF {
+				c.reader = nil
+				if n > 0 {
+					return n, nil
+				}
+				continue
+			}
+			if n == 0 && err == nil {
+				continue
+			}
+			return n, err
+		}
+
+		typ, reader, err := c.conn.NextReader()
+		if err != nil {
+			return 0, err
+		}
+		if typ != websocket.BinaryMessage {
+			_, _ = io.Copy(io.Discard, reader)
+			continue
+		}
+		c.reader = reader
 	}
-	_, msg, err := c.conn.ReadMessage()
-	if err != nil {
-		return 0, err // Fix: propagate error
-	}
-	n := copy(b, msg)
-	if n < len(msg) {
-		c.buf = msg[n:]
-	}
-	return n, nil
 }
 
 // Write implements io.Writer.
-// Fix #10: previous code returned (0, nil) unconditionally.
 func (c *WSConn) Write(b []byte) (int, error) {
-	err := c.conn.WriteMessage(websocket.BinaryMessage, b)
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+
+	writer, err := c.conn.NextWriter(websocket.BinaryMessage)
 	if err != nil {
 		return 0, err
 	}
-	return len(b), nil // Fix: return actual byte count
+	if _, err := writer.Write(b); err != nil {
+		_ = writer.Close()
+		return 0, err
+	}
+	if err := writer.Close(); err != nil {
+		return 0, err
+	}
+	return len(b), nil
 }
 
-func (c *WSConn) Close() error         { c.closed = true; return c.conn.Close() }
+func (c *WSConn) Close() error {
+	var err error
+	c.once.Do(func() { err = c.conn.Close() })
+	return err
+}
 func (c *WSConn) LocalAddr() net.Addr  { return c.conn.LocalAddr() }
 func (c *WSConn) RemoteAddr() net.Addr { return c.conn.RemoteAddr() }
 
@@ -152,6 +204,8 @@ func WSDial(serverURL string, cfg config.ClientConfig) (*WSConn, error) {
 	dialer := &websocket.Dialer{
 		TLSClientConfig:  tlsConfig,
 		HandshakeTimeout: 15 * time.Second,
+		ReadBufferSize:   64 * 1024,
+		WriteBufferSize:  64 * 1024,
 	}
 
 	conn, _, err := dialer.Dial(serverURL, nil)
