@@ -27,6 +27,14 @@ var (
 	BuildTime = "unknown"
 )
 
+const (
+	// minProxyConcurrency keeps the local listener at least as permissive as
+	// the historical fixed limit.
+	minProxyConcurrency = 512
+	// maxProxyConcurrency bounds file-descriptor use on small routers.
+	maxProxyConcurrency = 4096
+)
+
 func main() {
 	cfgPath, listen, showFP, showVersion, debug := flagParse()
 	config.DebugMode = debug
@@ -166,7 +174,23 @@ func (c *Client) maintainTunnel(lane int) {
 		c.tunnels[lane] = tunnel
 		c.mu.Unlock()
 
+		lifetime := staggerLifetime(c.cfg.SessionLifetime, lane, len(c.tunnels))
+		var drainDeadline time.Time
 		for !tunnel.closed.Load() && !c.stopping.Load() {
+			// A lane that reaches session_lifetime stops taking new streams and
+			// is closed once the streams already on it finish. This refreshes
+			// the outer TCP/TLS connection periodically without cutting an
+			// active download.
+			if lifetime > 0 && !tunnel.Draining() && time.Since(tunnel.ConnectedAt()) >= lifetime {
+				tunnel.draining.Store(true)
+				drainDeadline = time.Now().Add(drainGrace(lifetime))
+				fmt.Printf("  [Tunnel %d/%d] Session lifetime reached, draining (%d active)\n",
+					lane+1, len(c.tunnels), tunnel.ActiveLoad())
+			}
+			if tunnel.Draining() && (tunnel.ActiveLoad() == 0 || time.Now().After(drainDeadline)) {
+				tunnel.Close()
+				break
+			}
 			time.Sleep(1 * time.Second)
 		}
 		c.mu.Lock()
@@ -178,6 +202,29 @@ func (c *Client) maintainTunnel(lane int) {
 			fmt.Printf("  [Tunnel %d/%d] Disconnected. Reconnecting...\n", lane+1, len(c.tunnels))
 		}
 	}
+}
+
+// drainGrace bounds how long a draining lane may keep its remaining streams.
+func drainGrace(lifetime time.Duration) time.Duration {
+	grace := lifetime / 10
+	if grace < 30*time.Second {
+		grace = 30 * time.Second
+	}
+	if grace > 5*time.Minute {
+		grace = 5 * time.Minute
+	}
+	return grace
+}
+
+// staggerLifetime spreads lane deadlines so lanes that were opened together do
+// not all drain at the same instant and leave the client without a tunnel.
+// Lanes are offset by up to 15% of the configured lifetime.
+func staggerLifetime(lifetime time.Duration, lane, lanes int) time.Duration {
+	if lifetime <= 0 || lanes <= 1 || lane <= 0 {
+		return lifetime
+	}
+	step := lifetime / 20
+	return lifetime + step*time.Duration(lane)
 }
 
 func (c *Client) pickTunnel() (*TunnelClient, int) {
@@ -194,7 +241,7 @@ func (c *Client) pickTunnel() (*TunnelClient, int) {
 	for offset := 0; offset < len(tunnels); offset++ {
 		lane := (start + offset) % len(tunnels)
 		tunnel := tunnels[lane]
-		if tunnel == nil || tunnel.closed.Load() {
+		if tunnel == nil || tunnel.closed.Load() || tunnel.Draining() {
 			continue
 		}
 		load := tunnel.ActiveLoad()
@@ -225,7 +272,8 @@ func (c *Client) dial(ctx context.Context, network, addr string) (net.Conn, erro
 	copy(tunnels, c.tunnels)
 	c.mu.RUnlock()
 	for i, candidate := range tunnels {
-		if i == lane || candidate == nil || candidate == tunnel || candidate.closed.Load() {
+		if i == lane || candidate == nil || candidate == tunnel ||
+			candidate.closed.Load() || candidate.Draining() {
 			continue
 		}
 		if next, nextErr := candidate.DialStream(ctx, addr); nextErr == nil {
@@ -242,6 +290,17 @@ func (c *Client) Start() error {
 		go c.maintainTunnel(lane)
 	}
 
+	// The per-tunnel cap protects a single lane; the local proxy needs room
+	// for every lane at once so a busy LAN is not throttled below the old
+	// fixed limit.
+	proxyLimit := int(c.cfg.MaxConcurrentStream) * len(c.tunnels)
+	if proxyLimit < minProxyConcurrency {
+		proxyLimit = minProxyConcurrency
+	}
+	if proxyLimit > maxProxyConcurrency {
+		proxyLimit = maxProxyConcurrency
+	}
+
 	// ── Step 4: Start SOCKS5 proxy ────────────────────────────────────────
 	dialFn := func(ctx context.Context, network, addr string) (net.Conn, error) {
 		return c.dial(ctx, network, addr)
@@ -249,9 +308,9 @@ func (c *Client) Start() error {
 
 	switch c.cfg.ProxyProtocol {
 	case "http":
-		c.proxy = NewHttpProxyServer(c.cfg.ListenAddr, "", "", dialFn)
+		c.proxy = NewHttpProxyServer(c.cfg.ListenAddr, "", "", dialFn, proxyLimit)
 	default:
-		c.proxy = NewSocks5Server(c.cfg.ListenAddr, "", "", dialFn)
+		c.proxy = NewSocks5Server(c.cfg.ListenAddr, "", "", dialFn, proxyLimit)
 	}
 	return c.proxy.Start()
 }

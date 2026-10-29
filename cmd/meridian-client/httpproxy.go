@@ -13,14 +13,15 @@ import (
 )
 
 type HttpProxyServer struct {
-	listenAddr string
-	username   string
-	password   string
-	dial       func(ctx context.Context, network, addr string) (net.Conn, error)
-	listener   net.Listener
-	stopOnce   sync.Once
-	wg         sync.WaitGroup
-	sem        chan struct{} // concurrency limiter
+	listenAddr    string
+	username      string
+	password      string
+	dial          func(ctx context.Context, network, addr string) (net.Conn, error)
+	listener      net.Listener
+	stopOnce      sync.Once
+	wg            sync.WaitGroup
+	sem           chan struct{} // concurrency limiter
+	maxConcurrent int
 
 	// Stats
 	mu       sync.Mutex
@@ -32,13 +33,17 @@ type HttpProxyServer struct {
 }
 
 // NewHttpProxyServer creates a new HTTP proxy server.
-func NewHttpProxyServer(listenAddr, username, password string, dialFn func(ctx context.Context, network, addr string) (net.Conn, error)) *HttpProxyServer {
+func NewHttpProxyServer(listenAddr, username, password string, dialFn func(ctx context.Context, network, addr string) (net.Conn, error), maxConcurrent int) *HttpProxyServer {
+	if maxConcurrent <= 0 {
+		maxConcurrent = defaultMaxConcurrent
+	}
 	return &HttpProxyServer{
-		listenAddr: listenAddr,
-		username:   username,
-		password:   password,
-		dial:       dialFn,
-		sem:        make(chan struct{}, maxConcurrent),
+		listenAddr:    listenAddr,
+		username:      username,
+		password:      password,
+		dial:          dialFn,
+		sem:           make(chan struct{}, maxConcurrent),
+		maxConcurrent: maxConcurrent,
 	}
 }
 
@@ -96,7 +101,7 @@ func (s *HttpProxyServer) acceptLoop() {
 			defer s.wg.Done()
 			defer func() { <-s.sem }()
 			defer conn.Close()
-			
+
 			s.handleConn(conn)
 
 			s.mu.Lock()
@@ -109,7 +114,7 @@ func (s *HttpProxyServer) acceptLoop() {
 func (s *HttpProxyServer) handleConn(conn net.Conn) {
 	// Set initial read deadline
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-	
+
 	reader := bufio.NewReader(conn)
 	req, err := http.ReadRequest(reader)
 	if err != nil {
@@ -118,7 +123,7 @@ func (s *HttpProxyServer) handleConn(conn net.Conn) {
 		s.mu.Unlock()
 		return
 	}
-	
+
 	// Check auth if configured
 	if s.username != "" || s.password != "" {
 		authHeader := req.Header.Get("Proxy-Authorization")
@@ -130,7 +135,7 @@ func (s *HttpProxyServer) handleConn(conn net.Conn) {
 			return
 		}
 	}
-	
+
 	// Clear the read deadline so the tunnel can stay open
 	conn.SetReadDeadline(time.Time{})
 
@@ -210,11 +215,11 @@ func (s *HttpProxyServer) handlePlainHTTP(conn net.Conn, clientReader *bufio.Rea
 
 	// Rewrite request line to relative path
 	req.RequestURI = ""
-	
+
 	// Remove Proxy-Connection header
 	req.Header.Del("Proxy-Connection")
 	req.Header.Del("Proxy-Authorization")
-	
+
 	// We need to write the modified request to the upstream
 	err = req.Write(upstream)
 	if err != nil {
@@ -232,7 +237,7 @@ func (s *HttpProxyServer) handlePlainHTTP(conn net.Conn, clientReader *bufio.Rea
 	// We'll just do a bidirectional relay for simplicity, because some HTTP requests might be upgraded (e.g. WebSocket).
 	// Oh, but `req.Write(upstream)` consumed the body. So if we start relaying now, we'll only relay SUBSEQUENT requests, which is fine for keep-alive, or WebSocket upgrades.
 	// Actually, `http.ReadRequest` might wrap the connection. Let's just relay from `clientReader` instead of `conn` for the client->upstream direction to catch any buffered bytes.
-	
+
 	s.relayWithReader(conn, clientReader, upstream)
 }
 

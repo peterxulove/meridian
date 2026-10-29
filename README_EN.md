@@ -46,6 +46,22 @@ Meridian is a custom secure proxy protocol designed to deliver **undetectable en
 
 ## Changelog
 
+### v1.6.4 (2026-10-29)
+
+#### 🔧 Config keys that finally do something
+
+`stream_window`, `max_concurrent_streams` and `session_lifetime` were parsed but never read. All three are wired up now:
+
+- **`stream_window`**: converts a byte budget into per-stream downlink queue depth (`window / 60 KiB`, clamped to 64–1024 frames). Same maths on both ends, default 8 MiB.
+- **`max_concurrent_streams`**: per-tunnel stream cap. The client retries a saturated lane on another one; the server answers `server busy` instead of letting a single client exhaust its file descriptors. The local proxy listener is sized as `max_concurrent_streams × tunnel_connections`, bounded to 512–4096.
+- **`session_lifetime`**: a lane that reaches its lifetime drains — it stops taking new streams, closes once the remaining ones finish (or after a 5 minute grace), and reconnects, refreshing the outer TCP/TLS connection. `0` disables recycling.
+
+#### 🚀 Deployment
+
+- New `./deploy.sh transport client|server [quic|websocket|hybrid|http-post]` (also menu item 9): changes only transport-specific keys, keeps password, SPKI, certificates and listen port, and rolls back if the service fails to start.
+- `./deploy.sh optimize` now also writes `stream_window: 8388608` and `max_concurrent_streams: 512`.
+- Default release version is `v1.6.4`.
+
 ### v1.6.0 (2026-10-21)
 
 #### 🔒 Security Fixes
@@ -241,6 +257,7 @@ chmod +x deploy.sh
 * `./deploy.sh status`: Display status of installed Meridian services.
 * `./deploy.sh update client`: update the client core only. Existing `client.yaml`, certificates and service definitions are preserved; the previous binary is restored automatically if startup fails.
 * `./deploy.sh update server`: update the server core only while preserving its existing configuration.
+* `./deploy.sh transport client|server`: switch transport interactively (QUIC / WebSocket / QUIC+WebSocket / HTTP-POST), or pass it directly, e.g. `./deploy.sh transport client websocket`.
 * `./deploy.sh uninstall`: Quickly uninstall client or server components.
 
 ---
@@ -356,7 +373,35 @@ git config --global http.https://github.com.proxy socks5://<client-machine-ip>:1
 
 ## Configuration
 
-Meridian supports three transport modes depending on your network environment.
+Meridian supports four transport modes depending on your network environment:
+QUIC, WebSocket, the server-side `QUIC+WebSocket` hybrid listener (both
+protocols on one port), and HTTP-POST.
+
+Switch without editing YAML by hand:
+
+```bash
+sudo ./deploy.sh transport server           # interactive
+sudo ./deploy.sh transport client websocket # or explicit
+```
+
+Only transport-specific fields (`transport` / `wss_path` / `mirror_path`) are
+touched; password, SPKI, certificates and listen port are preserved, and the
+change is rolled back if the service fails to restart.
+
+### Performance and connection parameters
+
+| Key | Meaning | Default | Range |
+|-----|---------|---------|-------|
+| `tunnel_connections` | Independent outer tunnels per client; each has its own handshake and keys, streams are spread by active load | `4` (deploy script) | 1–16 |
+| `stream_window` | Per-stream downlink buffer budget, converted to `window / 60KiB` frames | `8388608` (8 MiB) | 256 KiB–64 MiB |
+| `max_concurrent_streams` | Stream cap **per tunnel**; the client retries another lane, the server answers `server busy` | `512` | 16–4096 |
+| `session_lifetime` | Outer connection lifetime; the lane drains and reconnects at expiry, `0` disables | `1h` | 5m–24h |
+| `timing_jitter_ms` | Random delay applied to small frames only | `0` | 0–100 |
+| `up_mbps` / `down_mbps` | Fixed QUIC bandwidth hint; `0` selects adaptive BBR | `0` | 0 or link rate |
+
+The local proxy listener is sized as `max_concurrent_streams ×
+tunnel_connections` (clamped to 512–4096), so multiple lanes are not throttled
+by a single lane's budget.
 
 ---
 
@@ -387,7 +432,8 @@ timing_jitter_ms: 30.0
 
 # ─── Connection limits ───
 max_clients: 1000
-stream_window: 1048576
+stream_window: 8388608
+max_concurrent_streams: 512
 keepalive_interval: "30s"
 handshake_timeout: "10s"
 
@@ -425,8 +471,8 @@ timing_jitter_ms: 30.0
 # ─── Connection ───
 keepalive_interval: "30s"
 handshake_timeout: "10s"
-stream_window: 1048576
-max_concurrent_streams: 100
+stream_window: 8388608
+max_concurrent_streams: 512
 session_lifetime: "1h"
 dial_timeout: "15s"
 

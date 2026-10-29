@@ -46,6 +46,22 @@ Meridian 是一个自定义安全代理协议，设计目标是在恶劣的网�
 
 ## 更新日志
 
+### v1.6.4（2026-10-29）
+
+#### 🔧 配置项真正生效
+
+此前 `stream_window`、`max_concurrent_streams`、`session_lifetime` 只被解析、从未被代码读取，改了不起作用。本版全部接通：
+
+- **`stream_window`**：按字节预算决定单条流的下行缓冲帧数（`窗口 / 60KiB`，限制在 64–1024 帧）。客户端与服务端使用同一套换算，默认 8 MiB。
+- **`max_concurrent_streams`**：**每条隧道**的并发流上限。客户端超限时把连接切到其他 lane 重试，服务端超限时返回 `server busy`，避免单客户端耗尽文件描述符。本地代理监听器的总并发由 `max_concurrent_streams × tunnel_connections` 推导，并限制在 512–4096。
+- **`session_lifetime`**：每条外层连接到达寿命后进入 draining 状态，不再接收新流；存量流结束后（或超过 5 分钟宽限期）自动断开重连，定期刷新外层 TCP/TLS 连接指纹。设为 `0` 关闭。
+
+#### 🚀 部署
+
+- 新增 `./deploy.sh transport client|server [quic|websocket|hybrid|http-post]`，交互菜单第 9 项同样可用：只改传输相关配置，保留密码、SPKI、证书与本地端口，重启失败自动回滚。
+- `./deploy.sh optimize` 现在同时写入 `stream_window: 8388608` 与 `max_concurrent_streams: 512`。
+- 默认发布版本更新为 `v1.6.4`。
+
 ### v1.6.3（2026-10-29）
 
 #### 🚀 高吞吐
@@ -293,6 +309,7 @@ chmod +x deploy.sh
 * `./deploy.sh update client`：只更新客户端核心，保留现有 `client.yaml`、证书与服务定义；新核心启动失败会自动回滚。
 * `./deploy.sh update server`：只更新服务端核心，保留现有 `server.yaml`、证书与服务定义。
 * `./deploy.sh optimize client|server`：保留凭据，切换高吞吐传输与并行参数。
+* `./deploy.sh transport client|server`：交互式切换传输协议（QUIC / WebSocket / QUIC+WebSocket / HTTP-POST）；也可直接跟参数，例如 `./deploy.sh transport client websocket`。
 * `./deploy.sh uninstall`：快捷卸载已安装的客户端或服务端。
 
 ---
@@ -408,11 +425,34 @@ git config --global http.https://github.com.proxy socks5://主机IP:1080
 
 ## 配置说明
 
-根据所部署的网络环境，Meridian 提供了三种传输层协议的配置方案：
+根据所部署的网络环境，Meridian 提供四种传输层配置方案：
 
-1. **QUIC + WebSocket 混合模式**：服务端推荐，同一端口兼容 UDP QUIC 与 TCP/WSS。
-2. **WebSocket (WSS) 多隧道模式**：500 Mbps 以上或 UDP 受限环境推荐。
-3. **HTTP-POST 模式**：模拟大文件上传，极端环境下使用。
+1. **QUIC (Hysteria v2)**：UDP 单协议，延迟最低，链路干净时首选。
+2. **WebSocket (WSS)**：TLS/TCP，配 4 条隧道时吞吐最高，UDP 被限速时首选。
+3. **QUIC + WebSocket 混合模式**：服务端推荐，同一端口同时兼容 UDP QUIC 与 TCP/WSS，便于客户端逐个迁移。
+4. **HTTP-POST 模式**：模拟大文件上传，极端环境下使用，速度最慢。
+
+切换协议不必手改配置：
+
+```bash
+sudo ./deploy.sh transport server          # 交互式选择
+sudo ./deploy.sh transport client websocket # 或直接指定
+```
+
+该命令只改传输相关字段（`transport` / `wss_path` / `mirror_path`），密码、SPKI、证书和本地端口保持不变，重启失败会自动回滚。
+
+### 性能与连接参数
+
+| 参数 | 作用 | 默认 | 取值范围 |
+|------|------|------|----------|
+| `tunnel_connections` | 客户端并行外层隧道数；每条隧道独立握手、独立密钥，按活跃流数分摊 | `4`（部署脚本生成） | 1–16 |
+| `stream_window` | 单条流的下行缓冲预算，换算为 `窗口 / 60KiB` 帧，限 64–1024 帧 | `8388608`（8 MiB） | 256 KiB–64 MiB |
+| `max_concurrent_streams` | **每条隧道**的并发流上限；超限时客户端换 lane 重试，服务端回 `server busy` | `512` | 16–4096 |
+| `session_lifetime` | 外层连接寿命，到期后 drain（不再接新流）并重连；多 lane 自动错开 0–15%；`0` 关闭 | `1h` | 5m–24h |
+| `timing_jitter_ms` | 小帧随机延迟；大帧不受影响 | `0` | 0–100 |
+| `up_mbps` / `down_mbps` | QUIC 固定带宽提示；`0` 表示自适应 BBR | `0` | 0 或链路值 |
+
+`stream_window` 只在本地应用停止读取时才会被填满，它是抗卡顿余量而不是常驻内存；`max_concurrent_streams` 是每隧道上限，客户端本地代理的总并发按 `max_concurrent_streams × tunnel_connections` 推导（限制在 512–4096）。
 
 ---
 
@@ -445,7 +485,8 @@ down_mbps: 0
 
 # ─── 连接与性能控制 ───
 max_clients: 1000
-stream_window: 1048576
+stream_window: 8388608
+max_concurrent_streams: 512
 keepalive_interval: "30s"
 handshake_timeout: "10s"
 
@@ -485,8 +526,8 @@ down_mbps: 0
 # ─── 连接优化 ───
 keepalive_interval: "30s"
 handshake_timeout: "10s"
-stream_window: 1048576
-max_concurrent_streams: 100
+stream_window: 8388608
+max_concurrent_streams: 512
 session_lifetime: "1h"
 dial_timeout: "15s"
 
@@ -775,6 +816,8 @@ go vet ./...
 - [x] **方向均衡 / Nonce 失步修复** ✅ v1.6.0
 - [x] **版本号构建注入** ✅ v1.6.0
 - [x] **多隧道并行 / QUIC+WebSocket 混合监听** ✅ v1.6.3
+- [x] **`stream_window` / `max_concurrent_streams` / `session_lifetime` 真正生效** ✅ v1.6.4
+- [x] **`deploy.sh transport` 协议切换菜单** ✅ v1.6.4
 
 ---
 

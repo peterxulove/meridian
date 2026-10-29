@@ -1,7 +1,14 @@
-# Meridian Protocol Specification v1.0
+# Meridian Protocol Specification v1.1
 
 > A hybrid high-efficiency, anti-detection secure communication protocol.
 > Combines strengths of Shadowsocks, Hysteria/Hysteria2, VLESS, and REALITY.
+
+Revision history:
+
+| Version | Date | Changes |
+|---------|------|---------|
+| 1.0 | 2026-06 | Initial specification |
+| 1.1 | 2026-10-29 | Documented `QUIC+WebSocket` listener, multi-lane transport, real `stream_window` / `max_concurrent_streams` semantics, and session-lifetime draining |
 
 ---
 
@@ -44,7 +51,17 @@
 |-----------|-------------|-------|
 | **QUIC (default)** | Open/semi-open networks | Best performance, multiplexed streams |
 | **WebSocket** | Network blocks UDP/QUIC | Fingerprints as standard WSS |
+| **QUIC+WebSocket (server)** | Mixed client fleet | UDP QUIC and TCP/WSS listeners share one port |
 | **HTTP-POST** | Aggressive DPI environments | Mimics cloud storage upload |
+
+The server-side `QUIC+WebSocket` transport is a listener configuration, not a
+separate wire protocol: a client still speaks either QUIC or WebSocket, and the
+server accepts both on the same `listen_addr`. This lets a deployment migrate
+clients one at a time without changing the port.
+
+Clients MAY open several independent outer connections ("lanes") to the same
+server — see §6.4. Each lane carries its own handshake, session ID and key
+schedule; streams are distributed across lanes by active load.
 
 ---
 
@@ -282,6 +299,10 @@ carries per-stream semantics instead:
 | 0x01  | CONNECT accepted        |
 | 0x08  | CONNECT failed (payload is the error string) |
 
+`0x08` covers both hard failures (dial error) and the retryable
+`server busy: stream limit reached`, which a client answers by moving the
+stream to another lane rather than surfacing an error to the application.
+
 An implementation that writes a control type into `Flags` silently turns the
 frame into an ordinary DATA frame, and the peer will never dispatch it to the
 keepalive or stream-teardown handler.
@@ -509,18 +530,45 @@ Client adapts sending rate accordingly.
 
 ### 6.2 Flow Control (Stream-level)
 
-Each stream has a window of configurable size (default 1MB). ACK frames indicate consumed data, freeing window space.
+Meridian does not use an explicit ACK/credit window. Flow control is
+receiver-driven backpressure over a bounded per-stream queue:
 
-```
-ACK frame:
-  1 byte:  TYPE (0x01)
-  2 bytes: LENGTH (8)
-  4 bytes: STREAM_ID
-  1 byte:  FLAGS
-  4 bytes: SEQUENCE
-  8 bytes: WINDOW_SIZE [uint64, bytes]
-  4 bytes: CONSUMED [uint32, bytes]
-```
+- Every stream owns a queue of decoded DATA payloads. Its depth is derived from
+  the `stream_window` byte budget:
+
+  ```
+  depth = clamp(stream_window / 60 KiB, 64, 1024)      # 60 KiB = max DATA payload
+  ```
+
+  With the default `stream_window: 8388608` (8 MiB) that is 136 frames per
+  stream. Both roles compute the depth from their own config; the value is a
+  local memory/robustness knob, not a negotiated wire parameter.
+- The single read loop that serves a lane never blocks on a slow consumer. If a
+  stream's queue is full, that stream is reset (`RESET`) and the application
+  sees EOF, while every other stream on the lane keeps flowing.
+- A sender that outruns the receiver is throttled by the transport: the
+  receiver stops draining its socket, the kernel/QUIC receive window closes,
+  and the sender's writes block. There is no per-frame acknowledgement.
+
+The `0x01 ACK`, `0x02 CONGESTION` and `0x07 FLOW` frame types are reserved for a
+future credit-based scheme and are not emitted by this implementation; peers
+MUST ignore them rather than treat them as DATA.
+
+### 6.2.1 Concurrent stream cap
+
+`max_concurrent_streams` caps how many streams one lane may carry at once
+(default 512, clamped to 16–4096):
+
+- The client checks the cap when opening a stream and returns a retryable
+  "lane saturated" condition, so the dial is re-attempted on the least loaded
+  lane.
+- The server checks the cap when it receives `CONNECT` and answers
+  `0x08 CONNECT failed` with `server busy: stream limit reached` when the lane
+  is full. It never silently drops the request.
+
+The local proxy listener is sized as `max_concurrent_streams ×
+tunnel_connections`, clamped to 512–4096, so a multi-lane client is not
+throttled by a single lane's budget.
 
 ### 6.3 Keepalive & Heartbeat
 
@@ -540,6 +588,40 @@ RTT = server_timestamp - client_timestamp (one-way) * 2 (approximate)
 ```
 
 Default ping interval: 30 seconds. Timeout: 3 consecutive missed pongs = dead connection.
+
+### 6.4 Session Lifetime and Lane Draining
+
+`session_lifetime` (default `1h`, `0` disables) bounds how long an outer
+connection may live, so a single long-lived TCP/TLS session does not become a
+stable fingerprint. The lifecycle is:
+
+1. A lane whose age reaches `session_lifetime` enters the **draining** state.
+   It stays connected but receives no new streams.
+   Lane `n` of `N` uses `session_lifetime × (1 + n/20)` (up to +15%) so lanes
+   opened together do not all drain at the same instant.
+2. Existing streams keep running until they finish, or until the drain grace
+   period expires: `clamp(session_lifetime / 10, 30s, 5min)`.
+3. The lane is closed and reconnected with a fresh TLS/QUIC handshake. The
+   session ID is intentionally reused so session resumption still works; only
+   the outer connection is refreshed.
+
+Lane state is local to the client — nothing is signalled on the wire, so a
+server does not need to support draining to interoperate.
+
+### 6.5 Multi-lane Stream Distribution
+
+`tunnel_connections` (1–16) is the number of independent outer connections a
+client maintains. Each lane is a full Meridian tunnel (own handshake, session
+ID and keys), and the client assigns each new stream to the lane with the
+lowest active stream count, skipping lanes that are closed or draining. If the
+chosen lane fails while dialling, the remaining lanes are tried once before the
+proxy reports a failure.
+
+This exists because a single outer TCP/QUIC flow is BDP-limited: on a ~55ms RTT
+path one flow plateaus around 150 Mbps regardless of available bandwidth, while
+four WebSocket lanes reach 500–600 Mbps aggregate. Lanes are independent, so
+their throughput adds up; per-stream throughput is still bounded by the lane it
+lands on.
 
 ---
 
@@ -627,13 +709,18 @@ type DefaultConfig struct {
     MaxPayloadSize      uint32       = 1452  // typical UDP MTU
     KeepaliveInterval   float32      = 30  // seconds
     HandshakeTimeout    float32      = 10  // seconds
-    StreamWindow        uint64       = 1048576  // 1MB
-    MaxConcurrentStreams uint32      = 100
+    StreamWindow        uint64       = 8388608  // 8MB per-stream queue budget
+    MaxConcurrentStreams uint32      = 512      // per lane
+    TunnelConnections   int          = 4        // independent outer connections
     SessionLifetime     uint32       = 3600  // 1 hour
     RenewalInterval     float32      = 300  // 5 minutes
     RenewalDataLimit    uint64       = 67108864  // 64MB
 }
 ```
+
+`StreamWindow` is clamped to 256 KiB–64 MiB, `MaxConcurrentStreams` to 16–4096,
+`TunnelConnections` to 1–16, and `SessionLifetime` to 5 minutes–24 hours (or `0`
+to disable recycling).
 
 ### 9.2 Performance Benchmarks (Reference)
 

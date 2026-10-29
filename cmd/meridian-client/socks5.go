@@ -49,9 +49,9 @@ const (
 	replyCmdNotSupported  = 0x07
 	replyAddrNotSupported = 0x08
 
-	// maxConcurrent limits how many connections are in flight simultaneously.
+	// defaultMaxConcurrent is used when the caller passes no explicit limit.
 	// Prevents "too many open files" on systems with low ulimits.
-	maxConcurrent = 512
+	defaultMaxConcurrent = 512
 )
 
 var dnsServers = []string{
@@ -94,19 +94,18 @@ var publicDialer = &net.Dialer{
 	Resolver:  publicResolver,
 }
 
-
-
 // Socks5Server is a SOCKS5 proxy server that forwards connections through
 // the Meridian encrypted tunnel.
 type Socks5Server struct {
-	listenAddr string
-	username   string
-	password   string
-	dial       func(ctx context.Context, network, addr string) (net.Conn, error)
-	listener   net.Listener
-	stopOnce   sync.Once
-	wg         sync.WaitGroup
-	sem        chan struct{} // concurrency limiter
+	listenAddr    string
+	username      string
+	password      string
+	dial          func(ctx context.Context, network, addr string) (net.Conn, error)
+	listener      net.Listener
+	stopOnce      sync.Once
+	wg            sync.WaitGroup
+	sem           chan struct{} // concurrency limiter
+	maxConcurrent int
 
 	// Stats
 	mu       sync.Mutex
@@ -120,13 +119,17 @@ type Socks5Server struct {
 // NewSocks5Server creates a new SOCKS5 server.
 // dialFn is called to establish the upstream (Meridian-tunnelled) connection.
 // If username/password are empty, no authentication is required.
-func NewSocks5Server(listenAddr, username, password string, dialFn func(ctx context.Context, network, addr string) (net.Conn, error)) *Socks5Server {
+func NewSocks5Server(listenAddr, username, password string, dialFn func(ctx context.Context, network, addr string) (net.Conn, error), maxConcurrent int) *Socks5Server {
+	if maxConcurrent <= 0 {
+		maxConcurrent = defaultMaxConcurrent
+	}
 	return &Socks5Server{
-		listenAddr: listenAddr,
-		username:   username,
-		password:   password,
-		dial:       dialFn,
-		sem:        make(chan struct{}, maxConcurrent),
+		listenAddr:    listenAddr,
+		username:      username,
+		password:      password,
+		dial:          dialFn,
+		sem:           make(chan struct{}, maxConcurrent),
+		maxConcurrent: maxConcurrent,
 	}
 }
 
@@ -137,7 +140,7 @@ func (s *Socks5Server) Start() error {
 		return fmt.Errorf("socks5: listen %s: %w", s.listenAddr, err)
 	}
 	s.listener = ln
-	fmt.Printf("  [SOCKS5] Listening on %s (LAN, max %d concurrent)\n", s.listenAddr, maxConcurrent)
+	fmt.Printf("  [SOCKS5] Listening on %s (LAN, max %d concurrent)\n", s.listenAddr, s.maxConcurrent)
 	s.wg.Add(1)
 	go s.acceptLoop()
 	return nil
@@ -176,7 +179,7 @@ func (s *Socks5Server) acceptLoop() {
 			s.mu.Lock()
 			s.failed++
 			s.mu.Unlock()
-			logf("[warn] connection limit reached (%d), dropped %s", maxConcurrent, conn.RemoteAddr())
+			logf("[warn] connection limit reached (%d), dropped %s", s.maxConcurrent, conn.RemoteAddr())
 			continue
 		}
 

@@ -2,6 +2,7 @@ package main
 
 import (
 	"testing"
+	"time"
 
 	"meridian/pkg/config"
 )
@@ -53,5 +54,60 @@ func TestPickTunnelUsesLeastLoadedLane(t *testing.T) {
 	tunnel, lane = client.pickTunnel()
 	if tunnel != lanes[2] || lane != 2 {
 		t.Fatalf("picked lane %d after close, want lane 2", lane)
+	}
+}
+
+func TestPickTunnelSkipsDrainingLane(t *testing.T) {
+	cfg := config.DefaultClientConfig()
+	cfg.TunnelConnections = 2
+	client, err := NewClient(cfg)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	lanes := []*TunnelClient{{}, {}}
+	lanes[0].draining.Store(true)
+	client.tunnels = lanes
+
+	tunnel, lane := client.pickTunnel()
+	if tunnel != lanes[1] || lane != 1 {
+		t.Fatalf("picked lane %d, want the non-draining lane 1", lane)
+	}
+
+	lanes[1].draining.Store(true)
+	if tunnel, lane := client.pickTunnel(); tunnel != nil || lane != -1 {
+		t.Fatalf("picked lane %d while all lanes drain, want none", lane)
+	}
+}
+
+func TestDrainGraceBounds(t *testing.T) {
+	cases := []struct {
+		lifetime time.Duration
+		want     time.Duration
+	}{
+		{5 * time.Minute, 30 * time.Second},
+		{time.Hour, 5 * time.Minute},
+		{24 * time.Hour, 5 * time.Minute},
+	}
+	for _, c := range cases {
+		if got := drainGrace(c.lifetime); got != c.want {
+			t.Errorf("drainGrace(%v) = %v, want %v", c.lifetime, got, c.want)
+		}
+	}
+}
+
+func TestStaggerLifetime(t *testing.T) {
+	hour := time.Hour
+	if got := staggerLifetime(0, 2, 4); got != 0 {
+		t.Errorf("disabled lifetime = %v, want 0", got)
+	}
+	if got := staggerLifetime(hour, 0, 4); got != hour {
+		t.Errorf("lane 0 = %v, want %v", got, hour)
+	}
+	if got := staggerLifetime(hour, 1, 4); got != hour+3*time.Minute {
+		t.Errorf("lane 1 = %v, want %v", got, hour+3*time.Minute)
+	}
+	if got := staggerLifetime(hour, 3, 4); got != hour+9*time.Minute {
+		t.Errorf("lane 3 = %v, want %v", got, hour+9*time.Minute)
 	}
 }

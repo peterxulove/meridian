@@ -267,10 +267,10 @@ type activeStream struct {
 }
 
 const (
-	// streamQueueDepth bounds per-stream buffering. 256 frames of at most
-	// ~32 KiB is 8 MiB — enough to ride out a short consumer stall, while a
-	// genuinely stuck stream is reset before it can pin the whole tunnel.
-	streamQueueDepth = 256
+	// DATA frame flags carrying the control-plane result of a CONNECT.
+	flagConnect      = 0x01
+	flagConnectError = 0x08
+
 	// tunnelWriteTimeout keeps one unresponsive peer from holding writeMu
 	// forever. Once a tunnel write times out the frame stream is unsynchronised,
 	// so the tunnel is closed and the client reconnects.
@@ -407,6 +407,8 @@ func (s *Server) handleTCPTunnel(conn net.Conn) {
 	// Map of active StreamID -> target connection
 	activeStreams := make(map[uint32]*activeStream)
 	pendingDials := make(map[uint32]struct{})
+	queueDepth := config.StreamQueueDepth(s.cfg.StreamWindow)
+	streamLimit := int(s.cfg.MaxConcurrentStream)
 	var mu sync.Mutex      // protects activeStreams and pendingDials
 	var writeMu sync.Mutex // serialises encoder use and frame writes
 	tunnelClosed := new(atomic.Bool)
@@ -563,6 +565,20 @@ func (s *Server) handleTCPTunnel(conn net.Conn) {
 					continue
 				}
 
+				// max_concurrent_streams caps how many target connections one
+				// tunnel may hold. The client turns this into a clean retry on
+				// another lane instead of an ever-growing dial storm.
+				mu.Lock()
+				atCapacity := streamLimit > 0 && len(activeStreams)+len(pendingDials) >= streamLimit
+				mu.Unlock()
+				if atCapacity {
+					if err := send(mfp.TypeDATA, sid, flagConnectError,
+						[]byte("server busy: stream limit reached")); err != nil {
+						return
+					}
+					continue
+				}
+
 				mu.Lock()
 				_, busy := activeStreams[sid]
 				_, dialing := pendingDials[sid]
@@ -612,7 +628,7 @@ func (s *Server) handleTCPTunnel(conn net.Conn) {
 					streamInfo := &activeStream{
 						id:        streamID,
 						conn:      targetConn,
-						writeChan: make(chan []byte, streamQueueDepth),
+						writeChan: make(chan []byte, queueDepth),
 						done:      make(chan struct{}),
 					}
 

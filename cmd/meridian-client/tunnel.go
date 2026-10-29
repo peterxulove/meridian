@@ -38,17 +38,20 @@ type TunnelClient struct {
 	closeCh       chan struct{}
 	lastRecv      atomic.Int64
 	activeLoad    atomic.Int64
+	connectedAt   time.Time
+	draining      atomic.Bool
 }
+
+// errLaneSaturated is returned when a lane already carries its configured
+// number of streams. The caller retries on another lane instead of failing the
+// user connection.
+var errLaneSaturated = errors.New("tunnel: lane saturated")
 
 const (
 	// DATA frame flags carrying the control-plane result of a CONNECT.
 	flagConnect      = 0x01
 	flagConnectError = 0x08
 
-	// streamReadQueueDepth bounds how much downlink data one stream may buffer
-	// before it is considered stuck. A slow/suspended consumer must never block
-	// the single read loop that serves every other stream.
-	streamReadQueueDepth = 256
 	// tunnelWriteTimeout bounds a single frame write. A peer that stops reading
 	// would otherwise pin writeMu (and every stream) forever.
 	tunnelWriteTimeout = 30 * time.Second
@@ -259,6 +262,8 @@ func (tc *TunnelClient) Connect() error {
 		fmt.Printf("  [Tunnel] Handshake successful over %s! Cipher: MERIDIAN-CHACHA\n", tc.cfg.Transport)
 	}
 
+	tc.connectedAt = time.Now()
+
 	// Start read loop
 	go tc.readLoop()
 
@@ -282,7 +287,7 @@ func (tc *TunnelClient) DialStream(ctx context.Context, targetAddr string) (net.
 	sc := &StreamConn{
 		sid:         sid,
 		client:      tc,
-		readChan:    make(chan []byte, streamReadQueueDepth),
+		readChan:    make(chan []byte, config.StreamQueueDepth(tc.cfg.StreamWindow)),
 		confirmChan: make(chan bool, 1),
 		closed:      make(chan struct{}),
 	}
@@ -291,6 +296,15 @@ func (tc *TunnelClient) DialStream(ctx context.Context, targetAddr string) (net.
 	tc.activeStreams[sid] = sc
 	tc.activeLoad.Add(1)
 	tc.mu.Unlock()
+
+	// Enforce the per-lane stream cap. The counter is incremented before the
+	// check so two racing dials cannot both slip past the limit; the loser is
+	// rolled back and the caller moves on to a less loaded lane.
+	if limit := int64(tc.cfg.MaxConcurrentStream); limit > 0 && tc.activeLoad.Load() > limit {
+		tc.removeStream(sid)
+		sc.CloseFromServer()
+		return nil, errLaneSaturated
+	}
 
 	// Send CONNECT frame (Flags = 0x01: connect request).
 	if err := tc.sendFrame(mfp.TypeDATA, sid, flagConnect, []byte(targetAddr), 0); err != nil {
@@ -348,6 +362,17 @@ func (tc *TunnelClient) removeStream(sid uint32) {
 // outer tunnel. The client uses it to keep lanes evenly loaded.
 func (tc *TunnelClient) ActiveLoad() int64 {
 	return tc.activeLoad.Load()
+}
+
+// Draining reports whether the lane is being retired at the end of its
+// configured session lifetime. Draining lanes take no new streams.
+func (tc *TunnelClient) Draining() bool {
+	return tc.draining.Load()
+}
+
+// ConnectedAt is when the handshake for this lane completed.
+func (tc *TunnelClient) ConnectedAt() time.Time {
+	return tc.connectedAt
 }
 
 // keepaliveLoop sends a PING on the control stream every KeepaliveInterval so

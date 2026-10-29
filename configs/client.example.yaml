@@ -25,10 +25,16 @@ timing_jitter_ms: 0.0
 # ─── Connection ───
 keepalive_interval: "30s"
 handshake_timeout: "10s"
-stream_window: 1048576
-max_concurrent_streams: 100
+# Per-stream downlink buffer budget (bytes). 8 MiB rides out consumer stalls;
+# it only fills when the local app stops reading.
+stream_window: 8388608
+# Hard cap on streams per tunnel. The proxy listener is sized from
+# max_concurrent_streams x tunnel_connections (bounded to 512-4096).
+max_concurrent_streams: 512
 # Several independent outer transports avoid the single-stream BDP ceiling.
 tunnel_connections: 4
+# Drains and reconnects each lane after this long so a single outer
+# connection is not kept alive indefinitely. 0 disables recycling.
 session_lifetime: "1h"
 dial_timeout: "15s"
 

@@ -12,7 +12,7 @@
 
 set -e
 
-DEFAULT_RELEASE_VERSION="v1.6.3"
+DEFAULT_RELEASE_VERSION="v1.6.4"
 
 # Re-execute with bash if run with sh
 if [ -z "$BASH_VERSION" ]; then
@@ -275,7 +275,8 @@ down_mbps: 0
 
 # ─── Connection Limits ───
 max_clients: 1000
-stream_window: 1048576
+stream_window: 8388608
+max_concurrent_streams: 512
 keepalive_interval: "30s"
 handshake_timeout: "10s"
 
@@ -361,8 +362,8 @@ timing_jitter_ms: 0.0
 # ─── Connection ───
 keepalive_interval: "30s"
 handshake_timeout: "10s"
-stream_window: 1048576
-max_concurrent_streams: 100
+stream_window: 8388608
+max_concurrent_streams: 512
 tunnel_connections: ${client_lanes}
 session_lifetime: "1h"
 dial_timeout: "15s"
@@ -400,12 +401,111 @@ set_yaml_key() {
     rm -f "$tmp_file"
 }
 
+# Return true when a top-level key is already present in a YAML file.
+yaml_has_key() {
+    local file="$1"
+    local key="$2"
+    $SUDO grep -q "^${key}:" "$file" 2>/dev/null
+}
+
+# Restart the service after a configuration change and roll back to the given
+# backup if it does not come up.
+restart_or_rollback() {
+    local role="$1"
+    local config_file="$2"
+    local backup_file="$3"
+
+    echo -e "${BLUE}Restarting meridian-${role}...${NC}"
+    if restart_service "$role"; then
+        echo -e "${GREEN}Configuration applied.${NC}"
+        return 0
+    fi
+    $SUDO cp -p "$backup_file" "$config_file"
+    restart_service "$role" || true
+    echo -e "${RED}[Error] The service did not restart. Configuration was rolled back.${NC}"
+    return 1
+}
+
+# switch_transport [role] [quic|websocket|hybrid|http-post]
+# Switches the wire protocol of an existing installation. Credentials, SPKI,
+# certificates and proxy settings are preserved; only transport-specific keys
+# are touched.
+switch_transport() {
+    local role="$1"
+    local want="$2"
+    local config_file="${CONFIG_DIR}/${role}.yaml"
+    local backup_file="${config_file}.bak.$(date +%Y%m%d%H%M%S)-$$"
+    local transport=""
+
+    if [ ! -f "$config_file" ]; then
+        echo -e "${RED}[Error] $config_file not found.${NC}"
+        return 1
+    fi
+
+    if [ -z "$want" ]; then
+        echo -e "Current transport: ${CYAN}$(grep -m1 '^transport:' "$config_file" | cut -d: -f2- | tr -d ' "')${NC}"
+        echo -e "Select the transport for ${role}:"
+        echo "  1) QUIC            - Hysteria v2 over UDP, best on clean links"
+        echo "  2) WebSocket       - TLS over TCP, best throughput with 4 lanes"
+        if [ "$role" = "server" ]; then
+            echo "  3) QUIC+WebSocket  - UDP and TCP listeners share one port"
+        fi
+        echo "  4) HTTP-POST       - mirror mode, slowest but most camouflaged"
+        read -rp "Choice [1-4]: " want
+    fi
+
+    case "$want" in
+        1|quic|QUIC)                          transport="QUIC" ;;
+        2|ws|wss|websocket|WebSocket)         transport="WebSocket" ;;
+        3|hybrid|quic+websocket|QUIC+WebSocket) transport="QUIC+WebSocket" ;;
+        4|http-post|httppost|HTTP-POST)       transport="HTTP-POST" ;;
+        *) echo -e "${RED}Unknown transport: $want${NC}"; return 1 ;;
+    esac
+
+    if [ "$transport" = "QUIC+WebSocket" ] && [ "$role" != "server" ]; then
+        echo -e "${RED}[Error] QUIC+WebSocket is a server-side listener; clients must pick QUIC or WebSocket.${NC}"
+        return 1
+    fi
+
+    # The binary has to understand the new transport name before the config
+    # starts pointing at it.
+    if ! update_core "$role"; then
+        echo -e "${RED}[Error] Core update failed; configuration was not changed.${NC}"
+        return 1
+    fi
+
+    $SUDO cp -p "$config_file" "$backup_file"
+    echo -e "Configuration backup: ${backup_file}"
+
+    set_yaml_key "$config_file" "transport" "\"${transport}\""
+    case "$transport" in
+        "WebSocket")
+            set_yaml_key "$config_file" "wss_path" '"/ws/"'
+            if [ "$role" = "client" ] && ! yaml_has_key "$config_file" "tunnel_connections"; then
+                set_yaml_key "$config_file" "tunnel_connections" "4"
+            fi
+            ;;
+        "QUIC+WebSocket")
+            set_yaml_key "$config_file" "wss_path" '"/ws/"'
+            ;;
+        "HTTP-POST")
+            set_yaml_key "$config_file" "mirror_path" '"/upload"'
+            ;;
+    esac
+
+    echo -e "Transport set to ${CYAN}${transport}${NC}"
+    if [ "$role" = "server" ] && [ "$transport" = "WebSocket" ]; then
+        echo -e "${YELLOW}Note: every client must also use WebSocket after this change.${NC}"
+    fi
+    restart_or_rollback "$role" "$config_file" "$backup_file"
+}
+
 # Switch an existing installation to the high-throughput transport while
 # preserving all credentials and local proxy settings.
 optimize_config() {
     local role="$1"
     local config_file="${CONFIG_DIR}/${role}.yaml"
-    local backup_file="${config_file}.bak.$(date +%Y%m%d%H%M%S)"
+    local backup_file="${config_file}.bak.$(date +%Y%m%d%H%M%S)-$$"
 
     if [ ! -f "$config_file" ]; then
         echo -e "${RED}[Error] $config_file not found.${NC}"
@@ -437,17 +537,10 @@ optimize_config() {
     set_yaml_key "$config_file" "timing_jitter_ms" "0.0"
     set_yaml_key "$config_file" "up_mbps" "0"
     set_yaml_key "$config_file" "down_mbps" "0"
+    set_yaml_key "$config_file" "stream_window" "8388608"
+    set_yaml_key "$config_file" "max_concurrent_streams" "512"
 
-    echo -e "${BLUE}Restarting meridian-${role}...${NC}"
-    if restart_service "$role"; then
-        echo -e "${GREEN}High-throughput settings applied; credentials preserved.${NC}"
-        return 0
-    fi
-
-    $SUDO cp -p "$backup_file" "$config_file"
-    restart_service "$role" || true
-    echo -e "${RED}[Error] The service did not restart. Configuration was rolled back.${NC}"
-    return 1
+    restart_or_rollback "$role" "$config_file" "$backup_file"
 }
 
 # Start Service (Systemd / Launchd)
@@ -800,6 +893,17 @@ case "$ACTION" in
             *) echo -e "${RED}Usage: $0 optimize [client|server]${NC}"; exit 1 ;;
         esac
         ;;
+    transport)
+        role="${2:-}"
+        if [ -z "$role" ]; then
+            echo -e "Usage: $0 transport [client|server] [quic|websocket|hybrid|http-post]"
+            exit 1
+        fi
+        case "$role" in
+            client|server) switch_transport "$role" "${3:-}" ;;
+            *) echo -e "${RED}Usage: $0 transport [client|server] [quic|websocket|hybrid|http-post]${NC}"; exit 1 ;;
+        esac
+        ;;
     *)
         # Interactive Menu
         echo "What would you like to deploy?"
@@ -811,7 +915,8 @@ case "$ACTION" in
         echo "6. Update Server Core (keep config)"
         echo "7. Exit"
         echo "8. Enable high-throughput transport (keep credentials)"
-        read -rp "Choice [1-8]: " choice
+        echo "9. Switch transport protocol (QUIC / WebSocket / Hybrid / HTTP-POST)"
+        read -rp "Choice [1-9]: " choice
         
         case "$choice" in
             1)
@@ -880,6 +985,17 @@ case "$ACTION" in
                 case "$opt_choice" in
                     1) optimize_config "server" ;;
                     2) optimize_config "client" ;;
+                    *) echo "Invalid choice"; exit 1 ;;
+                esac
+                ;;
+            9)
+                echo -e "Select role to reconfigure:"
+                echo "1. Server"
+                echo "2. Client"
+                read -rp "Choice [1-2]: " tr_choice
+                case "$tr_choice" in
+                    1) switch_transport "server" "" ;;
+                    2) switch_transport "client" "" ;;
                     *) echo "Invalid choice"; exit 1 ;;
                 esac
                 ;;

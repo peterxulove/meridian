@@ -165,10 +165,11 @@ type ServerConfig struct {
 	DirectionBalance bool `yaml:"direction_balance" json:"direction_balance"`
 
 	// Connection limits
-	MaxClients        int           `yaml:"max_clients" json:"max_clients"`
-	StreamWindow      uint64        `yaml:"stream_window" json:"stream_window"`
-	KeepaliveInterval time.Duration `yaml:"keepalive_interval" json:"keepalive_interval"`
-	HandshakeTimeout  time.Duration `yaml:"handshake_timeout" json:"handshake_timeout"`
+	MaxClients          int           `yaml:"max_clients" json:"max_clients"`
+	StreamWindow        uint64        `yaml:"stream_window" json:"stream_window"`
+	MaxConcurrentStream uint32        `yaml:"max_concurrent_streams" json:"max_concurrent_streams"`
+	KeepaliveInterval   time.Duration `yaml:"keepalive_interval" json:"keepalive_interval"`
+	HandshakeTimeout    time.Duration `yaml:"handshake_timeout" json:"handshake_timeout"`
 
 	// Hysteria v2
 	UpMbps   uint64 `yaml:"up_mbps" json:"up_mbps"`
@@ -204,8 +205,8 @@ func DefaultClientConfig() ClientConfig {
 		TimingJitterMS:      0.0,
 		KeepaliveInterval:   30 * time.Second,
 		HandshakeTimeout:    10 * time.Second,
-		StreamWindow:        1048576, // 1MB
-		MaxConcurrentStream: 100,
+		StreamWindow:        DefaultStreamWindow,
+		MaxConcurrentStream: DefaultMaxConcurrentStreams,
 		TunnelConnections:   1,
 		SessionLifetime:     time.Hour,
 		DialTimeout:         15 * time.Second,
@@ -226,20 +227,21 @@ func DefaultClientConfig() ClientConfig {
 // DefaultServerConfig returns sensible defaults.
 func DefaultServerConfig() ServerConfig {
 	return ServerConfig{
-		ListenAddr:        "0.0.0.0:443",
-		Transport:         TransportHysteria,
-		CipherSuite:       CipherMeridianChacha,
-		RealityMode:       false,
-		RealityEnabled:    false,
-		Fingerprint:       FingerprintChromeWin,
-		PaddingMode:       PaddingRandom,
-		BasePayloadSize:   1400,
-		MaxPayloadSize:    1452,
-		TimingJitterMS:    0.0,
-		MaxClients:        1000,
-		StreamWindow:      1048576,
-		KeepaliveInterval: 30 * time.Second,
-		HandshakeTimeout:  10 * time.Second,
+		ListenAddr:          "0.0.0.0:443",
+		Transport:           TransportHysteria,
+		CipherSuite:         CipherMeridianChacha,
+		RealityMode:         false,
+		RealityEnabled:      false,
+		Fingerprint:         FingerprintChromeWin,
+		PaddingMode:         PaddingRandom,
+		BasePayloadSize:     1400,
+		MaxPayloadSize:      1452,
+		TimingJitterMS:      0.0,
+		MaxClients:          1000,
+		StreamWindow:        DefaultStreamWindow,
+		MaxConcurrentStream: DefaultMaxConcurrentStreams,
+		KeepaliveInterval:   30 * time.Second,
+		HandshakeTimeout:    10 * time.Second,
 		Destinations: []DestinationConfig{
 			{
 				Name:     "default",
@@ -254,6 +256,89 @@ func DefaultServerConfig() ServerConfig {
 		RenewalInterval:  5 * time.Minute,
 		RenewalDataLimit: 67108864, // 64MB
 	}
+}
+
+// Tuning limits shared by both roles.
+const (
+	// FrameSizeHint is the largest DATA payload the mux emits (60 KiB). It is
+	// the unit used to turn a byte budget into a per-stream queue depth.
+	FrameSizeHint = 60 * 1024
+
+	// DefaultStreamWindow is the per-stream downlink buffer budget. The queue
+	// only fills when the local consumer stalls, so 8 MiB is headroom rather
+	// than steady-state memory use.
+	DefaultStreamWindow = 8 << 20
+	minStreamWindow     = 256 << 10
+	maxStreamWindow     = 64 << 20
+
+	// DefaultMaxConcurrentStreams is the per-tunnel stream cap. It protects
+	// the server from one client exhausting file descriptors without getting
+	// in the way of a busy router that multiplexes hundreds of LAN sockets.
+	DefaultMaxConcurrentStreams = 512
+	minMaxConcurrentStreams     = 16
+	maxMaxConcurrentStreams     = 4096
+
+	minStreamQueueDepth = 64
+	maxStreamQueueDepth = 1024
+)
+
+// NormalizeStreamWindow clamps a configured stream window to a sane range.
+// Zero selects the default so an omitted key never disables buffering.
+func NormalizeStreamWindow(v uint64) uint64 {
+	if v == 0 {
+		return DefaultStreamWindow
+	}
+	if v < minStreamWindow {
+		return minStreamWindow
+	}
+	if v > maxStreamWindow {
+		return maxStreamWindow
+	}
+	return v
+}
+
+// NormalizeMaxConcurrentStreams clamps the per-tunnel stream cap. Zero selects
+// the default; values below the floor are raised so a legacy config that was
+// written when the key did nothing cannot starve a busy client.
+func NormalizeMaxConcurrentStreams(v uint32) uint32 {
+	if v == 0 {
+		return DefaultMaxConcurrentStreams
+	}
+	if v < minMaxConcurrentStreams {
+		return minMaxConcurrentStreams
+	}
+	if v > maxMaxConcurrentStreams {
+		return maxMaxConcurrentStreams
+	}
+	return v
+}
+
+// StreamQueueDepth converts a byte budget into the number of DATA frames one
+// stream may buffer before it is treated as stalled.
+func StreamQueueDepth(window uint64) int {
+	depth := int(NormalizeStreamWindow(window) / FrameSizeHint)
+	if depth < minStreamQueueDepth {
+		return minStreamQueueDepth
+	}
+	if depth > maxStreamQueueDepth {
+		return maxStreamQueueDepth
+	}
+	return depth
+}
+
+// NormalizeSessionLifetime clamps how long an outer connection may live before
+// the client drains and reconnects it. Zero disables recycling.
+func NormalizeSessionLifetime(d time.Duration) time.Duration {
+	if d == 0 {
+		return 0
+	}
+	if d < 5*time.Minute {
+		return 5 * time.Minute
+	}
+	if d > 24*time.Hour {
+		return 24 * time.Hour
+	}
+	return d
 }
 
 // NormalizeTunnelConnections clamps the lane count to a safe range.
@@ -293,6 +378,10 @@ func LoadClientConfig(path string) (ClientConfig, error) {
 		}
 		cfg.RealitySPKIHash = hash
 	}
+	cfg.StreamWindow = NormalizeStreamWindow(cfg.StreamWindow)
+	cfg.MaxConcurrentStream = NormalizeMaxConcurrentStreams(cfg.MaxConcurrentStream)
+	cfg.SessionLifetime = NormalizeSessionLifetime(cfg.SessionLifetime)
+	cfg.TunnelConnections = NormalizeTunnelConnections(cfg.TunnelConnections)
 	return cfg, nil
 }
 
@@ -319,5 +408,7 @@ func LoadServerConfig(path string) (ServerConfig, error) {
 		}
 		cfg.ServerSPKIHash = hash
 	}
+	cfg.StreamWindow = NormalizeStreamWindow(cfg.StreamWindow)
+	cfg.MaxConcurrentStream = NormalizeMaxConcurrentStreams(cfg.MaxConcurrentStream)
 	return cfg, nil
 }
