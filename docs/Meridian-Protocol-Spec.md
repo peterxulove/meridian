@@ -1,4 +1,4 @@
-# Meridian Protocol Specification v1.3
+# Meridian Protocol Specification v1.4
 
 > A hybrid high-efficiency, anti-detection secure communication protocol.
 > Combines strengths of Shadowsocks, Hysteria/Hysteria2, VLESS, and REALITY.
@@ -11,6 +11,7 @@ Revision history:
 | 1.1 | 2026-10-29 | Documented `QUIC+WebSocket` listener, multi-lane transport, real `stream_window` / `max_concurrent_streams` semantics, and session-lifetime draining |
 | 1.2 | 2026-10-29 | Per-stream ACK flow control (version 2 wire); `stream_window` is now a real in-flight byte window |
 | 1.3 | 2026-10-29 | Local per-stream buffer is bounded in bytes, not frames; stall detection no longer truncates healthy streams |
+| 1.4 | 2026-10-29 | `QUIC` transport on the server binds UDP only; the legacy plaintext TCP listener is no longer opened |
 
 ---
 
@@ -60,6 +61,12 @@ The server-side `QUIC+WebSocket` transport is a listener configuration, not a
 separate wire protocol: a client still speaks either QUIC or WebSocket, and the
 server accepts both on the same `listen_addr`. This lets a deployment migrate
 clients one at a time without changing the port.
+
+A server configured for `QUIC` MUST bind UDP only. It MUST NOT also open a
+plaintext TCP listener on `listen_addr`: an unauthenticated TCP port that
+answers arbitrary connections with tunnel framing is trivially fingerprintable
+and defeats the anti-detection goal. (Before v1.6.7 the `QUIC` value fell
+through to the legacy raw-TCP path and opened both.)
 
 Clients MAY open several independent outer connections ("lanes") to the same
 server — see §6.4. Each lane carries its own handshake, session ID and key

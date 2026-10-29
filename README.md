@@ -46,6 +46,19 @@ Meridian 是一个自定义安全代理协议，设计目标是在恶劣的网�
 
 ## 更新日志
 
+### v1.6.7（2026-10-29）
+
+#### 🐛 修复：`transport: QUIC` 仍会开一个裸 TCP 隧道端口
+
+服务端 `Start()` 的 `switch` 里没有 `QUIC` 分支，纯 QUIC 配置落进了 `default`，于是除了 UDP/QUIC 监听外，还在同一端口开了一个**无 TLS 的裸 TCP 隧道监听**：
+
+- 任何扫描器连上来都会被当成隧道握手处理，行为与正常 QUIC-only 服务器明显不同，是典型的 DPI 指纹特征；
+- 等于在“只用 QUIC”的部署里留了一个明文入口。
+
+现在 `QUIC` 只绑 UDP。`QUIC+WebSocket` 混合监听和 `WebSocket` / `HTTP-POST` 不受影响；`default`（未配置 transport 的老配置）仍保留旧的裸 TCP 行为。
+
+实测：`transport: QUIC` 启动后 `lsof -i :<port>` 只有一条 UDP 记录，`nc -z` 连 TCP 直接失败，端到端 8MB 传输校验一致。
+
 ### v1.6.6（2026-10-29）
 
 #### 🐛 修复：慢消费者误判导致流被截断

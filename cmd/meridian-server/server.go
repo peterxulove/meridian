@@ -68,6 +68,11 @@ func (s *Server) Start() error {
 			}
 		}()
 		return s.startHysteria()
+	case config.TransportHysteria:
+		// QUIC only. No TCP listener is opened: a plaintext tunnel port would
+		// answer arbitrary connections with tunnel framing, which is exactly
+		// the kind of behaviour DPI fingerprints.
+		return s.startHysteria()
 	default:
 		// Legacy raw-TCP fallback for configurations that predate WebSocket.
 		go s.startTCP()

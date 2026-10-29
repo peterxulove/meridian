@@ -46,6 +46,26 @@ Meridian is a custom secure proxy protocol designed to deliver **undetectable en
 
 ## Changelog
 
+### v1.6.7 (2026-10-29)
+
+#### 🐛 Fix: `transport: QUIC` still opened a plaintext TCP tunnel port
+
+The server's `Start()` switch had no `QUIC` case, so a QUIC-only config fell
+into `default` and opened a **plaintext TCP tunnel listener** next to the
+UDP/QUIC one:
+
+- Any scanner connecting to that port was treated as a tunnel handshake — a
+  clear DPI fingerprint that a QUIC-only server would never produce.
+- It left an unauthenticated cleartext entry point in a deployment that asked
+  for QUIC only.
+
+`QUIC` now binds UDP only. `QUIC+WebSocket`, `WebSocket` and `HTTP-POST` are
+unchanged; `default` (a config with no `transport` key) keeps the legacy
+behaviour.
+
+Verified: with `transport: QUIC` only a UDP socket is bound, `nc -z` on the TCP
+port fails, and an 8 MB end-to-end transfer matches checksums.
+
 ### v1.6.6 (2026-10-29)
 
 #### 🐛 Fix: slow-consumer false positive truncated streams
