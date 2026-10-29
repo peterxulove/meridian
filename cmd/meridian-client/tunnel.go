@@ -40,6 +40,7 @@ type TunnelClient struct {
 	activeLoad    atomic.Int64
 	connectedAt   time.Time
 	draining      atomic.Bool
+	flowControl   bool
 }
 
 // errLaneSaturated is returned when a lane already carries its configured
@@ -201,6 +202,10 @@ func (tc *TunnelClient) Connect() error {
 	serverRandom := respBuf[6:38]
 	serverEKPub := respBuf[38:70]
 	status := respBuf[5]
+	// The server echoes the negotiated version. Version 2 peers exchange ACK
+	// frames and honour the per-stream window; older servers do not, so we
+	// keep the historical unlimited behaviour for them.
+	tc.flowControl = respBuf[4] >= 2
 
 	if resumeKeys != nil && status == 0 {
 		// Server accepted resume
@@ -290,6 +295,10 @@ func (tc *TunnelClient) DialStream(ctx context.Context, targetAddr string) (net.
 		readChan:    make(chan []byte, config.StreamQueueDepth(tc.cfg.StreamWindow)),
 		confirmChan: make(chan bool, 1),
 		closed:      make(chan struct{}),
+	}
+	if tc.flowControl {
+		sc.flow = mfp.NewFlowWindow(int64(tc.cfg.StreamWindow))
+		sc.ack = mfp.NewAckTracker(tc.cfg.StreamWindow)
 	}
 
 	tc.mu.Lock()
@@ -556,6 +565,20 @@ func (tc *TunnelClient) readLoop() {
 			continue
 		}
 
+		// ACK releases uplink flow-control credit for bytes the server has
+		// already written to the target.
+		if frame.Header.Type == mfp.TypeACK {
+			if cum, ok := mfp.DecodeAck(frame.Data); ok {
+				tc.mu.Lock()
+				sc := tc.activeStreams[sid]
+				tc.mu.Unlock()
+				if sc != nil {
+					sc.flow.Ack(cum)
+				}
+			}
+			continue
+		}
+
 		// Note received bytes so direction balancing can compare directions.
 		if tc.balancer != nil {
 			tc.encoder.NoteRecv(uint64(len(frame.Data)))
@@ -643,12 +666,15 @@ type StreamConn struct {
 	closed      chan struct{}
 	closeOnce   sync.Once
 	leftover    []byte
+	flow        *mfp.FlowWindow
+	ack         *mfp.AckTracker
 }
 
 func (sc *StreamConn) Read(b []byte) (int, error) {
 	if len(sc.leftover) > 0 {
 		n := copy(b, sc.leftover)
 		sc.leftover = sc.leftover[n:]
+		sc.sendAck(n)
 		return n, nil
 	}
 
@@ -661,9 +687,36 @@ func (sc *StreamConn) Read(b []byte) (int, error) {
 		if n < len(data) {
 			sc.leftover = data[n:]
 		}
+		sc.sendAck(n)
 		return n, nil
 	case <-sc.closed:
+		// A RESET arrives right after the final DATA frames. Drain whatever is
+		// already queued before reporting EOF, otherwise the tail of the
+		// stream is silently dropped.
+		select {
+		case data, ok := <-sc.readChan:
+			if ok {
+				n := copy(b, data)
+				if n < len(data) {
+					sc.leftover = data[n:]
+				}
+				sc.sendAck(n)
+				return n, nil
+			}
+		default:
+		}
 		return 0, io.EOF
+	}
+}
+
+// sendAck tells the server how many downlink bytes the application has
+// consumed, which is what releases its flow-control window.
+func (sc *StreamConn) sendAck(n int) {
+	if sc.ack == nil || n <= 0 {
+		return
+	}
+	if cum, due := sc.ack.Consume(n); due {
+		_ = sc.client.sendFrame(mfp.TypeACK, sc.sid, 0, mfp.EncodeAck(cum), 0)
 	}
 }
 
@@ -681,7 +734,12 @@ func (sc *StreamConn) Write(b []byte) (int, error) {
 			chunk = chunk[:maxFrameDataSize]
 		}
 		jitter := sc.client.encoder.JitterDelayFor(len(chunk))
+		if err := sc.flow.Acquire(int64(len(chunk))); err != nil {
+			sc.Close()
+			return written, err
+		}
 		if err := sc.client.sendFrame(mfp.TypeDATA, sc.sid, 0, chunk, jitter); err != nil {
+			sc.flow.Refund(int64(len(chunk)))
 			return written, err
 		}
 		written += len(chunk)
@@ -693,6 +751,7 @@ func (sc *StreamConn) Write(b []byte) (int, error) {
 func (sc *StreamConn) Close() error {
 	sc.closeOnce.Do(func() {
 		close(sc.closed)
+		sc.flow.Close()
 		sc.client.removeStream(sc.sid)
 		// Best-effort RESET so the server can close its target immediately
 		// instead of waiting for a read timeout.
@@ -704,6 +763,7 @@ func (sc *StreamConn) Close() error {
 func (sc *StreamConn) CloseFromServer() {
 	sc.closeOnce.Do(func() {
 		close(sc.closed)
+		sc.flow.Close()
 	})
 }
 

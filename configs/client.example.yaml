@@ -27,7 +27,7 @@ keepalive_interval: "30s"
 handshake_timeout: "10s"
 # Per-stream downlink buffer budget (bytes). 8 MiB rides out consumer stalls;
 # it only fills when the local app stops reading.
-stream_window: 8388608
+stream_window: 1048576
 # Hard cap on streams per tunnel. The proxy listener is sized from
 # max_concurrent_streams x tunnel_connections (bounded to 512-4096).
 max_concurrent_streams: 512

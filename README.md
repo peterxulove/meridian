@@ -46,20 +46,35 @@ Meridian 是一个自定义安全代理协议，设计目标是在恶劣的网�
 
 ## 更新日志
 
+### v1.6.5（2026-10-29）
+
+#### 🚀 每流 ACK 流控（协议 v2）
+
+WSS 多隧道在高负载下会把小请求堵在大流后面（实测 4 路持续大流量时，新连接 TTFB 中位数 1.3s、p90 2.2s）。根因是整条 lane 共享一个 TCP 缓冲区，谁都能把几 MB 塞进去。本版加入真正的每流窗口：
+
+- 发送方每条流最多 `stream_window` 字节未确认在途，接收方按消费量回 `ACK`（累计字节数），阈值 `窗口/8`（16–256 KiB）。
+- 窗口耗尽即阻塞，因此排队时延被限制在约 `窗口 / 链路速率`（1 MiB @ 150 Mbps ≈ 55 ms），而单流吞吐仍为 `窗口 / RTT`。
+- ACK 累计且钳制在已发送字节内，重复/乱序/伪造都不会超额放行；60 秒拿不到信用则判定该流僵死并重置。
+- **向后兼容**：能力用 ClientHello 的标志位（0x08）声明，服务端支持时在 ServerHello 回版本 2；旧服务端会忽略该位并回版本 1，双方自动退回无窗口模式，不会卡死。
+
+#### 🐛 修复
+
+- 修复流结束时 `RESET` 与队列中最后一帧竞争导致的**尾部数据丢失**（并发压测中偶发少 20KB）。
+
 ### v1.6.4（2026-10-29）
 
 #### 🔧 配置项真正生效
 
 此前 `stream_window`、`max_concurrent_streams`、`session_lifetime` 只被解析、从未被代码读取，改了不起作用。本版全部接通：
 
-- **`stream_window`**：按字节预算决定单条流的下行缓冲帧数（`窗口 / 60KiB`，限制在 64–1024 帧）。客户端与服务端使用同一套换算，默认 8 MiB。
+- **`stream_window`**：按字节预算决定单条流的下行缓冲帧数（`窗口 / 60KiB`，限制在 64–1024 帧）。客户端与服务端使用同一套换算，默认 8 MiB。（v1.6.5 起改为每流在途字节窗口，见上。）
 - **`max_concurrent_streams`**：**每条隧道**的并发流上限。客户端超限时把连接切到其他 lane 重试，服务端超限时返回 `server busy`，避免单客户端耗尽文件描述符。本地代理监听器的总并发由 `max_concurrent_streams × tunnel_connections` 推导，并限制在 512–4096。
 - **`session_lifetime`**：每条外层连接到达寿命后进入 draining 状态，不再接收新流；存量流结束后（或超过 5 分钟宽限期）自动断开重连，定期刷新外层 TCP/TLS 连接指纹。设为 `0` 关闭。
 
 #### 🚀 部署
 
 - 新增 `./deploy.sh transport client|server [quic|websocket|hybrid|http-post]`，交互菜单第 9 项同样可用：只改传输相关配置，保留密码、SPKI、证书与本地端口，重启失败自动回滚。
-- `./deploy.sh optimize` 现在同时写入 `stream_window: 8388608` 与 `max_concurrent_streams: 512`。
+- `./deploy.sh optimize` 现在同时写入 `stream_window: 1048576` 与 `max_concurrent_streams: 512`。
 - 默认发布版本更新为 `v1.6.4`。
 
 ### v1.6.3（2026-10-29）
@@ -446,13 +461,13 @@ sudo ./deploy.sh transport client websocket # 或直接指定
 | 参数 | 作用 | 默认 | 取值范围 |
 |------|------|------|----------|
 | `tunnel_connections` | 客户端并行外层隧道数；每条隧道独立握手、独立密钥，按活跃流数分摊 | `4`（部署脚本生成） | 1–16 |
-| `stream_window` | 单条流的下行缓冲预算，换算为 `窗口 / 60KiB` 帧，限 64–1024 帧 | `8388608`（8 MiB） | 256 KiB–64 MiB |
+| `stream_window` | 单条流的**在途未确认字节上限**（每流 ACK 窗口）；排队时延 ≈ 窗口 / 链路速率 | `1048576`（1 MiB） | 256 KiB–16 MiB |
 | `max_concurrent_streams` | **每条隧道**的并发流上限；超限时客户端换 lane 重试，服务端回 `server busy` | `512` | 16–4096 |
 | `session_lifetime` | 外层连接寿命，到期后 drain（不再接新流）并重连；多 lane 自动错开 0–15%；`0` 关闭 | `1h` | 5m–24h |
 | `timing_jitter_ms` | 小帧随机延迟；大帧不受影响 | `0` | 0–100 |
 | `up_mbps` / `down_mbps` | QUIC 固定带宽提示；`0` 表示自适应 BBR | `0` | 0 或链路值 |
 
-`stream_window` 只在本地应用停止读取时才会被填满，它是抗卡顿余量而不是常驻内存；`max_concurrent_streams` 是每隧道上限，客户端本地代理的总并发按 `max_concurrent_streams × tunnel_connections` 推导（限制在 512–4096）。
+`stream_window` 现在同时决定吞吐与延迟：调大更抗抖动但排队更久，调小更跟手；单流吞吐上限约为 `窗口 / RTT`（1 MiB @ 55ms ≈ 145 Mbps）。`max_concurrent_streams` 是每隧道上限，客户端本地代理的总并发按 `max_concurrent_streams × tunnel_connections` 推导（限制在 512–4096）。
 
 ---
 
@@ -485,7 +500,7 @@ down_mbps: 0
 
 # ─── 连接与性能控制 ───
 max_clients: 1000
-stream_window: 8388608
+stream_window: 1048576
 max_concurrent_streams: 512
 keepalive_interval: "30s"
 handshake_timeout: "10s"
@@ -526,7 +541,7 @@ down_mbps: 0
 # ─── 连接优化 ───
 keepalive_interval: "30s"
 handshake_timeout: "10s"
-stream_window: 8388608
+stream_window: 1048576
 max_concurrent_streams: 512
 session_lifetime: "1h"
 dial_timeout: "15s"
@@ -817,6 +832,7 @@ go vet ./...
 - [x] **版本号构建注入** ✅ v1.6.0
 - [x] **多隧道并行 / QUIC+WebSocket 混合监听** ✅ v1.6.3
 - [x] **`stream_window` / `max_concurrent_streams` / `session_lifetime` 真正生效** ✅ v1.6.4
+- [x] **每流 ACK 流控（协议 v2，消除大流堵塞小流）** ✅ v1.6.5
 - [x] **`deploy.sh transport` 协议切换菜单** ✅ v1.6.4
 
 ---

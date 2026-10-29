@@ -264,12 +264,13 @@ const (
 	// the unit used to turn a byte budget into a per-stream queue depth.
 	FrameSizeHint = 60 * 1024
 
-	// DefaultStreamWindow is the per-stream downlink buffer budget. The queue
-	// only fills when the local consumer stalls, so 8 MiB is headroom rather
-	// than steady-state memory use.
-	DefaultStreamWindow = 8 << 20
+	// DefaultStreamWindow is the number of unacknowledged bytes one stream may
+	// have in flight. It is the latency/throughput knob: queueing delay is
+	// roughly window / link rate, so 1 MiB keeps a saturated 150 Mbps lane
+	// under ~55 ms while still allowing ~145 Mbps per stream at 55 ms RTT.
+	DefaultStreamWindow = 1 << 20
 	minStreamWindow     = 256 << 10
-	maxStreamWindow     = 64 << 20
+	maxStreamWindow     = 16 << 20
 
 	// DefaultMaxConcurrentStreams is the per-tunnel stream cap. It protects
 	// the server from one client exhausting file descriptors without getting
@@ -278,7 +279,7 @@ const (
 	minMaxConcurrentStreams     = 16
 	maxMaxConcurrentStreams     = 4096
 
-	minStreamQueueDepth = 64
+	minStreamQueueDepth = 16
 	maxStreamQueueDepth = 1024
 )
 
@@ -313,10 +314,12 @@ func NormalizeMaxConcurrentStreams(v uint32) uint32 {
 	return v
 }
 
-// StreamQueueDepth converts a byte budget into the number of DATA frames one
-// stream may buffer before it is treated as stalled.
+// StreamQueueDepth converts the in-flight window into the number of DATA
+// frames one stream may buffer before it is treated as stalled. With flow
+// control the sender can never exceed the window, so the queue only needs
+// that much space plus a small margin.
 func StreamQueueDepth(window uint64) int {
-	depth := int(NormalizeStreamWindow(window) / FrameSizeHint)
+	depth := int(NormalizeStreamWindow(window)/FrameSizeHint) + 8
 	if depth < minStreamQueueDepth {
 		return minStreamQueueDepth
 	}

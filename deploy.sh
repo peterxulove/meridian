@@ -12,7 +12,7 @@
 
 set -e
 
-DEFAULT_RELEASE_VERSION="v1.6.4"
+DEFAULT_RELEASE_VERSION="v1.6.5"
 
 # Re-execute with bash if run with sh
 if [ -z "$BASH_VERSION" ]; then
@@ -275,7 +275,7 @@ down_mbps: 0
 
 # ─── Connection Limits ───
 max_clients: 1000
-stream_window: 8388608
+stream_window: 1048576
 max_concurrent_streams: 512
 keepalive_interval: "30s"
 handshake_timeout: "10s"
@@ -362,7 +362,7 @@ timing_jitter_ms: 0.0
 # ─── Connection ───
 keepalive_interval: "30s"
 handshake_timeout: "10s"
-stream_window: 8388608
+stream_window: 1048576
 max_concurrent_streams: 512
 tunnel_connections: ${client_lanes}
 session_lifetime: "1h"
@@ -537,7 +537,7 @@ optimize_config() {
     set_yaml_key "$config_file" "timing_jitter_ms" "0.0"
     set_yaml_key "$config_file" "up_mbps" "0"
     set_yaml_key "$config_file" "down_mbps" "0"
-    set_yaml_key "$config_file" "stream_window" "8388608"
+    set_yaml_key "$config_file" "stream_window" "1048576"
     set_yaml_key "$config_file" "max_concurrent_streams" "512"
 
     restart_or_rollback "$role" "$config_file" "$backup_file"

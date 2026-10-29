@@ -264,6 +264,8 @@ type activeStream struct {
 	writeChan chan []byte
 	done      chan struct{}
 	closeOnce sync.Once
+	flow      *mfp.FlowWindow
+	ack       *mfp.AckTracker
 }
 
 const (
@@ -370,8 +372,18 @@ func (s *Server) handleTCPTunnel(conn net.Conn) {
 		})
 	}
 
+	// Per-stream ACK flow control needs both ends to understand ACK frames.
+	// The client advertises it with a ClientHello flag; echoing version 2 in
+	// ServerHello confirms the server also supports it. Version 1 clients get
+	// the old unlimited behaviour.
+	flowControl := hs.FlowControl
+	negotiatedVer := byte(1)
+	if flowControl {
+		negotiatedVer = 2
+	}
+
 	// Build & Send ServerHello
-	sh := buildServerHello(status, serverEKPub, serverRandomBytes, hs.ClientID)
+	sh := buildServerHello(negotiatedVer, status, serverEKPub, serverRandomBytes, hs.ClientID)
 	if _, err := conn.Write(sh); err != nil {
 		return
 	}
@@ -463,6 +475,7 @@ func (s *Server) handleTCPTunnel(conn net.Conn) {
 			fired = true
 			close(st.done)
 			st.conn.Close()
+			st.flow.Close()
 			mu.Lock()
 			if activeStreams[st.id] == st {
 				delete(activeStreams, st.id)
@@ -553,6 +566,20 @@ func (s *Server) handleTCPTunnel(conn net.Conn) {
 			continue
 		}
 
+		// ACK releases flow-control credit for bytes the client's application
+		// has consumed. It is cumulative, so duplicates are harmless.
+		if frame.Header.Type == mfp.TypeACK {
+			if cum, ok := mfp.DecodeAck(frame.Data); ok {
+				mu.Lock()
+				tc := activeStreams[sid]
+				mu.Unlock()
+				if tc != nil {
+					tc.flow.Ack(cum)
+				}
+			}
+			continue
+		}
+
 		if frame.Header.Type == mfp.TypeDATA {
 			flags := frame.Header.Flags
 			if flags == 0x01 {
@@ -631,6 +658,10 @@ func (s *Server) handleTCPTunnel(conn net.Conn) {
 						writeChan: make(chan []byte, queueDepth),
 						done:      make(chan struct{}),
 					}
+					if flowControl {
+						streamInfo.flow = mfp.NewFlowWindow(int64(s.cfg.StreamWindow))
+						streamInfo.ack = mfp.NewAckTracker(s.cfg.StreamWindow)
+					}
 
 					mu.Lock()
 					activeStreams[streamID] = streamInfo
@@ -659,6 +690,14 @@ func (s *Server) handleTCPTunnel(conn net.Conn) {
 									}
 									return
 								}
+								// Tell the client these bytes reached the target so it
+								// can release flow-control credit for them.
+								if cum, due := streamInfo.ack.Consume(len(data)); due {
+									if sendErr := send(mfp.TypeACK, streamID, 0, mfp.EncodeAck(cum)); sendErr != nil {
+										retireStream(streamInfo)
+										return
+									}
+								}
 							}
 						}
 					}()
@@ -674,7 +713,14 @@ func (s *Server) handleTCPTunnel(conn net.Conn) {
 						for {
 							rn, err := targetConn.Read(relayBuf)
 							if rn > 0 {
+								// Never let one bulk stream put more than the window
+								// on the wire: that is what keeps a new stream's
+								// first response from queueing behind megabytes.
+								if flowErr := streamInfo.flow.Acquire(int64(rn)); flowErr != nil {
+									break
+								}
 								if sendErr := send(mfp.TypeDATA, streamID, 0, relayBuf[:rn]); sendErr != nil {
+									streamInfo.flow.Refund(int64(rn))
 									closeTunnel()
 									return
 								}
@@ -713,11 +759,11 @@ func (s *Server) handleTCPTunnel(conn net.Conn) {
 	}
 }
 
-func buildServerHello(status byte, serverEKPub, serverRandom []byte, clientID [16]byte) []byte {
+func buildServerHello(version, status byte, serverEKPub, serverRandom []byte, clientID [16]byte) []byte {
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.BigEndian, uint32(0xDeadBeEF))
-	buf.WriteByte(1)      // version
-	buf.WriteByte(status) // status
+	buf.WriteByte(version) // negotiated version (mirrors the ClientHello)
+	buf.WriteByte(status)  // status
 	buf.Write(serverRandom)
 	buf.Write(serverEKPub)
 	buf.Write(make([]byte, 32))                    // server hash placeholder

@@ -20,6 +20,10 @@ const (
 	FlagResume = byte(0x01)
 	FlagWS     = byte(0x02)
 	FlagPad    = byte(0x04)
+	// FlagFlow advertises per-stream ACK flow control. It is a flag rather
+	// than a version bump so peers that predate it keep working: they ignore
+	// the bit, answer with version 1, and the session runs without a window.
+	FlagFlow = byte(0x08)
 
 	// Wire offsets within ClientHello (per spec §3.2)
 	OffMagic = 0
@@ -64,6 +68,8 @@ type Handshake struct {
 	ClientID         [16]byte
 	ServerID         [16]byte
 	NegotiatedCipher config.CipherID
+	Version          byte
+	FlowControl      bool
 	SessionLT        uint32
 	Extensions       []Extension
 	Keys             *crypto.KeyMaterial
@@ -100,6 +106,9 @@ func BuildClientHello(cfg config.ClientConfig, cr *[32]byte, pubECDHE []byte, re
 	if cfg.PaddingMode == config.PaddingFixed {
 		flags |= FlagPad
 	}
+	// Always advertise ACK flow control; the server echoes support by
+	// answering with version 2. Older servers simply ignore the bit.
+	flags |= FlagFlow
 	buf.WriteByte(flags)
 	binary.Write(buf, binary.BigEndian, uint16(1452)) // ClientMTU
 
@@ -171,8 +180,9 @@ func ParseClientHello(data []byte) (*Handshake, error) {
 		return nil, errors.New("mtp: ClientHello too short for ECDHE key")
 	}
 
-	hs := &Handshake{}
+	hs := &Handshake{Version: data[OffVer]}
 	hs.IsResume = (data[OffFlags] & FlagResume) != 0
+	hs.FlowControl = (data[OffFlags] & FlagFlow) != 0
 	copy(hs.ClientRandom[:], data[OffCRand:OffCRand+32])
 	hs.ClientECDHE = make([]byte, crypto.ECDHKeyLen) // Fix: fixed 32 bytes, not data[40] length
 	copy(hs.ClientECDHE, data[OffECDHE:OffECDHE+crypto.ECDHKeyLen])

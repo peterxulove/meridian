@@ -46,20 +46,35 @@ Meridian is a custom secure proxy protocol designed to deliver **undetectable en
 
 ## Changelog
 
+### v1.6.5 (2026-10-29)
+
+#### 🚀 Per-stream ACK flow control (wire v2)
+
+A saturated WebSocket lane used to queue small responses behind bulk data — measured 1.3 s median / 2.2 s p90 TTFB for a new request while four bulk streams ran. Each stream is now credit-windowed in both directions:
+
+- A sender may have at most `stream_window` unacknowledged bytes in flight; the receiver returns cumulative `ACK` frames (one per `window/8` bytes consumed, bounded to 16–256 KiB).
+- Queueing delay is bounded by roughly `window / link rate` (1 MiB at 150 Mbps ≈ 55 ms) while per-stream throughput stays `window / RTT`.
+- ACKs are cumulative and clamped to bytes actually sent, so duplicates or reordering cannot over-credit a stream; a stream with no credit for 60 s is reset.
+- **Backward compatible**: support is advertised with the `0x08` ClientHello flag and confirmed by version 2 in ServerHello. An older server ignores the bit and answers version 1, so both sides fall back to the unlimited behaviour instead of stalling.
+
+#### 🐛 Fixes
+
+- Fixed a race where `RESET` could win over the last queued frame and silently truncate the tail of a stream (observed as a missing ~20 KB under parallel load).
+
 ### v1.6.4 (2026-10-29)
 
 #### 🔧 Config keys that finally do something
 
 `stream_window`, `max_concurrent_streams` and `session_lifetime` were parsed but never read. All three are wired up now:
 
-- **`stream_window`**: converts a byte budget into per-stream downlink queue depth (`window / 60 KiB`, clamped to 64–1024 frames). Same maths on both ends, default 8 MiB.
+- **`stream_window`**: converts a byte budget into per-stream downlink queue depth (`window / 60 KiB`, clamped to 64–1024 frames). Same maths on both ends, default 8 MiB. (Redefined as an in-flight byte window in v1.6.5.)
 - **`max_concurrent_streams`**: per-tunnel stream cap. The client retries a saturated lane on another one; the server answers `server busy` instead of letting a single client exhaust its file descriptors. The local proxy listener is sized as `max_concurrent_streams × tunnel_connections`, bounded to 512–4096.
 - **`session_lifetime`**: a lane that reaches its lifetime drains — it stops taking new streams, closes once the remaining ones finish (or after a 5 minute grace), and reconnects, refreshing the outer TCP/TLS connection. `0` disables recycling.
 
 #### 🚀 Deployment
 
 - New `./deploy.sh transport client|server [quic|websocket|hybrid|http-post]` (also menu item 9): changes only transport-specific keys, keeps password, SPKI, certificates and listen port, and rolls back if the service fails to start.
-- `./deploy.sh optimize` now also writes `stream_window: 8388608` and `max_concurrent_streams: 512`.
+- `./deploy.sh optimize` now also writes `stream_window: 1048576` and `max_concurrent_streams: 512`.
 - Default release version is `v1.6.4`.
 
 ### v1.6.0 (2026-10-21)
@@ -393,7 +408,7 @@ change is rolled back if the service fails to restart.
 | Key | Meaning | Default | Range |
 |-----|---------|---------|-------|
 | `tunnel_connections` | Independent outer tunnels per client; each has its own handshake and keys, streams are spread by active load | `4` (deploy script) | 1–16 |
-| `stream_window` | Per-stream downlink buffer budget, converted to `window / 60KiB` frames | `8388608` (8 MiB) | 256 KiB–64 MiB |
+| `stream_window` | Per-stream **in-flight** byte window (ACK flow control); queueing delay ≈ window / link rate | `1048576` (1 MiB) | 256 KiB–16 MiB |
 | `max_concurrent_streams` | Stream cap **per tunnel**; the client retries another lane, the server answers `server busy` | `512` | 16–4096 |
 | `session_lifetime` | Outer connection lifetime; the lane drains and reconnects at expiry, `0` disables | `1h` | 5m–24h |
 | `timing_jitter_ms` | Random delay applied to small frames only | `0` | 0–100 |
@@ -432,7 +447,7 @@ timing_jitter_ms: 30.0
 
 # ─── Connection limits ───
 max_clients: 1000
-stream_window: 8388608
+stream_window: 1048576
 max_concurrent_streams: 512
 keepalive_interval: "30s"
 handshake_timeout: "10s"
@@ -471,7 +486,7 @@ timing_jitter_ms: 30.0
 # ─── Connection ───
 keepalive_interval: "30s"
 handshake_timeout: "10s"
-stream_window: 8388608
+stream_window: 1048576
 max_concurrent_streams: 512
 session_lifetime: "1h"
 dial_timeout: "15s"

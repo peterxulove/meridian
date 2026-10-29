@@ -1,4 +1,4 @@
-# Meridian Protocol Specification v1.1
+# Meridian Protocol Specification v1.2
 
 > A hybrid high-efficiency, anti-detection secure communication protocol.
 > Combines strengths of Shadowsocks, Hysteria/Hysteria2, VLESS, and REALITY.
@@ -9,6 +9,7 @@ Revision history:
 |---------|------|---------|
 | 1.0 | 2026-06 | Initial specification |
 | 1.1 | 2026-10-29 | Documented `QUIC+WebSocket` listener, multi-lane transport, real `stream_window` / `max_concurrent_streams` semantics, and session-lifetime draining |
+| 1.2 | 2026-10-29 | Per-stream ACK flow control (version 2 wire); `stream_window` is now a real in-flight byte window |
 
 ---
 
@@ -530,31 +531,55 @@ Client adapts sending rate accordingly.
 
 ### 6.2 Flow Control (Stream-level)
 
-Meridian does not use an explicit ACK/credit window. Flow control is
-receiver-driven backpressure over a bounded per-stream queue:
+Every stream is credit-windowed in each direction. A sender may have at most
+`stream_window` unacknowledged bytes in flight; the receiver returns credit
+with cumulative `ACK` frames as its application consumes data.
 
-- Every stream owns a queue of decoded DATA payloads. Its depth is derived from
-  the `stream_window` byte budget:
+```
+ACK frame (type 0x01, stream id = the data stream):
+  8 bytes: CUMULATIVE_CONSUMED [uint64, big endian]
+```
 
-  ```
-  depth = clamp(stream_window / 60 KiB, 64, 1024)      # 60 KiB = max DATA payload
-  ```
+Rules:
 
-  With the default `stream_window: 8388608` (8 MiB) that is 136 frames per
-  stream. Both roles compute the depth from their own config; the value is a
-  local memory/robustness knob, not a negotiated wire parameter.
-- The single read loop that serves a lane never blocks on a slow consumer. If a
-  stream's queue is full, that stream is reset (`RESET`) and the application
-  sees EOF, while every other stream on the lane keeps flowing.
-- A sender that outruns the receiver is throttled by the transport: the
-  receiver stops draining its socket, the kernel/QUIC receive window closes,
-  and the sender's writes block. There is no per-frame acknowledgement.
+- The sender reserves credit before writing a DATA frame and refunds it if the
+  write fails. When the window is exhausted it blocks until an ACK arrives.
+- The receiver emits one ACK per `window / 8` bytes consumed (bounded to
+  16–256 KiB), so the reverse direction carries a negligible amount of
+  overhead while credit is refilled promptly.
+- ACK counts are cumulative and are clamped to the bytes actually sent, so a
+  duplicated, reordered or forged ACK cannot over-credit a stream.
+- A sender that sees no credit for 60 seconds treats the stream as stalled,
+  resets it, and lets the application reconnect.
 
-The `0x01 ACK`, `0x02 CONGESTION` and `0x07 FLOW` frame types are reserved for a
-future credit-based scheme and are not emitted by this implementation; peers
-MUST ignore them rather than treat them as DATA.
+Why this exists: without a window, one bulk stream fills the shared socket
+buffer and every later frame — including the first response of a newly opened
+stream — queues behind it. Measured on a saturated 4-lane WebSocket tunnel,
+that produced ~1.3 s median / ~2.2 s p90 time-to-first-byte for small
+requests. Bounding in-flight bytes per stream limits queueing delay to roughly
+`stream_window / link rate` (1 MiB at 150 Mbps ≈ 55 ms) while leaving
+per-stream throughput at `window / RTT`.
 
-### 6.2.1 Concurrent stream cap
+### 6.2.1 Capability negotiation and fallback
+
+Flow control is advertised with the `0x08 FLOW` bit in the ClientHello flags
+byte rather than a protocol version bump, so peers that predate it keep
+working:
+
+- The client sets `FlagFlow` and still sends `CurrentVer` (1).
+- A server that understands it answers with version **2** in ServerHello byte
+  4 and enables windowing in both directions.
+- A server that does not understand it ignores the unknown bit, answers
+  version 1, and the session runs without a window — no ACK frames, receive
+  queue backpressure only.
+- An older client never sets the bit, so a new server keeps the same
+  unlimited behaviour for it and answers version 1.
+
+Both ends MUST NOT send ACK frames unless the session negotiated version 2.
+
+The `0x02 CONGESTION` and `0x07 FLOW` frame types remain reserved.
+
+### 6.2.2 Concurrent stream cap
 
 `max_concurrent_streams` caps how many streams one lane may carry at once
 (default 512, clamped to 16–4096):
@@ -709,7 +734,7 @@ type DefaultConfig struct {
     MaxPayloadSize      uint32       = 1452  // typical UDP MTU
     KeepaliveInterval   float32      = 30  // seconds
     HandshakeTimeout    float32      = 10  // seconds
-    StreamWindow        uint64       = 8388608  // 8MB per-stream queue budget
+    StreamWindow        uint64       = 1048576  // 1MB in-flight window per stream
     MaxConcurrentStreams uint32      = 512      // per lane
     TunnelConnections   int          = 4        // independent outer connections
     SessionLifetime     uint32       = 3600  // 1 hour
@@ -718,7 +743,7 @@ type DefaultConfig struct {
 }
 ```
 
-`StreamWindow` is clamped to 256 KiB–64 MiB, `MaxConcurrentStreams` to 16–4096,
+`StreamWindow` is clamped to 256 KiB–16 MiB, `MaxConcurrentStreams` to 16–4096,
 `TunnelConnections` to 1–16, and `SessionLifetime` to 5 minutes–24 hours (or `0`
 to disable recycling).
 

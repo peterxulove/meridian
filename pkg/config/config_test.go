@@ -31,12 +31,13 @@ func TestStreamQueueDepthTracksWindow(t *testing.T) {
 	}
 
 	huge := StreamQueueDepth(1 << 40)
-	if huge != maxStreamQueueDepth {
-		t.Fatalf("huge window depth = %d, want ceiling %d", huge, maxStreamQueueDepth)
+	wantHuge := int(maxStreamWindow/FrameSizeHint) + 8
+	if huge != wantHuge {
+		t.Fatalf("huge window depth = %d, want %d (window capped at %d)", huge, wantHuge, maxStreamWindow)
 	}
 
 	window := uint64(8 << 20)
-	want := int(window / FrameSizeHint)
+	want := int(window/FrameSizeHint) + 8
 	if got := StreamQueueDepth(window); got != want {
 		t.Fatalf("depth = %d, want %d", got, want)
 	}
