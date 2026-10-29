@@ -85,9 +85,11 @@ func TestDrainGraceBounds(t *testing.T) {
 		lifetime time.Duration
 		want     time.Duration
 	}{
-		{5 * time.Minute, 30 * time.Second},
-		{time.Hour, 5 * time.Minute},
-		{24 * time.Hour, 5 * time.Minute},
+		// A short lifetime still gets a usable grace, and a long one is capped
+		// so a never-ending stream cannot pin a lane forever.
+		{5 * time.Minute, 5 * time.Minute},
+		{time.Hour, 30 * time.Minute},
+		{24 * time.Hour, 30 * time.Minute},
 	}
 	for _, c := range cases {
 		if got := drainGrace(c.lifetime); got != c.want {

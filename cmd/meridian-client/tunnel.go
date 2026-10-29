@@ -822,6 +822,7 @@ func (sc *StreamConn) Write(b []byte) (int, error) {
 		}
 		jitter := sc.client.encoder.JitterDelayFor(len(chunk))
 		if err := sc.flow.Acquire(int64(len(chunk))); err != nil {
+			fmt.Printf("  [Tunnel] stream %d uplink stalled: %v\n", sc.sid, err)
 			sc.Close()
 			return written, err
 		}

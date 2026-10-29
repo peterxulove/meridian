@@ -1,4 +1,4 @@
-# Meridian Protocol Specification v1.5
+# Meridian Protocol Specification v1.6
 
 > A hybrid high-efficiency, anti-detection secure communication protocol.
 > Combines strengths of Shadowsocks, Hysteria/Hysteria2, VLESS, and REALITY.
@@ -13,6 +13,7 @@ Revision history:
 | 1.3 | 2026-10-29 | Local per-stream buffer is bounded in bytes, not frames; stall detection no longer truncates healthy streams |
 | 1.4 | 2026-10-29 | `QUIC` transport on the server binds UDP only; the legacy plaintext TCP listener is no longer opened |
 | 1.5 | 2026-10-30 | Handshake version 3: early data (pipelined CONNECT); server-side DNS cache |
+| 1.6 | 2026-10-30 | Address racing for target dials; flow-stall timeout raised to 10 min; lane drain waits for idle |
 
 ---
 
@@ -659,6 +660,18 @@ player opens several connections to hostnames it has not used before; without
 a cache each of those pays a full resolver round trip, measured at 130–160 ms
 on a cloud instance, before the TCP dial even starts. A failed dial
 invalidates the entry so a stale answer costs one attempt, not a session.
+
+Addresses for one host MUST be dialled with a staggered race (Meridian starts
+the next address after 200 ms, IPv4 first). Dialling them one after another is
+a defect: a host that publishes an IPv6 address the server cannot reach makes
+every stream wait for the whole dial timeout before the working IPv4 address is
+tried, and a slow target then looks like a broken tunnel.
+
+A sender MUST NOT treat "no credit for N seconds" as a dead stream on a short
+timer. Applications legitimately stop reading — a video player pauses once its
+buffer is full — and the window closes immediately when the stream or the
+tunnel is closed, so the timeout only needs to catch a consumer that hung
+forever. Meridian waits 10 minutes.
 
 ### 6.3 Keepalive & Heartbeat
 

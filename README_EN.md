@@ -46,6 +46,34 @@ Meridian is a custom secure proxy protocol designed to deliver **undetectable en
 
 ## Changelog
 
+### v1.6.9 (2026-10-30)
+
+#### 🐛 Fix: three problems that all look like "playback interrupted"
+
+1. **Happy Eyeballs was lost (regression from v1.6.8).** Caching DNS meant
+   resolving first and dialling addresses in order, so a host that resolves to
+   a blackholed IPv6 waited the full 10 s timeout before IPv4 was even tried,
+   then failed overall. `speedtest.tele2.net` reproduces it on the server: IPv6
+   connect times out, IPv4 is fine, and through the tunnel it became "hang for
+   10 s, then error". Addresses are now raced in parallel (IPv4 first, 200 ms
+   stagger), so a blackholed address costs 200 ms instead of everything.
+2. **Flow control reset a stream after 60 s without credit.** A player stops
+   reading when its buffer is full; pausing for a minute made the server reset
+   the stream, which shows up as an interruption with nothing in the logs.
+   Raised to 10 minutes, and resets now log their reason (`downlink stalled` /
+   `uplink stalled`).
+3. **A lane was force-closed 5 minutes after its lifetime.** When
+   `session_lifetime` expired the lane stopped taking new streams but was
+   closed after at most 5 minutes regardless, cutting whatever was playing on
+   it — with four lanes that is an interruption roughly every 15 minutes. It
+   now waits for idle, with a 30 minute hard cap and a log line when it fires.
+
+#### 🔍 Diagnostics
+
+Flow-control stalls, buffer overflows and forced lane closes now log
+explicitly, so a future interruption can be attributed to the protocol or to
+the upstream instead of guessed at.
+
 ### v1.6.8 (2026-10-30)
 
 #### 🚀 Faster playback start: early data + server-side DNS cache

@@ -15,7 +15,12 @@ var ErrFlowStalled = errors.New("mfp: stream stalled waiting for flow-control cr
 
 const (
 	// flowStallTimeout is how long a writer waits for credit before giving up.
-	flowStallTimeout = 60 * time.Second
+	// A video player routinely stops reading once its buffer is full and may
+	// resume minutes later; a short timeout turned those pauses into resets,
+	// which the player reports as an interrupted stream. A dead peer is still
+	// detected immediately because closing the tunnel or the stream closes the
+	// window, so this only has to catch an application that hangs forever.
+	flowStallTimeout = 10 * time.Minute
 	// defaultFlowWindow is used when a caller passes a non-positive window.
 	defaultFlowWindow = 1 << 20
 )

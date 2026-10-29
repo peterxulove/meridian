@@ -54,9 +54,21 @@ func NewServer(cfg config.ServerConfig) (*Server, error) {
 	}, nil
 }
 
-// dialTarget resolves addr through the cache and dials the first address that
-// accepts. Resolving here rather than inside net.Dial keeps a single lookup
-// per host per minute instead of one per stream.
+// dialFallbackDelay is how long one address gets before the next is dialled in
+// parallel. It mirrors the Happy Eyeballs default: a blackholed address (a
+// host that resolves to an unreachable IPv6, say) costs a fraction of a second
+// instead of the whole dial timeout, which is the difference between a slow
+// page and a failed one.
+const dialFallbackDelay = 200 * time.Millisecond
+
+type dialResult struct {
+	conn net.Conn
+	err  error
+}
+
+// dialTarget resolves addr through the cache and races its addresses.
+// Resolving here rather than inside net.Dial keeps a single lookup per host
+// per minute instead of one per stream.
 func (s *Server) dialTarget(ctx context.Context, addr string) (net.Conn, error) {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -70,20 +82,120 @@ func (s *Server) dialTarget(ctx context.Context, addr string) (net.Conn, error) 
 		return nil, err
 	}
 
-	dialer := net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
-	var lastErr error
-	for _, ip := range addrs {
-		conn, dialErr := dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip, port))
-		if dialErr == nil {
-			return conn, nil
+	conn, err := dialRace(ctx, preferIPv4(addrs), port)
+	if err != nil {
+		s.dns.Invalidate(host)
+	}
+	return conn, err
+}
+
+// preferIPv4 keeps IPv4 first and leaves the original order within a family.
+// The server's own IPv6 connectivity is not always usable, and racing means
+// the ordering only decides who starts first.
+func preferIPv4(addrs []string) []string {
+	out := make([]string, 0, len(addrs))
+	for _, a := range addrs {
+		if ip := net.ParseIP(a); ip != nil && ip.To4() != nil {
+			out = append(out, a)
 		}
-		lastErr = dialErr
 	}
-	s.dns.Invalidate(host)
-	if lastErr == nil {
-		lastErr = fmt.Errorf("dial %s: resolver returned no addresses", addr)
+	for _, a := range addrs {
+		if ip := net.ParseIP(a); ip == nil || ip.To4() == nil {
+			out = append(out, a)
+		}
 	}
-	return nil, lastErr
+	return out
+}
+
+// dialRace starts one address at a time, staggered, and returns the first
+// connection that succeeds. The losers are cancelled and their connections
+// closed.
+func dialRace(ctx context.Context, addrs []string, port string) (net.Conn, error) {
+	if len(addrs) == 0 {
+		return nil, errors.New("dial: resolver returned no addresses")
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	dialer := net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	results := make(chan dialResult, len(addrs))
+	var wg sync.WaitGroup
+	next := 0
+
+	launch := func() bool {
+		if next >= len(addrs) {
+			return false
+		}
+		ip := addrs[next]
+		next++
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip, port))
+			select {
+			case results <- dialResult{c, err}:
+			case <-ctx.Done():
+				if c != nil {
+					c.Close()
+				}
+			}
+		}()
+		return true
+	}
+
+	launch()
+	pending := 1
+	var firstErr error
+	timer := time.NewTimer(dialFallbackDelay)
+	defer timer.Stop()
+
+	for {
+		select {
+		case r := <-results:
+			pending--
+			if r.err == nil {
+				cancel()
+				go closeLateConns(&wg, results)
+				return r.conn, nil
+			}
+			if firstErr == nil {
+				firstErr = r.err
+			}
+			if pending == 0 && next >= len(addrs) {
+				if firstErr == nil {
+					firstErr = errors.New("dial: all addresses failed")
+				}
+				return nil, firstErr
+			}
+			if next < len(addrs) {
+				launch()
+				pending++
+			}
+		case <-timer.C:
+			if launch() {
+				pending++
+			}
+			timer.Reset(dialFallbackDelay)
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+}
+
+// closeLateConns closes connections produced by dial attempts that lost the
+// race after the winner was already returned.
+func closeLateConns(wg *sync.WaitGroup, results <-chan dialResult) {
+	wg.Wait()
+	for {
+		select {
+		case r := <-results:
+			if r.conn != nil {
+				r.conn.Close()
+			}
+		default:
+			return
+		}
+	}
 }
 
 // Start begins listening on the configured address.
@@ -793,6 +905,7 @@ func (s *Server) handleTCPTunnel(conn net.Conn) {
 								// on the wire: that is what keeps a new stream's
 								// first response from queueing behind megabytes.
 								if flowErr := streamInfo.flow.Acquire(int64(rn)); flowErr != nil {
+									fmt.Printf("  [Tunnel] stream %d downlink stalled: %v\n", streamID, flowErr)
 									break
 								}
 								if sendErr := send(mfp.TypeDATA, streamID, 0, relayBuf[:rn]); sendErr != nil {

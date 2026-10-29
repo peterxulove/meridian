@@ -188,6 +188,10 @@ func (c *Client) maintainTunnel(lane int) {
 					lane+1, len(c.tunnels), tunnel.ActiveLoad())
 			}
 			if tunnel.Draining() && (tunnel.ActiveLoad() == 0 || time.Now().After(drainDeadline)) {
+				if tunnel.ActiveLoad() > 0 {
+					fmt.Printf("  [Tunnel %d/%d] Drain grace expired with %d active, closing\n",
+						lane+1, len(c.tunnels), tunnel.ActiveLoad())
+				}
 				tunnel.Close()
 				break
 			}
@@ -205,13 +209,20 @@ func (c *Client) maintainTunnel(lane int) {
 }
 
 // drainGrace bounds how long a draining lane may keep its remaining streams.
+//
+// It has to be generous: a lane is closed forcibly once the grace expires, and
+// that kills whatever is running on it. With a 5 minute cap, a video playing
+// on a lane that reached its lifetime was cut mid-stream roughly every
+// lifetime/lanes minutes, which the player reports as an interruption. The
+// lane takes no new streams while draining, so waiting for it to go idle is
+// the normal path; the grace only bounds a stream that never ends.
 func drainGrace(lifetime time.Duration) time.Duration {
-	grace := lifetime / 10
-	if grace < 30*time.Second {
-		grace = 30 * time.Second
-	}
-	if grace > 5*time.Minute {
+	grace := lifetime / 2
+	if grace < 5*time.Minute {
 		grace = 5 * time.Minute
+	}
+	if grace > 30*time.Minute {
+		grace = 30 * time.Minute
 	}
 	return grace
 }
