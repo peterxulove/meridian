@@ -522,12 +522,20 @@ optimize_config() {
     $SUDO cp -p "$config_file" "$backup_file"
     echo -e "Configuration backup: ${backup_file}"
 
-    if [ "$role" = "server" ]; then
-        set_yaml_key "$config_file" "transport" '"QUIC+WebSocket"'
+    # Tuning must not silently rewrite the transport the operator chose:
+    # `optimize` used to force QUIC+WebSocket on servers and WebSocket on
+    # clients, so a QUIC-only deployment reverted on the next tune-up.
+    local current_transport
+    current_transport="$(grep -m1 '^transport:' "$config_file" | cut -d: -f2- | tr -d ' "')"
+    if [ -z "$current_transport" ]; then
+        if [ "$role" = "server" ]; then
+            set_yaml_key "$config_file" "transport" '"QUIC+WebSocket"'
+        else
+            set_yaml_key "$config_file" "transport" '"WebSocket"'
+        fi
         set_yaml_key "$config_file" "wss_path" '"/ws/"'
-    else
-        set_yaml_key "$config_file" "transport" '"WebSocket"'
-        set_yaml_key "$config_file" "wss_path" '"/ws/"'
+    fi
+    if [ "$role" = "client" ] && ! yaml_has_key "$config_file" "tunnel_connections"; then
         set_yaml_key "$config_file" "tunnel_connections" "4"
     fi
 

@@ -59,6 +59,10 @@ Meridian 是一个自定义安全代理协议，设计目标是在恶劣的网�
 
 实测：`transport: QUIC` 启动后 `lsof -i :<port>` 只有一条 UDP 记录，`nc -z` 连 TCP 直接失败，端到端 8MB 传输校验一致。
 
+#### 🔧 部署脚本：`optimize` 不再覆盖传输协议
+
+`./deploy.sh optimize` 以前无条件把服务端写成 `QUIC+WebSocket`、客户端写成 `WebSocket`，于是每次调优都会把 QUIC 部署悄悄改回 TCP 路径。现在只有配置里缺少 `transport` 键时才写入默认值，已有选择一律保留（脚本改动随 `main` 分发，无需新版本二进制）。
+
 ### v1.6.6（2026-10-29）
 
 #### 🐛 修复：慢消费者误判导致流被截断

@@ -66,6 +66,14 @@ behaviour.
 Verified: with `transport: QUIC` only a UDP socket is bound, `nc -z` on the TCP
 port fails, and an 8 MB end-to-end transfer matches checksums.
 
+#### 🔧 Deploy script: `optimize` no longer overrides the transport
+
+`./deploy.sh optimize` used to write `QUIC+WebSocket` for servers and
+`WebSocket` for clients unconditionally, so every tuning run quietly moved a
+QUIC deployment back to the TCP path. It now only writes a default when the
+`transport` key is missing, and preserves an explicit choice. (Script change
+only — it ships on `main`, no new binary.)
+
 ### v1.6.6 (2026-10-29)
 
 #### 🐛 Fix: slow-consumer false positive truncated streams
