@@ -27,6 +27,7 @@ type TunnelClient struct {
 	encoder       *mfp.Encoder
 	decoder       *mfp.Decoder
 	mu            sync.Mutex
+	writeMu       sync.Mutex
 	activeStreams map[uint32]*StreamConn
 	streamIDAlloc uint32
 	closed        atomic.Bool
@@ -35,7 +36,25 @@ type TunnelClient struct {
 	padCfg        mfp.PaddingConfig
 	balancer      *mfp.DirectionBalancer
 	closeCh       chan struct{}
+	lastRecv      atomic.Int64
 }
+
+const (
+	// DATA frame flags carrying the control-plane result of a CONNECT.
+	flagConnect      = 0x01
+	flagConnectError = 0x08
+
+	// streamReadQueueDepth bounds how much downlink data one stream may buffer
+	// before it is considered stuck. A slow/suspended consumer must never block
+	// the single read loop that serves every other stream.
+	streamReadQueueDepth = 256
+	// tunnelWriteTimeout bounds a single frame write. A peer that stops reading
+	// would otherwise pin writeMu (and every stream) forever.
+	tunnelWriteTimeout = 30 * time.Second
+	// maxDecodeFailures is the point at which the tunnel is assumed to be
+	// desynchronised and is torn down for a clean reconnect.
+	maxDecodeFailures = 16
+)
 
 // NewTunnelClient creates a new TunnelClient.
 func NewTunnelClient(cfg config.ClientConfig, sessionStore *mtp.SessionStore) *TunnelClient {
@@ -44,6 +63,7 @@ func NewTunnelClient(cfg config.ClientConfig, sessionStore *mtp.SessionStore) *T
 		activeStreams: make(map[uint32]*StreamConn),
 		handshakeDone: make(chan struct{}),
 		sessionStore:  sessionStore,
+		closeCh:       make(chan struct{}),
 	}
 }
 
@@ -254,7 +274,7 @@ func (tc *TunnelClient) DialStream(ctx context.Context, targetAddr string) (net.
 	sc := &StreamConn{
 		sid:         sid,
 		client:      tc,
-		readChan:    make(chan []byte, 1024),
+		readChan:    make(chan []byte, streamReadQueueDepth),
 		confirmChan: make(chan bool, 1),
 		closed:      make(chan struct{}),
 	}
@@ -263,25 +283,10 @@ func (tc *TunnelClient) DialStream(ctx context.Context, targetAddr string) (net.
 	tc.activeStreams[sid] = sc
 	tc.mu.Unlock()
 
-	// Send CONNECT frame
-	tc.mu.Lock()
-	connFrame, err := tc.encoder.Encode(sid, 0x01, []byte(targetAddr)) // Flags = 0x01: Connect Request
-	if err == nil && tc.encoder.ShouldRotate() {
-		if config.DebugMode {
-			fmt.Println("[DEBUG] Rotating keys on client encoder (connect)")
-		}
-		tc.encoder.RotateKeys()
-	}
-	if err != nil {
-		tc.mu.Unlock()
+	// Send CONNECT frame (Flags = 0x01: connect request).
+	if err := tc.sendFrame(mfp.TypeDATA, sid, flagConnect, []byte(targetAddr), 0); err != nil {
 		tc.removeStream(sid)
-		return nil, fmt.Errorf("tunnel: failed to encode connect frame: %w", err)
-	}
-	_, err = tc.tunnelConn.Write(connFrame)
-	tc.mu.Unlock()
-
-	if err != nil {
-		tc.removeStream(sid)
+		sc.CloseFromServer()
 		return nil, fmt.Errorf("tunnel: failed to send connect frame: %w", err)
 	}
 
@@ -290,6 +295,7 @@ func (tc *TunnelClient) DialStream(ctx context.Context, targetAddr string) (net.
 	case success := <-sc.confirmChan:
 		if !success {
 			tc.removeStream(sid)
+			sc.CloseFromServer()
 			if config.DebugMode {
 				fmt.Printf("[DEBUG] [Tunnel] Stream %d connection rejected by server\n", sid)
 			}
@@ -299,14 +305,25 @@ func (tc *TunnelClient) DialStream(ctx context.Context, targetAddr string) (net.
 			fmt.Printf("[DEBUG] [Tunnel] Stream %d connection established to %s\n", sid, targetAddr)
 		}
 	case <-ctx.Done():
-		tc.removeStream(sid)
+		tc.abortStream(sid)
 		return nil, ctx.Err()
+	case <-tc.closeCh:
+		tc.abortStream(sid)
+		return nil, errors.New("tunnel: closed while dialing")
 	case <-time.After(tc.cfg.DialTimeout):
-		tc.removeStream(sid)
+		tc.abortStream(sid)
 		return nil, errors.New("tunnel: dial timeout waiting for server response")
 	}
 
 	return sc, nil
+}
+
+// abortStream forgets a stream and tells the server to cancel a CONNECT that
+// may still be dialing. Without the RESET a late dial completion would leak a
+// target connection on the server for the lifetime of the tunnel.
+func (tc *TunnelClient) abortStream(sid uint32) {
+	tc.removeStream(sid)
+	go func() { _ = tc.sendFrame(mfp.TypeRESET, sid, 0, nil, 0) }()
 }
 
 func (tc *TunnelClient) removeStream(sid uint32) {
@@ -327,14 +344,27 @@ func (tc *TunnelClient) keepaliveLoop() {
 		case <-tc.done():
 			return
 		case <-ticker.C:
+			// If the server stops answering PINGs the tunnel is dead even
+			// though the socket may still look open. Close it so the
+			// supervisor reconnects instead of leaving every dial timing out.
+			timeout := 3 * tc.cfg.KeepaliveInterval
+			if timeout < 90*time.Second {
+				timeout = 90 * time.Second
+			}
+			if last := tc.lastRecv.Load(); last > 0 &&
+				time.Since(time.Unix(0, last)) > timeout {
+				fmt.Println("  [Tunnel] peer silent for too long, reconnecting")
+				tc.Close()
+				return
+			}
 			tc.sendKeepalive()
 		}
 	}
 }
 
 func (tc *TunnelClient) sendKeepalive() {
-	tc.mu.Lock()
-	defer tc.mu.Unlock()
+	tc.writeMu.Lock()
+	defer tc.writeMu.Unlock()
 
 	if tc.closed.Load() || tc.encoder == nil || tc.tunnelConn == nil {
 		return
@@ -344,14 +374,11 @@ func (tc *TunnelClient) sendKeepalive() {
 	payload := make([]byte, 8)
 	binary.BigEndian.PutUint64(payload, uint64(time.Now().UnixNano()))
 
-	frame, err := tc.encoder.EncodeType(mfp.TypePING, 0, 0, payload)
+	frame, boundary, err := tc.encoder.EncodeTypeAndRenew(mfp.TypePING, 0, 0, payload)
 	if err != nil {
 		return
 	}
-	if tc.encoder.ShouldRotate() {
-		tc.encoder.RotateKeys()
-	}
-	tc.tunnelConn.Write(frame)
+	frames := [][]byte{frame, boundary}
 
 	// Direction balancing: pad the send side with a dummy frame when the
 	// uplink/downlink ratio looks suspiciously one-sided.
@@ -361,41 +388,90 @@ func (tc *TunnelClient) sendKeepalive() {
 		// the peer and used to break the whole direction.
 		dummy, err := tc.encoder.DummyFrame()
 		if err == nil {
-			tc.tunnelConn.Write(dummy)
+			frames = append(frames, dummy)
 		}
+	}
+
+	if err := tc.writeWire(frames...); err != nil {
+		tc.Close()
 	}
 }
 
-// writeFrame writes an encoded frame to the tunnel, optionally pausing for
-// jitterNanos first to randomise packet timing.
-//
-// Callers must hold tc.mu. The jitter sleep runs in a goroutine-free way by
-// releasing nothing: jitter is at most a few tens of milliseconds and holding
-// the write lock for it is what makes pacing deterministic under concurrency.
-func (tc *TunnelClient) writeFrame(frame []byte, jitterNanos int64) (int, error) {
+// sendFrame encodes one frame and, when a rekey is due, its BOUNDARY marker,
+// then writes both while holding the tunnel write lock. Encoding and writing
+// are serialised so frames from different streams can never interleave.
+func (tc *TunnelClient) sendFrame(typ byte, sid uint32, flags byte, data []byte, jitterNanos int64) error {
+	tc.writeMu.Lock()
+	defer tc.writeMu.Unlock()
+
+	if tc.closed.Load() {
+		return net.ErrClosed
+	}
+	if tc.encoder == nil || tc.tunnelConn == nil {
+		return errors.New("tunnel: not connected")
+	}
+
 	if jitterNanos > 0 {
 		timer := time.NewTimer(time.Duration(jitterNanos))
 		select {
 		case <-timer.C:
-		case <-tc.done():
+		case <-tc.closeCh:
 			timer.Stop()
-			return 0, errors.New("tunnel: closed during jitter wait")
+			return errors.New("tunnel: closed during jitter wait")
 		}
 	}
-	return tc.tunnelConn.Write(frame)
+
+	frame, boundary, err := tc.encoder.EncodeTypeAndRenew(typ, sid, flags, data)
+	if err != nil {
+		return err
+	}
+	if err := tc.writeWire(frame, boundary); err != nil {
+		tc.Close()
+		return err
+	}
+	return nil
+}
+
+// writeWire writes frames in order under a deadline. Callers must hold
+// writeMu. A timeout means the frame stream is no longer trustworthy, so the
+// caller closes the tunnel.
+func (tc *TunnelClient) writeWire(frames ...[]byte) error {
+	tc.tunnelConn.SetWriteDeadline(time.Now().Add(tunnelWriteTimeout))
+	defer tc.tunnelConn.SetWriteDeadline(time.Time{})
+
+	for _, frame := range frames {
+		if len(frame) == 0 {
+			continue
+		}
+		if _, err := tc.tunnelConn.Write(frame); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // done returns a channel that is closed when the tunnel shuts down.
 func (tc *TunnelClient) done() <-chan struct{} {
-	if tc.closeCh == nil {
-		tc.closeCh = make(chan struct{})
-	}
 	return tc.closeCh
 }
 
 func (tc *TunnelClient) readLoop() {
 	defer tc.Close()
+
+	tc.lastRecv.Store(time.Now().UnixNano())
+	idleTimeout := time.Duration(0)
+	if tc.cfg.KeepaliveInterval > 0 {
+		idleTimeout = 3 * tc.cfg.KeepaliveInterval
+		if idleTimeout < 90*time.Second {
+			idleTimeout = 90 * time.Second
+		}
+	}
+	decodeFailures := 0
+
 	for {
+		if idleTimeout > 0 {
+			tc.tunnelConn.SetReadDeadline(time.Now().Add(idleTimeout))
+		}
 		frameData, err := readTCPFrame(tc.tunnelConn)
 		if err != nil {
 			return
@@ -403,16 +479,25 @@ func (tc *TunnelClient) readLoop() {
 
 		frame, err := tc.decoder.Decode(frameData)
 		if err != nil {
+			decodeFailures++
+			if decodeFailures >= maxDecodeFailures {
+				fmt.Println("  [Tunnel] downlink desynchronised, reconnecting")
+				return
+			}
 			continue
 		}
+		decodeFailures = 0
+		tc.lastRecv.Store(time.Now().UnixNano())
 
-		if tc.decoder.ShouldRotate() {
-			if config.DebugMode {
-				fmt.Println("[DEBUG] Rotating keys on client decoder")
+		// The server tells us which frame is the last one under the current
+		// key. Rotating here (instead of on a local timer) keeps both ends on
+		// the same frame even if their clocks or byte counters drift.
+		if frame.Header.Type == mfp.TypeBOUNDARY {
+			if err := tc.decoder.RotateKeys(); err != nil {
+				fmt.Printf("  [Tunnel] key rotation failed: %v\n", err)
+				return
 			}
-			if err := tc.decoder.RotateKeys(); err != nil && config.DebugMode {
-				fmt.Printf("[DEBUG] Failed to rotate decoder keys: %v\n", err)
-			}
+			continue
 		}
 
 		sid := frame.Header.StreamID
@@ -437,14 +522,42 @@ func (tc *TunnelClient) readLoop() {
 		sc, exists := tc.activeStreams[sid]
 		tc.mu.Unlock()
 
-		if exists {
-			if frame.Header.Type == mfp.TypeRESET {
-				sc.CloseFromServer()
-			} else if frame.Header.Type == mfp.TypeDATA {
-				if flags == 0x01 {
-					sc.confirmChan <- true
-				} else {
-					sc.readChan <- frame.Data
+		if !exists {
+			continue
+		}
+
+		switch frame.Header.Type {
+		case mfp.TypeRESET:
+			tc.removeStream(sid)
+			sc.CloseFromServer()
+		case mfp.TypeDATA:
+			switch flags {
+			case flagConnect:
+				select {
+				case sc.confirmChan <- true:
+				default:
+				}
+			case flagConnectError:
+				select {
+				case sc.confirmChan <- false:
+				default:
+				}
+			default:
+				// Never let one stalled SOCKS consumer block the shared read
+				// loop: if its queue is full, reset just that stream. The
+				// application sees EOF and retries on a fresh connection.
+				select {
+				case sc.readChan <- frame.Data:
+				case <-sc.closed:
+				case <-tc.closeCh:
+					return
+				default:
+					fmt.Printf("  [Tunnel] stream %d consumer stalled, resetting\n", sid)
+					tc.removeStream(sid)
+					sc.CloseFromServer()
+					go func(id uint32) {
+						_ = tc.sendFrame(mfp.TypeRESET, id, 0, nil, 0)
+					}(sid)
 				}
 			}
 		}
@@ -453,18 +566,24 @@ func (tc *TunnelClient) readLoop() {
 
 // Close gracefully closes the tunnel client.
 func (tc *TunnelClient) Close() {
-	if tc.closed.CompareAndSwap(false, true) {
-		if tc.closeCh != nil {
-			close(tc.closeCh)
-		}
-		if tc.tunnelConn != nil {
-			tc.tunnelConn.Close()
-		}
-		tc.mu.Lock()
-		for _, sc := range tc.activeStreams {
-			sc.CloseFromServer()
-		}
-		tc.mu.Unlock()
+	if !tc.closed.CompareAndSwap(false, true) {
+		return
+	}
+	close(tc.closeCh)
+	if tc.tunnelConn != nil {
+		tc.tunnelConn.Close()
+	}
+
+	tc.mu.Lock()
+	streams := make([]*StreamConn, 0, len(tc.activeStreams))
+	for _, sc := range tc.activeStreams {
+		streams = append(streams, sc)
+	}
+	tc.activeStreams = make(map[uint32]*StreamConn)
+	tc.mu.Unlock()
+
+	for _, sc := range streams {
+		sc.CloseFromServer()
 	}
 }
 
@@ -511,23 +630,8 @@ func (sc *StreamConn) Write(b []byte) (int, error) {
 	default:
 	}
 
-	sc.client.mu.Lock()
-	frame, err := sc.client.encoder.Encode(sc.sid, 0x00, b)
-	if err == nil && sc.client.encoder.ShouldRotate() {
-		if config.DebugMode {
-			fmt.Println("[DEBUG] Rotating keys on client encoder")
-		}
-		sc.client.encoder.RotateKeys()
-	}
 	jitter := sc.client.encoder.JitterDelay()
-	if err != nil {
-		sc.client.mu.Unlock()
-		return 0, err
-	}
-	_, err = sc.client.writeFrame(frame, jitter)
-	sc.client.mu.Unlock()
-
-	if err != nil {
+	if err := sc.client.sendFrame(mfp.TypeDATA, sc.sid, 0, b, jitter); err != nil {
 		return 0, err
 	}
 	return len(b), nil
@@ -537,16 +641,9 @@ func (sc *StreamConn) Close() error {
 	sc.closeOnce.Do(func() {
 		close(sc.closed)
 		sc.client.removeStream(sc.sid)
-		// Send RESET frame to server
-		sc.client.mu.Lock()
-		frame, err := sc.client.encoder.EncodeType(mfp.TypeRESET, sc.sid, 0, nil)
-		if err == nil {
-			if sc.client.encoder.ShouldRotate() {
-				sc.client.encoder.RotateKeys()
-			}
-			sc.client.tunnelConn.Write(frame)
-		}
-		sc.client.mu.Unlock()
+		// Best-effort RESET so the server can close its target immediately
+		// instead of waiting for a read timeout.
+		_ = sc.client.sendFrame(mfp.TypeRESET, sc.sid, 0, nil, 0)
 	})
 	return nil
 }
@@ -554,7 +651,6 @@ func (sc *StreamConn) Close() error {
 func (sc *StreamConn) CloseFromServer() {
 	sc.closeOnce.Do(func() {
 		close(sc.closed)
-		close(sc.readChan)
 	})
 }
 

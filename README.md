@@ -237,6 +237,8 @@ chmod +x deploy.sh
 **支持的指令：**
 * `./deploy.sh`：打开交互式部署主菜单。
 * `./deploy.sh status`：查看目前所有 Meridian 服务运行状态。
+* `./deploy.sh update client`：只更新客户端核心，保留现有 `client.yaml`、证书与服务定义；新核心启动失败会自动回滚。
+* `./deploy.sh update server`：只更新服务端核心，保留现有 `server.yaml`、证书与服务定义。
 * `./deploy.sh uninstall`：快捷卸载已安装的客户端或服务端。
 
 ---

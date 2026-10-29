@@ -227,6 +227,44 @@ func (e *Encoder) Encode(sid uint32, flags byte, data []byte) ([]byte, error) {
 func (e *Encoder) EncodeType(typ byte, sid uint32, flags byte, data []byte) ([]byte, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	return e.encodeLocked(typ, sid, flags, data)
+}
+
+// EncodeTypeAndRenew encodes a frame and, when the renewal policy fires,
+// returns an additional TypeBOUNDARY frame that tells the peer to switch to
+// the next key generation. The encoder advances its key only after both frames
+// have been produced, so the boundary frame itself still uses the old key.
+//
+// Rotation must be receiver-driven: the sender decides *which* frame is the
+// last one under the current key and announces it in-band. The receiver then
+// rotates after decrypting that marker. Clock- or byte-count-based rotation on
+// both ends independently is not safe — the two sides disagree by at least one
+// frame whenever their timers drift, after which every frame fails
+// authentication and the tunnel is permanently dead.
+func (e *Encoder) EncodeTypeAndRenew(typ byte, sid uint32, flags byte, data []byte) (frame, boundary []byte, err error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	frame, err = e.encodeLocked(typ, sid, flags, data)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !e.shouldRotateLocked() {
+		return frame, nil, nil
+	}
+
+	boundary, err = e.encodeLocked(TypeBOUNDARY, 0, 0, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := e.rotateLocked(); err != nil {
+		return nil, nil, err
+	}
+	return frame, boundary, nil
+}
+
+// encodeLocked performs the actual encoding. Callers must hold e.mu.
+func (e *Encoder) encodeLocked(typ byte, sid uint32, flags byte, data []byte) ([]byte, error) {
 
 	seq := e.Count
 	e.Count++
@@ -369,6 +407,12 @@ func (e *Encoder) DummyFrame() ([]byte, error) {
 func (e *Encoder) ShouldRotate() bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	return e.shouldRotateLocked()
+}
+
+// shouldRotateLocked reports whether the next frame must trigger a rekey.
+// Callers must hold e.mu.
+func (e *Encoder) shouldRotateLocked() bool {
 	if e.renewalLimit > 0 && e.bytesProcessed >= e.renewalLimit {
 		return true
 	}
@@ -381,6 +425,12 @@ func (e *Encoder) ShouldRotate() bool {
 func (e *Encoder) RotateKeys() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	return e.rotateLocked()
+}
+
+// rotateLocked derives and installs the next key generation.
+// Callers must hold e.mu.
+func (e *Encoder) rotateLocked() error {
 	e.generation++
 	newKeys, err := crypto.RotateKeyMaterial(e.Keys, e.generation)
 	if err != nil {

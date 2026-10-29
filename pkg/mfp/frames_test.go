@@ -212,6 +212,88 @@ func TestRenewalRotatesKeys(t *testing.T) {
 	}
 }
 
+// TestRekeyMarkerKeepsPeersInSync reproduces the failure that killed long
+// video sessions: both ends rotated to the next key based on their own clocks,
+// disagreed about which frame was the last one under the old key, and every
+// subsequent frame failed authentication forever.
+//
+// Rotation is now announced in-band. The encoder uses an aggressive interval
+// (every frame) while the decoder's own timer is set to "never": the decoder
+// must still stay in lockstep because it rotates only on the BOUNDARY marker.
+func TestRekeyMarkerKeepsPeersInSync(t *testing.T) {
+	keys := testKeys(t)
+	enc := NewEncoder(keys)
+	dec := NewUplinkDecoder(keys)
+
+	enc.SetRenewal(0, time.Nanosecond)
+	dec.SetRenewal(^uint64(0), time.Hour)
+
+	rotations := 0
+	for i := 0; i < 64; i++ {
+		payload := bytes.Repeat([]byte{byte(i)}, 64)
+
+		frame, marker, err := enc.EncodeTypeAndRenew(TypeDATA, 1, 0, payload)
+		if err != nil {
+			t.Fatalf("frame %d: EncodeTypeAndRenew: %v", i, err)
+		}
+
+		got, err := dec.Decode(frame)
+		if err != nil {
+			t.Fatalf("frame %d: Decode: %v", i, err)
+		}
+		if !bytes.Equal(got.Data, payload) {
+			t.Fatalf("frame %d: payload mismatch", i)
+		}
+
+		if len(marker) == 0 {
+			continue
+		}
+		rotations++
+		markerFrame, err := dec.Decode(marker)
+		if err != nil {
+			t.Fatalf("frame %d: decode rekey marker: %v", i, err)
+		}
+		if markerFrame.Header.Type != TypeBOUNDARY {
+			t.Fatalf("rekey marker type = %#x, want %#x", markerFrame.Header.Type, TypeBOUNDARY)
+		}
+		if err := dec.RotateKeys(); err != nil {
+			t.Fatalf("frame %d: RotateKeys: %v", i, err)
+		}
+	}
+
+	if rotations == 0 {
+		t.Fatal("expected at least one rekey marker")
+	}
+}
+
+// TestRekeyMarkerRequired pins the ordering contract: a peer that skips the
+// marker cannot decrypt the next generation.
+func TestRekeyMarkerRequired(t *testing.T) {
+	keys := testKeys(t)
+	enc := NewEncoder(keys)
+	dec := NewUplinkDecoder(keys)
+	enc.SetRenewal(1, 0)
+
+	first, marker, err := enc.EncodeTypeAndRenew(TypeDATA, 1, 0, []byte("one"))
+	if err != nil {
+		t.Fatalf("EncodeTypeAndRenew: %v", err)
+	}
+	if len(marker) == 0 {
+		t.Fatal("expected a rekey marker")
+	}
+	if _, err := dec.Decode(first); err != nil {
+		t.Fatalf("Decode first: %v", err)
+	}
+
+	second, _, err := enc.EncodeTypeAndRenew(TypeDATA, 1, 0, []byte("two"))
+	if err != nil {
+		t.Fatalf("EncodeTypeAndRenew second: %v", err)
+	}
+	if _, err := dec.Decode(second); err == nil {
+		t.Fatal("decoding the next generation without the marker must fail")
+	}
+}
+
 // TestEncodeTypeKeepsFrameType guards the bug where control frames were
 // encoded with Encode, which always writes TypeDATA and pushes the intended
 // type into Flags instead. The peer then never sees a typed control frame.

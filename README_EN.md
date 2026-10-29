@@ -239,6 +239,8 @@ chmod +x deploy.sh
 **Supported CLI parameters:**
 * `./deploy.sh`: Open the interactive deployment menu.
 * `./deploy.sh status`: Display status of installed Meridian services.
+* `./deploy.sh update client`: update the client core only. Existing `client.yaml`, certificates and service definitions are preserved; the previous binary is restored automatically if startup fails.
+* `./deploy.sh update server`: update the server core only while preserving its existing configuration.
 * `./deploy.sh uninstall`: Quickly uninstall client or server components.
 
 ---

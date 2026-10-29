@@ -7,7 +7,7 @@
 #   - OS: Linux (systemd) and macOS (launchd)
 #   - Architectures: amd64 and arm64
 #   - Roles: Server (with auto SSL & SPKI derivation) and Client (interactive config)
-#   - Actions: Install, Uninstall, Status
+#   - Actions: Install, Update (binary only, keep config), Uninstall, Status
 #
 
 set -e
@@ -469,6 +469,86 @@ uninstall_service() {
     echo -e "${GREEN}Uninstallation of Meridian $role completed successfully!${NC}"
 }
 
+# Restart an already-installed service without touching its config.
+restart_service() {
+    local role="$1"
+    local bin_name="meridian-${role}"
+
+    if [ "$OS" = "linux" ]; then
+        $SUDO systemctl restart "$bin_name"
+        sleep 2
+        $SUDO systemctl is-active --quiet "$bin_name"
+    elif [ "$OS" = "openwrt" ]; then
+        local service_file="/etc/init.d/${bin_name}"
+        [ -x "$service_file" ] || return 1
+        $SUDO "$service_file" restart >/dev/null 2>&1 || return 1
+        sleep 2
+        pgrep -f "${BIN_DIR}/${bin_name}" >/dev/null 2>&1
+    elif [ "$OS" = "darwin" ]; then
+        local plist_file="$HOME/Library/LaunchAgents/com.meridian.${role}.plist"
+        [ -f "$plist_file" ] || return 1
+        launchctl unload "$plist_file" >/dev/null 2>&1 || true
+        launchctl load "$plist_file" >/dev/null 2>&1 || return 1
+        sleep 1
+        launchctl list | grep -q "com.meridian.${role}"
+    else
+        return 1
+    fi
+}
+
+# Update the core binary only. The existing YAML config, certificates and
+# service definition are left exactly as they are; if the new binary fails to
+# come up, the previous binary is restored automatically.
+update_core() {
+    local role="$1"
+    local bin_name="meridian-${role}"
+    local target_bin="${BIN_DIR}/${bin_name}"
+    local config_file="${CONFIG_DIR}/${role}.yaml"
+    local backup_bin="${target_bin}.bak"
+
+    echo -e "${BLUE}Updating $bin_name (configuration will NOT be changed)...${NC}"
+
+    if [ ! -f "$config_file" ]; then
+        echo -e "${RED}[Error] $config_file not found. Use the install option first.${NC}"
+        return 1
+    fi
+    if [ ! -f "$target_bin" ]; then
+        echo -e "${RED}[Error] $target_bin not found. Use the install option first.${NC}"
+        return 1
+    fi
+
+    $SUDO cp -p "$target_bin" "$backup_bin"
+    echo -e "Previous binary saved to ${backup_bin}"
+
+    # install_binary only writes ${BIN_DIR}/${bin_name}; it never touches
+    # ${CONFIG_DIR}, so client.yaml and any certificates stay untouched.
+    if ! install_binary "$role"; then
+        echo -e "${RED}[Error] Failed to install the new binary. Restoring previous version...${NC}"
+        $SUDO mv -f "$backup_bin" "$target_bin"
+        return 1
+    fi
+
+    echo -e "${BLUE}Restarting ${bin_name}...${NC}"
+    if restart_service "$role"; then
+        $SUDO rm -f "$backup_bin"
+        echo -e "${GREEN}Update complete.${NC}"
+        echo -e "  Binary: ${target_bin}"
+        echo -e "  Config: ${config_file} ${GREEN}(unchanged)${NC}"
+        if [ "$role" = "client" ]; then
+            print_client_summary
+        else
+            echo -e "  Service: restarted successfully."
+        fi
+        return 0
+    fi
+
+    echo -e "${RED}[Error] The new binary did not start. Rolling back...${NC}"
+    $SUDO mv -f "$backup_bin" "$target_bin"
+    restart_service "$role" || true
+    echo -e "${YELLOW}Rolled back to the previous ${bin_name} binary.${NC}"
+    return 1
+}
+
 print_server_summary() {
     # Try to grab local public IP or local network IP
     local ip="YOUR_SERVER_IP"
@@ -513,6 +593,24 @@ ACTION="${1:-}"
 print_banner
 
 case "$ACTION" in
+    update)
+        role="${2:-}"
+        if [ -z "$role" ]; then
+            echo -e "Select what to update (config files are preserved):"
+            echo "1. Client core only"
+            echo "2. Server core only"
+            read -rp "Choice [1-2]: " upd_choice
+            case "$upd_choice" in
+                1) role="client" ;;
+                2) role="server" ;;
+                *) echo "Invalid choice"; exit 1 ;;
+            esac
+        fi
+        case "$role" in
+            client|server) update_core "$role" ;;
+            *) echo -e "${RED}Usage: $0 update [client|server]${NC}"; exit 1 ;;
+        esac
+        ;;
     uninstall)
         echo -e "Select role to uninstall:"
         echo "1. Server"
@@ -555,8 +653,10 @@ case "$ACTION" in
         echo "2. Install Meridian Client"
         echo "3. Uninstall Meridian (Server/Client)"
         echo "4. Show Service Status"
-        echo "5. Exit"
-        read -rp "Choice [1-5]: " choice
+        echo "5. Update Client Core (keep config)"
+        echo "6. Update Server Core (keep config)"
+        echo "7. Exit"
+        read -rp "Choice [1-7]: " choice
         
         case "$choice" in
             1)
@@ -608,6 +708,12 @@ case "$ACTION" in
                 fi
                 ;;
             5)
+                update_core "client"
+                ;;
+            6)
+                update_core "server"
+                ;;
+            7)
                 echo "Goodbye."
                 exit 0
                 ;;
