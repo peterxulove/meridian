@@ -41,6 +41,10 @@ type TunnelClient struct {
 	connectedAt   time.Time
 	draining      atomic.Bool
 	flowControl   bool
+	// earlyData means the server accepts DATA before CONNECT SUCCESS, so a new
+	// stream does not have to wait a round trip before the application can
+	// speak. It is negotiated as ServerHello version 3.
+	earlyData bool
 }
 
 // errLaneSaturated is returned when a lane already carries its configured
@@ -206,6 +210,8 @@ func (tc *TunnelClient) Connect() error {
 	// frames and honour the per-stream window; older servers do not, so we
 	// keep the historical unlimited behaviour for them.
 	tc.flowControl = respBuf[4] >= 2
+	// Version 3 also allows sending DATA before the server confirms the dial.
+	tc.earlyData = respBuf[4] >= 3
 
 	if resumeKeys != nil && status == 0 {
 		// Server accepted resume
@@ -266,6 +272,16 @@ func (tc *TunnelClient) Connect() error {
 	} else {
 		fmt.Printf("  [Tunnel] Handshake successful over %s! Cipher: MERIDIAN-CHACHA\n", tc.cfg.Transport)
 	}
+	if config.DebugMode {
+		features := "none"
+		switch {
+		case tc.earlyData:
+			features = fmt.Sprintf("flow-control + early-data (window %d KiB)", tc.cfg.StreamWindow/1024)
+		case tc.flowControl:
+			features = fmt.Sprintf("flow-control (window %d KiB)", tc.cfg.StreamWindow/1024)
+		}
+		fmt.Printf("[DEBUG] [Tunnel] Server features: %s\n", features)
+	}
 
 	tc.connectedAt = time.Now()
 
@@ -324,6 +340,17 @@ func (tc *TunnelClient) DialStream(ctx context.Context, targetAddr string) (net.
 	}
 
 	// Wait for confirmation (Flags = 0x01 from server)
+	//
+	// With early data the wait is skipped: the server queues whatever the
+	// application sends until its dial completes, which removes one round trip
+	// from every new connection (this is what the first video request of a
+	// playback session is most sensitive to). A dial failure then surfaces as
+	// a closed stream instead of a dial error, which the application handles
+	// the same way it handles any mid-transfer failure.
+	if tc.earlyData {
+		return sc, nil
+	}
+
 	select {
 	case success := <-sc.confirmChan:
 		if !success {
@@ -609,6 +636,17 @@ func (tc *TunnelClient) readLoop() {
 				case sc.confirmChan <- false:
 				default:
 				}
+				// In early-data mode nobody is waiting for the confirmation,
+				// so hand the failure to the application instead of leaving
+				// it with a silently closed stream.
+				if tc.earlyData {
+					reason := "tunnel: server rejected the connection"
+					if len(frame.Data) > 0 {
+						reason = "tunnel: " + string(frame.Data)
+					}
+					tc.removeStream(sid)
+					sc.failWith(errors.New(reason))
+				}
 			default:
 				// Never let one stalled SOCKS consumer block the shared read
 				// loop: if it holds more unread bytes than the flow-control
@@ -670,6 +708,10 @@ type StreamConn struct {
 	// flow-control window so a healthy stream is never reset mid-transfer.
 	buffered  atomic.Int64
 	maxBuffer int64
+	// readErr carries a server-side failure (rejected dial) to the application
+	// when the stream was opened with early data.
+	errMu   sync.Mutex
+	readErr error
 }
 
 // enqueue hands one DATA frame to the application reader. It reports false
@@ -713,7 +755,7 @@ func (sc *StreamConn) Read(b []byte) (int, error) {
 	select {
 	case data, ok := <-sc.readChan:
 		if !ok {
-			return 0, io.EOF
+			return 0, sc.readFailure()
 		}
 		n := copy(b, data)
 		if n < len(data) {
@@ -739,8 +781,19 @@ func (sc *StreamConn) Read(b []byte) (int, error) {
 			}
 		default:
 		}
-		return 0, io.EOF
+		return 0, sc.readFailure()
 	}
+}
+
+// readFailure reports a recorded server-side failure, or plain EOF.
+func (sc *StreamConn) readFailure() error {
+	sc.errMu.Lock()
+	err := sc.readErr
+	sc.errMu.Unlock()
+	if err != nil {
+		return err
+	}
+	return io.EOF
 }
 
 // sendAck tells the server how many downlink bytes the application has
@@ -799,6 +852,17 @@ func (sc *StreamConn) CloseFromServer() {
 		close(sc.closed)
 		sc.flow.Close()
 	})
+}
+
+// failWith records why the stream ended so a Read that was pipelined past
+// CONNECT SUCCESS can report the real cause instead of a bare EOF.
+func (sc *StreamConn) failWith(err error) {
+	sc.errMu.Lock()
+	if sc.readErr == nil {
+		sc.readErr = err
+	}
+	sc.errMu.Unlock()
+	sc.CloseFromServer()
 }
 
 func (sc *StreamConn) LocalAddr() net.Addr                { return &net.TCPAddr{IP: net.IPv4zero, Port: 0} }

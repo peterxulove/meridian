@@ -46,6 +46,41 @@ Meridian is a custom secure proxy protocol designed to deliver **undetectable en
 
 ## Changelog
 
+### v1.6.8 (2026-10-30)
+
+#### 🚀 Faster playback start: early data + server-side DNS cache
+
+Measured against an 85 ms path, a new connection used to cost:
+
+| Stage | Before | Why |
+|-------|--------|-----|
+| SOCKS CONNECT → tunnel confirmation | 126 ms | the client waited for the server's dial before replying |
+| TLS handshake | 129 ms | one round trip, as expected |
+| First byte | 125 ms | one round trip, as expected |
+
+Two changes:
+
+- **Early data (handshake version 3)**: the server registers the stream (queue
+  and flow window) as soon as it parses CONNECT and dials asynchronously; the
+  client no longer waits for `CONNECT SUCCESS`, so the local proxy answers the
+  application immediately and its first bytes (usually the TLS ClientHello)
+  travel in parallel with the dial. One round trip saved per new connection
+  (~90 ms on an 85 ms path). A failed dial is reported as `CONNECT failed` +
+  `RESET`, which the application sees as a mid-transfer close.
+- **Server-side DNS cache (60 s TTL, concurrent lookups collapsed)**: a player
+  opens several connections to `rr*.googlevideo.com` hosts it has not used
+  yet, and each one used to pay a cold lookup (measured 130–160 ms) on the
+  server. Now a host is resolved once a minute, and a failed dial invalidates
+  the entry immediately.
+
+Compatibility: version 3 is only sent to clients advertising `0x08 FLOW`; old
+clients read it as ">= 2" and never pipeline; a new client talking to a
+version 2 server falls back to waiting for the confirmation. All three
+combinations were tested.
+
+Local 8-way concurrency (4 full speed + 4 rate-limited): 8/8 checksums matched,
+zero `stalled` events.
+
 ### v1.6.7 (2026-10-29)
 
 #### 🐛 Fix: `transport: QUIC` still opened a plaintext TCP tunnel port

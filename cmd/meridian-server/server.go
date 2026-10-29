@@ -3,6 +3,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -33,6 +34,7 @@ type Server struct {
 	mirror       *transport.MirrorListener
 	ws           *transport.WSListener
 	sessionStore *mtp.SessionStore
+	dns          *dnsCache
 }
 
 // ServerStats tracks connection metrics.
@@ -48,7 +50,40 @@ func NewServer(cfg config.ServerConfig) (*Server, error) {
 	return &Server{
 		cfg:          cfg,
 		sessionStore: mtp.NewSessionStore(),
+		dns:          newDNSCache(),
 	}, nil
+}
+
+// dialTarget resolves addr through the cache and dials the first address that
+// accepts. Resolving here rather than inside net.Dial keeps a single lookup
+// per host per minute instead of one per stream.
+func (s *Server) dialTarget(ctx context.Context, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	addrs, err := s.dns.Resolve(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+
+	dialer := net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	var lastErr error
+	for _, ip := range addrs {
+		conn, dialErr := dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip, port))
+		if dialErr == nil {
+			return conn, nil
+		}
+		lastErr = dialErr
+	}
+	s.dns.Invalidate(host)
+	if lastErr == nil {
+		lastErr = fmt.Errorf("dial %s: resolver returned no addresses", addr)
+	}
+	return nil, lastErr
 }
 
 // Start begins listening on the configured address.
@@ -265,18 +300,49 @@ func (s *Server) startTCP() {
 
 type activeStream struct {
 	id        uint32
-	conn      net.Conn
 	writeChan chan []byte
 	done      chan struct{}
 	closeOnce sync.Once
 	flow      *mfp.FlowWindow
 	ack       *mfp.AckTracker
+	// conn is written once by the dial goroutine and read by retireStream, so
+	// both sides go through connMu. A stream is registered before its target
+	// is dialled, which is what lets the client send early data.
+	connMu sync.Mutex
+	conn   net.Conn
+	closed bool
 	// buffered counts bytes queued for the target but not yet written. It is
 	// the stall signal: the client can only have one flow-control window of
 	// unacknowledged bytes in flight, so holding more than that means this
 	// target has stopped draining and only this stream should be reset.
 	buffered  atomic.Int64
 	maxBuffer int64
+}
+
+// attachTarget installs the dialled connection. It reports false when the
+// stream was already retired while the dial was in flight, in which case the
+// caller must close the connection itself.
+func (as *activeStream) attachTarget(c net.Conn) bool {
+	as.connMu.Lock()
+	defer as.connMu.Unlock()
+	if as.closed {
+		return false
+	}
+	as.conn = c
+	return true
+}
+
+// closeTarget closes the target connection exactly once, whether the stream is
+// retired before or after its dial completes.
+func (as *activeStream) closeTarget() {
+	as.connMu.Lock()
+	as.closed = true
+	c := as.conn
+	as.conn = nil
+	as.connMu.Unlock()
+	if c != nil {
+		c.Close()
+	}
 }
 
 // enqueue hands one DATA frame to the target writer. It reports false when the
@@ -407,7 +473,11 @@ func (s *Server) handleTCPTunnel(conn net.Conn) {
 	flowControl := hs.FlowControl
 	negotiatedVer := byte(1)
 	if flowControl {
-		negotiatedVer = 2
+		// Version 3 additionally means the server accepts DATA for a stream
+		// before CONNECT SUCCESS, i.e. the client may pipeline its first bytes
+		// and save a round trip. Clients that predate it only check ">= 2" for
+		// flow control and never pipeline, so they are unaffected.
+		negotiatedVer = 3
 	}
 
 	// Build & Send ServerHello
@@ -446,9 +516,8 @@ func (s *Server) handleTCPTunnel(conn net.Conn) {
 
 	// Map of active StreamID -> target connection
 	activeStreams := make(map[uint32]*activeStream)
-	pendingDials := make(map[uint32]struct{})
 	streamLimit := int(s.cfg.MaxConcurrentStream)
-	var mu sync.Mutex      // protects activeStreams and pendingDials
+	var mu sync.Mutex      // protects activeStreams
 	var writeMu sync.Mutex // serialises encoder use and frame writes
 	tunnelClosed := new(atomic.Bool)
 
@@ -501,7 +570,7 @@ func (s *Server) handleTCPTunnel(conn net.Conn) {
 		st.closeOnce.Do(func() {
 			fired = true
 			close(st.done)
-			st.conn.Close()
+			st.closeTarget()
 			st.flow.Close()
 			mu.Lock()
 			if activeStreams[st.id] == st {
@@ -521,7 +590,6 @@ func (s *Server) handleTCPTunnel(conn net.Conn) {
 			streams = append(streams, st)
 		}
 		activeStreams = make(map[uint32]*activeStream)
-		pendingDials = make(map[uint32]struct{})
 		mu.Unlock()
 		for _, st := range streams {
 			retireStream(st)
@@ -584,7 +652,6 @@ func (s *Server) handleTCPTunnel(conn net.Conn) {
 
 		if frame.Header.Type == mfp.TypeRESET {
 			mu.Lock()
-			delete(pendingDials, sid)
 			tc := activeStreams[sid]
 			mu.Unlock()
 			if tc != nil {
@@ -600,7 +667,7 @@ func (s *Server) handleTCPTunnel(conn net.Conn) {
 				mu.Lock()
 				tc := activeStreams[sid]
 				mu.Unlock()
-				if tc != nil {
+				if tc != nil && tc.flow != nil {
 					tc.flow.Ack(cum)
 				}
 			}
@@ -623,8 +690,12 @@ func (s *Server) handleTCPTunnel(conn net.Conn) {
 				// tunnel may hold. The client turns this into a clean retry on
 				// another lane instead of an ever-growing dial storm.
 				mu.Lock()
-				atCapacity := streamLimit > 0 && len(activeStreams)+len(pendingDials) >= streamLimit
+				atCapacity := streamLimit > 0 && len(activeStreams) >= streamLimit
+				_, busy := activeStreams[sid]
 				mu.Unlock()
+				if busy {
+					continue
+				}
 				if atCapacity {
 					if err := send(mfp.TypeDATA, sid, flagConnectError,
 						[]byte("server busy: stream limit reached")); err != nil {
@@ -633,67 +704,43 @@ func (s *Server) handleTCPTunnel(conn net.Conn) {
 					continue
 				}
 
+				// Register the stream before dialling. The client does not
+				// wait for CONNECT SUCCESS: its first bytes (usually the TLS
+				// ClientHello) arrive while the dial is still in flight and
+				// queue here, which saves one round trip per new connection.
+				streamInfo := &activeStream{
+					id:        sid,
+					writeChan: make(chan []byte, config.StreamQueueFrames),
+					done:      make(chan struct{}),
+					maxBuffer: config.StreamBufferLimit(s.cfg.StreamWindow),
+				}
+				if flowControl {
+					streamInfo.flow = mfp.NewFlowWindow(int64(s.cfg.StreamWindow))
+					streamInfo.ack = mfp.NewAckTracker(s.cfg.StreamWindow)
+				}
 				mu.Lock()
-				_, busy := activeStreams[sid]
-				_, dialing := pendingDials[sid]
-				if !busy && !dialing {
-					pendingDials[sid] = struct{}{}
-				}
+				activeStreams[sid] = streamInfo
 				mu.Unlock()
-				if busy || dialing {
-					continue
-				}
 
-				go func(streamID uint32, addr string) {
-					// Perform dial directly on server (resolving DNS on server side!)
-					dialer := net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
-					targetConn, err := dialer.Dial("tcp", addr)
+				go func(streamID uint32, addr string, streamInfo *activeStream) {
+					// Dial on the server side, reusing cached DNS answers.
+					targetConn, err := s.dialTarget(context.Background(), addr)
 					if err != nil {
-						mu.Lock()
-						delete(pendingDials, streamID)
-						mu.Unlock()
-						if sendErr := send(mfp.TypeDATA, streamID, 0x08, []byte(err.Error())); sendErr != nil {
-							closeTunnel()
+						if retireStream(streamInfo) {
+							if sendErr := send(mfp.TypeDATA, streamID, 0x08, []byte(err.Error())); sendErr != nil {
+								closeTunnel()
+							}
 						}
 						return
 					}
 
 					// A RESET may have arrived while the dial was in flight; the
-					// pending entry is removed in that case, so do not resurrect
-					// the stream (which would leak the target connection).
-					mu.Lock()
-					_, stillPending := pendingDials[streamID]
-					closedNow := tunnelClosed.Load()
-					if stillPending && !closedNow {
-						delete(pendingDials, streamID)
-					}
-					mu.Unlock()
-					select {
-					case <-done:
-						targetConn.Close()
-						return
-					default:
-					}
-					if !stillPending || closedNow {
+					// stream is then already retired and must not be resurrected
+					// (that would leak the target connection).
+					if !streamInfo.attachTarget(targetConn) || tunnelClosed.Load() {
 						targetConn.Close()
 						return
 					}
-
-					streamInfo := &activeStream{
-						id:        streamID,
-						conn:      targetConn,
-						writeChan: make(chan []byte, config.StreamQueueFrames),
-						done:      make(chan struct{}),
-						maxBuffer: config.StreamBufferLimit(s.cfg.StreamWindow),
-					}
-					if flowControl {
-						streamInfo.flow = mfp.NewFlowWindow(int64(s.cfg.StreamWindow))
-						streamInfo.ack = mfp.NewAckTracker(s.cfg.StreamWindow)
-					}
-
-					mu.Lock()
-					activeStreams[streamID] = streamInfo
-					mu.Unlock()
 
 					// Send CONNECT SUCCESS frame (Flags = 0x01)
 					if err := send(mfp.TypeDATA, streamID, 0x01, []byte("OK")); err != nil {
@@ -759,7 +806,7 @@ func (s *Server) handleTCPTunnel(conn net.Conn) {
 							}
 						}
 					}()
-				}(sid, targetAddr)
+				}(sid, targetAddr, streamInfo)
 			} else {
 				// Standard DATA frame
 				mu.Lock()

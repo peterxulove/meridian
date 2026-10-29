@@ -1,4 +1,4 @@
-# Meridian Protocol Specification v1.4
+# Meridian Protocol Specification v1.5
 
 > A hybrid high-efficiency, anti-detection secure communication protocol.
 > Combines strengths of Shadowsocks, Hysteria/Hysteria2, VLESS, and REALITY.
@@ -12,6 +12,7 @@ Revision history:
 | 1.2 | 2026-10-29 | Per-stream ACK flow control (version 2 wire); `stream_window` is now a real in-flight byte window |
 | 1.3 | 2026-10-29 | Local per-stream buffer is bounded in bytes, not frames; stall detection no longer truncates healthy streams |
 | 1.4 | 2026-10-29 | `QUIC` transport on the server binds UDP only; the legacy plaintext TCP listener is no longer opened |
+| 1.5 | 2026-10-30 | Handshake version 3: early data (pipelined CONNECT); server-side DNS cache |
 
 ---
 
@@ -622,6 +623,42 @@ ordinary side effect of TCP segmentation on a fast link) can fill a
 frame-counted queue while holding only tens of kilobytes, resetting streams
 that were never stalled. That produced truncated downloads and video
 playback retries in v1.6.5.
+
+### 6.2.4 Early data (pipelined CONNECT)
+
+Waiting for `CONNECT SUCCESS` before the application may speak costs a full
+round trip on every new stream. On an 85 ms path that is ~90 ms added to the
+first byte of every connection, which is exactly what a player pays when it
+opens several connections to start a video.
+
+Version 3 of the handshake means the server accepts `DATA` for a stream before
+it answers `CONNECT SUCCESS`:
+
+- The server registers the stream (queue and flow window) as soon as it parses
+  the `CONNECT` frame, then dials the target asynchronously. Frames that
+  arrive during the dial queue in the stream's write channel and are flushed
+  to the target once the dial succeeds.
+- The client may send `DATA` immediately. It does not wait for the
+  confirmation, so the local proxy can answer the application right away.
+- A failed dial is reported with `0x08 CONNECT failed` followed by `RESET`.
+  Because the application has already been told the connection is up, it sees
+  the failure as a closed stream — the same handling as any mid-transfer
+  error.
+- The early data a client may send is bounded by its flow-control window, so
+  the server's queue is bounded too; no extra buffer accounting is needed.
+
+Version 3 is only sent to clients that set `0x08 FLOW`, and clients that
+predate it read the version as ">= 2" and simply never pipeline. A new client
+talking to a version 2 server keeps waiting for `CONNECT SUCCESS`.
+
+### 6.2.5 Name resolution
+
+The server resolves target names itself and SHOULD cache answers (Meridian
+uses a 60 s TTL with concurrent lookups collapsed into one query). A media
+player opens several connections to hostnames it has not used before; without
+a cache each of those pays a full resolver round trip, measured at 130–160 ms
+on a cloud instance, before the TCP dial even starts. A failed dial
+invalidates the entry so a stale answer costs one attempt, not a session.
 
 ### 6.3 Keepalive & Heartbeat
 
