@@ -53,6 +53,17 @@ jobs:
       - name: 下载依赖
         run: go mod download
 
+      - name: 计算版本号
+        id: version
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          case "$VERSION" in
+            v*) ;;
+            *) VERSION="dev-${GITHUB_SHA::7}" ;;
+          esac
+          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building $VERSION"
+
       - name: 运行测试
         if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
         run: go test ./test/integration/ -v -timeout 60s
@@ -63,10 +74,11 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 0
         run: |
-          mkdir -p dist
+          rm -rf out
+          mkdir -p out
           go build \
-            -ldflags="-s -w -X main.Version=${{ github.ref_name }} -X main.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            -o dist/meridian-server-${{ matrix.suffix }} \
+            -ldflags="-s -w -X main.Version=${{ steps.version.outputs.value }} -X main.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -o out/meridian-server-${{ matrix.suffix }} \
             ./cmd/meridian-server/
 
       - name: 编译客户端
@@ -76,21 +88,36 @@ jobs:
           CGO_ENABLED: 0
         run: |
           go build \
-            -ldflags="-s -w -X main.Version=${{ github.ref_name }} -X main.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            -o dist/meridian-client-${{ matrix.suffix }} \
+            -ldflags="-s -w -X main.Version=${{ steps.version.outputs.value }} -X main.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -o out/meridian-client-${{ matrix.suffix }} \
             ./cmd/meridian-client/
 
       - name: 验证产物
         run: |
           echo "=== 编译产物 ==="
-          ls -lh dist/
-          file dist/*
+          ls -lh out/
+          file out/*
+          # The repository tracks an old dist/ directory. If it ever leaks into
+          # the artifact set it can overwrite a freshly built binary during the
+          # merge, which is exactly how a v1.6.1 release shipped a v1.6.0
+          # binary. Fail the build if the injected version is missing.
+          for f in out/*; do
+            if ! grep -a -q "${{ steps.version.outputs.value }}" "$f"; then
+              echo "ERROR: $f does not contain version ${{ steps.version.outputs.value }}"
+              exit 1
+            fi
+          done
 
       - name: 上传构建产物（供 release job 使用）
         uses: actions/upload-artifact@v4
         with:
           name: binaries-${{ matrix.suffix }}
-          path: dist/
+          # Upload only this matrix job's two files. Uploading all of dist/
+          # makes every artifact carry stale copies of the other platforms,
+          # and download-artifact's merge then overwrites fresh binaries.
+          path: |
+            out/meridian-server-${{ matrix.suffix }}
+            out/meridian-client-${{ matrix.suffix }}
           retention-days: 1
 
   release:
@@ -101,6 +128,9 @@ jobs:
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
+
+      - name: 清理仓库中旧的 dist 目录
+        run: rm -rf dist
 
       - name: 下载全部编译产物
         uses: actions/download-artifact@v4
