@@ -24,22 +24,24 @@ func TestNormalizeStreamWindow(t *testing.T) {
 	}
 }
 
-func TestStreamQueueDepthTracksWindow(t *testing.T) {
-	small := StreamQueueDepth(1 << 10)
-	if small != minStreamQueueDepth {
-		t.Fatalf("tiny window depth = %d, want floor %d", small, minStreamQueueDepth)
+func TestStreamBufferLimitTracksWindow(t *testing.T) {
+	// A window below the floor is normalised first, so the limit must stay
+	// above the effective window.
+	small := StreamBufferLimit(1 << 10)
+	if small <= int64(minStreamWindow) {
+		t.Fatalf("tiny window limit = %d, want more than %d", small, minStreamWindow)
 	}
 
-	huge := StreamQueueDepth(1 << 40)
-	wantHuge := int(maxStreamWindow/FrameSizeHint) + 8
+	huge := StreamBufferLimit(1 << 40)
+	wantHuge := int64(maxStreamWindow) + 4*FrameSizeHint
 	if huge != wantHuge {
-		t.Fatalf("huge window depth = %d, want %d (window capped at %d)", huge, wantHuge, maxStreamWindow)
+		t.Fatalf("huge window limit = %d, want %d (window capped at %d)", huge, wantHuge, maxStreamWindow)
 	}
 
 	window := uint64(8 << 20)
-	want := int(window/FrameSizeHint) + 8
-	if got := StreamQueueDepth(window); got != want {
-		t.Fatalf("depth = %d, want %d", got, want)
+	want := int64(window) + 4*FrameSizeHint
+	if got := StreamBufferLimit(window); got != want {
+		t.Fatalf("limit = %d, want %d", got, want)
 	}
 }
 

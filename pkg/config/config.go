@@ -278,9 +278,6 @@ const (
 	DefaultMaxConcurrentStreams = 512
 	minMaxConcurrentStreams     = 16
 	maxMaxConcurrentStreams     = 4096
-
-	minStreamQueueDepth = 16
-	maxStreamQueueDepth = 1024
 )
 
 // NormalizeStreamWindow clamps a configured stream window to a sane range.
@@ -314,19 +311,19 @@ func NormalizeMaxConcurrentStreams(v uint32) uint32 {
 	return v
 }
 
-// StreamQueueDepth converts the in-flight window into the number of DATA
-// frames one stream may buffer before it is treated as stalled. With flow
-// control the sender can never exceed the window, so the queue only needs
-// that much space plus a small margin.
-func StreamQueueDepth(window uint64) int {
-	depth := int(NormalizeStreamWindow(window)/FrameSizeHint) + 8
-	if depth < minStreamQueueDepth {
-		return minStreamQueueDepth
-	}
-	if depth > maxStreamQueueDepth {
-		return maxStreamQueueDepth
-	}
-	return depth
+// StreamQueueFrames is the slot count of the per-stream frame channel. The
+// channel is only a hand-off buffer; the real backpressure threshold is
+// StreamBufferLimit, so it just needs enough slots for the smallest frames a
+// sender can emit.
+const StreamQueueFrames = 1024
+
+// StreamBufferLimit is how many unread bytes one stream may hold before it is
+// treated as stalled. Flow control caps what a sender can have in flight at
+// the window size, so exceeding the window (plus a frame of slack) can only
+// mean the local consumer stopped reading. Sizing this in bytes rather than
+// frames keeps a burst of small frames from resetting a healthy stream.
+func StreamBufferLimit(window uint64) int64 {
+	return int64(NormalizeStreamWindow(window)) + 4*FrameSizeHint
 }
 
 // NormalizeSessionLifetime clamps how long an outer connection may live before

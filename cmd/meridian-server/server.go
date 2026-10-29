@@ -266,6 +266,29 @@ type activeStream struct {
 	closeOnce sync.Once
 	flow      *mfp.FlowWindow
 	ack       *mfp.AckTracker
+	// buffered counts bytes queued for the target but not yet written. It is
+	// the stall signal: the client can only have one flow-control window of
+	// unacknowledged bytes in flight, so holding more than that means this
+	// target has stopped draining and only this stream should be reset.
+	buffered  atomic.Int64
+	maxBuffer int64
+}
+
+// enqueue hands one DATA frame to the target writer. It reports false when the
+// stream already holds more unread bytes than the peer could have in flight.
+func (as *activeStream) enqueue(data []byte) bool {
+	size := int64(len(data))
+	if as.maxBuffer > 0 && as.buffered.Load()+size > as.maxBuffer {
+		return false
+	}
+	as.buffered.Add(size)
+	select {
+	case as.writeChan <- data:
+		return true
+	case <-as.done:
+		as.buffered.Add(-size)
+		return true
+	}
 }
 
 const (
@@ -419,7 +442,6 @@ func (s *Server) handleTCPTunnel(conn net.Conn) {
 	// Map of active StreamID -> target connection
 	activeStreams := make(map[uint32]*activeStream)
 	pendingDials := make(map[uint32]struct{})
-	queueDepth := config.StreamQueueDepth(s.cfg.StreamWindow)
 	streamLimit := int(s.cfg.MaxConcurrentStream)
 	var mu sync.Mutex      // protects activeStreams and pendingDials
 	var writeMu sync.Mutex // serialises encoder use and frame writes
@@ -655,8 +677,9 @@ func (s *Server) handleTCPTunnel(conn net.Conn) {
 					streamInfo := &activeStream{
 						id:        streamID,
 						conn:      targetConn,
-						writeChan: make(chan []byte, queueDepth),
+						writeChan: make(chan []byte, config.StreamQueueFrames),
 						done:      make(chan struct{}),
+						maxBuffer: config.StreamBufferLimit(s.cfg.StreamWindow),
 					}
 					if flowControl {
 						streamInfo.flow = mfp.NewFlowWindow(int64(s.cfg.StreamWindow))
@@ -690,6 +713,7 @@ func (s *Server) handleTCPTunnel(conn net.Conn) {
 									}
 									return
 								}
+								streamInfo.buffered.Add(-int64(len(data)))
 								// Tell the client these bytes reached the target so it
 								// can release flow-control credit for them.
 								if cum, due := streamInfo.ack.Consume(len(data)); due {
@@ -741,14 +765,15 @@ func (s *Server) handleTCPTunnel(conn net.Conn) {
 					continue
 				}
 				// Never block the tunnel-wide dispatch loop on one slow target.
-				// If a stream cannot drain its queue, reset just that stream so
-				// the application reconnects; the other streams keep working.
+				// If a stream holds more unread bytes than the peer can have in
+				// flight, reset just that stream so the application reconnects;
+				// the other streams keep working.
 				select {
-				case tc.writeChan <- frame.Data:
-				case <-tc.done:
 				case <-done:
 					return
 				default:
+				}
+				if !tc.enqueue(frame.Data) {
 					fmt.Printf("  [Tunnel] stream %d stalled, resetting\n", sid)
 					if retireStream(tc) {
 						go send(mfp.TypeRESET, sid, 0, nil)

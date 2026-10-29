@@ -292,9 +292,10 @@ func (tc *TunnelClient) DialStream(ctx context.Context, targetAddr string) (net.
 	sc := &StreamConn{
 		sid:         sid,
 		client:      tc,
-		readChan:    make(chan []byte, config.StreamQueueDepth(tc.cfg.StreamWindow)),
+		readChan:    make(chan []byte, config.StreamQueueFrames),
 		confirmChan: make(chan bool, 1),
 		closed:      make(chan struct{}),
+		maxBuffer:   config.StreamBufferLimit(tc.cfg.StreamWindow),
 	}
 	if tc.flowControl {
 		sc.flow = mfp.NewFlowWindow(int64(tc.cfg.StreamWindow))
@@ -610,14 +611,10 @@ func (tc *TunnelClient) readLoop() {
 				}
 			default:
 				// Never let one stalled SOCKS consumer block the shared read
-				// loop: if its queue is full, reset just that stream. The
+				// loop: if it holds more unread bytes than the flow-control
+				// window allows in flight, reset just that stream. The
 				// application sees EOF and retries on a fresh connection.
-				select {
-				case sc.readChan <- frame.Data:
-				case <-sc.closed:
-				case <-tc.closeCh:
-					return
-				default:
+				if !sc.enqueue(frame.Data) {
 					fmt.Printf("  [Tunnel] stream %d consumer stalled, resetting\n", sid)
 					tc.removeStream(sid)
 					sc.CloseFromServer()
@@ -668,12 +665,47 @@ type StreamConn struct {
 	leftover    []byte
 	flow        *mfp.FlowWindow
 	ack         *mfp.AckTracker
+	// buffered counts bytes handed to this stream but not yet consumed by the
+	// application. maxBuffer is the stall threshold, derived from the
+	// flow-control window so a healthy stream is never reset mid-transfer.
+	buffered  atomic.Int64
+	maxBuffer int64
+}
+
+// enqueue hands one DATA frame to the application reader. It reports false
+// when the stream is holding more unread bytes than the sender could ever have
+// in flight, which means this consumer has stopped reading and the stream has
+// to be reset so it cannot pin memory or block the shared read loop.
+func (sc *StreamConn) enqueue(data []byte) bool {
+	size := int64(len(data))
+	if sc.maxBuffer > 0 && sc.buffered.Load()+size > sc.maxBuffer {
+		return false
+	}
+	sc.buffered.Add(size)
+	select {
+	case sc.readChan <- data:
+		return true
+	case <-sc.closed:
+		sc.buffered.Add(-size)
+		return true
+	case <-sc.client.closeCh:
+		sc.buffered.Add(-size)
+		return true
+	}
+}
+
+// consume accounts for bytes the application has taken off the queue.
+func (sc *StreamConn) consume(n int) {
+	if n > 0 {
+		sc.buffered.Add(-int64(n))
+	}
 }
 
 func (sc *StreamConn) Read(b []byte) (int, error) {
 	if len(sc.leftover) > 0 {
 		n := copy(b, sc.leftover)
 		sc.leftover = sc.leftover[n:]
+		sc.consume(n)
 		sc.sendAck(n)
 		return n, nil
 	}
@@ -687,6 +719,7 @@ func (sc *StreamConn) Read(b []byte) (int, error) {
 		if n < len(data) {
 			sc.leftover = data[n:]
 		}
+		sc.consume(n)
 		sc.sendAck(n)
 		return n, nil
 	case <-sc.closed:
@@ -700,6 +733,7 @@ func (sc *StreamConn) Read(b []byte) (int, error) {
 				if n < len(data) {
 					sc.leftover = data[n:]
 				}
+				sc.consume(n)
 				sc.sendAck(n)
 				return n, nil
 			}

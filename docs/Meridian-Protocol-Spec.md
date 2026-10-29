@@ -1,4 +1,4 @@
-# Meridian Protocol Specification v1.2
+# Meridian Protocol Specification v1.3
 
 > A hybrid high-efficiency, anti-detection secure communication protocol.
 > Combines strengths of Shadowsocks, Hysteria/Hysteria2, VLESS, and REALITY.
@@ -10,6 +10,7 @@ Revision history:
 | 1.0 | 2026-06 | Initial specification |
 | 1.1 | 2026-10-29 | Documented `QUIC+WebSocket` listener, multi-lane transport, real `stream_window` / `max_concurrent_streams` semantics, and session-lifetime draining |
 | 1.2 | 2026-10-29 | Per-stream ACK flow control (version 2 wire); `stream_window` is now a real in-flight byte window |
+| 1.3 | 2026-10-29 | Local per-stream buffer is bounded in bytes, not frames; stall detection no longer truncates healthy streams |
 
 ---
 
@@ -594,6 +595,26 @@ The `0x02 CONGESTION` and `0x07 FLOW` frame types remain reserved.
 The local proxy listener is sized as `max_concurrent_streams ×
 tunnel_connections`, clamped to 512–4096, so a multi-lane client is not
 throttled by a single lane's budget.
+
+### 6.2.3 Local buffering and stall detection
+
+Each stream keeps a hand-off queue between the tunnel read loop and the
+application socket. An implementation MUST bound that queue in **bytes**, not
+in frames:
+
+- The threshold is `stream_window + 4 × 60 KiB`.
+- Because flow control already caps in-flight bytes at `stream_window`, a
+  healthy stream can never reach the threshold: reaching it proves the local
+  consumer stopped reading.
+- Only then is the stream reset (`RESET`), and only that stream — the shared
+  read loop never blocks on a single slow consumer, so one stalled download
+  cannot add latency to every other stream.
+
+Counting frames instead of bytes is a defect: a burst of small frames (an
+ordinary side effect of TCP segmentation on a fast link) can fill a
+frame-counted queue while holding only tens of kilobytes, resetting streams
+that were never stalled. That produced truncated downloads and video
+playback retries in v1.6.5.
 
 ### 6.3 Keepalive & Heartbeat
 

@@ -46,6 +46,21 @@ Meridian is a custom secure proxy protocol designed to deliver **undetectable en
 
 ## Changelog
 
+### v1.6.6 (2026-10-29)
+
+#### 🐛 Fix: slow-consumer false positive truncated streams
+
+Production logs after v1.6.5 showed `stream N consumer stalled, resetting`, which surfaced as occasional video errors and truncated downloads. The stall test counted **frames**, not bytes: the queue was sized `window / 60 KiB`, i.e. 25 slots for a 1 MiB window, while DATA frames on a fast link are commonly 1–2 KiB. A ~35 KB burst therefore looked "stalled" and reset the stream long before the 1 MiB window could ever apply backpressure.
+
+- The threshold is now `stream_window + 4 × 60 KiB` **bytes**. Flow control already caps in-flight bytes at the window, so only a consumer that truly stopped reading can reach it.
+- The frame channel is a fixed 1024-slot hand-off buffer and no longer carries backpressure, so bursts of small frames cannot reset a healthy stream.
+- The server applies the same byte accounting on the write-to-target direction.
+- A reset still affects only its own stream; the shared read loop never blocks on one slow consumer.
+
+Verified locally (hybrid listener, `stream_window: 262144`): four full-speed plus four rate-limited 20 MB downloads, three runs — **24/24 checksums matched**, zero `stalled` events.
+
+No wire change; interoperates with v1.6.5 and v1.6.4.
+
 ### v1.6.5 (2026-10-29)
 
 #### 🚀 Per-stream ACK flow control (wire v2)
@@ -67,7 +82,7 @@ A saturated WebSocket lane used to queue small responses behind bulk data — me
 
 `stream_window`, `max_concurrent_streams` and `session_lifetime` were parsed but never read. All three are wired up now:
 
-- **`stream_window`**: converts a byte budget into per-stream downlink queue depth (`window / 60 KiB`, clamped to 64–1024 frames). Same maths on both ends, default 8 MiB. (Redefined as an in-flight byte window in v1.6.5.)
+- **`stream_window`**: converts a byte budget into per-stream downlink queue depth (`window / 60 KiB`, clamped to 64–1024 frames). Same maths on both ends, default 8 MiB. (Redefined as an in-flight byte window in v1.6.5; local buffering is byte-accounted since v1.6.6.)
 - **`max_concurrent_streams`**: per-tunnel stream cap. The client retries a saturated lane on another one; the server answers `server busy` instead of letting a single client exhaust its file descriptors. The local proxy listener is sized as `max_concurrent_streams × tunnel_connections`, bounded to 512–4096.
 - **`session_lifetime`**: a lane that reaches its lifetime drains — it stops taking new streams, closes once the remaining ones finish (or after a 5 minute grace), and reconnects, refreshing the outer TCP/TLS connection. `0` disables recycling.
 
