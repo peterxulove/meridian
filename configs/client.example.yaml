@@ -43,11 +43,11 @@ tunnel_connections: 4
 # connection is not kept alive indefinitely. 0 disables recycling.
 session_lifetime: "1h"
 dial_timeout: "15s"
-# Reclaims a stream that carried no byte in either direction for this long.
-# A player that abandons a connection without closing the socket leaves a
-# half-dead stream holding a slot; enough of them and the proxy refuses new
-# work while the tunnel still looks healthy. 0 disables reclamation.
-stream_idle_timeout: "10m"
+# How long a stream may carry no byte in either direction before it becomes a
+# candidate for reclamation. Candidates are only closed while the lane is 80%
+# full, so a paused video is not reset just because time passed — a paused
+# stream and a forgotten one look identical from here. 0 disables it.
+stream_idle_timeout: "30m"
 # Per-lane cap on connections waiting for the server to finish dialling.
 # Excess dials queue instead of all timing out together during a burst.
 # 0 disables the cap.

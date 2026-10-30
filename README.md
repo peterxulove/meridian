@@ -73,6 +73,29 @@ WSS、另一个常驻 QUIC。
 
 ## 更新日志
 
+### v1.6.15（2026-10-30）
+
+#### 🎬 不再按时间杀流：回收看压力，排空看活跃
+
+v1.6.14 的僵尸流回收是“10 分钟没有字节就 RESET”。问题在于**暂停的视频、浏览器留着的 keep-alive、被应用丢弃的连接，从字节流上看完全一样**。111 上的实例跑了 1.5 小时回收了 12 条，时间全部卡在 10m01s–10m30s；同一时段还有一次 `drain grace expired with 1 active, closing`——排空的 lane 宽限到点，把还在播的流一起关了。这两个在播放器侧都表现为“播放中断”，和 v1.6.9 修掉的那三条（Happy Eyeballs 回归、流控 60 秒静默重置、lane 5 分钟硬关）是同一类症状、不同的触发点。
+
+- **回收改成压力触发**：lane 达到 80% 并发上限才动手，房间够住就不赶人。正常浏览、暂停的视频都不会被定时器碰到；真挤了才按年龄淘汰，被丢弃的连接照样清得出去。
+- **阈值 10 分钟 → 30 分钟**：作为“最多能瞒多久”的上限，而不是“到点就杀”的日程表。
+- **排空宽限到点先判活**：两分钟内还有字节在动就续一期，只有全部流静默才关。轮换对空闲 lane 照常生效，在播的视频不会被切。
+- 附带：回收日志补上**目标地址**与当时的 lane 占用，下次能直接区分 googlevideo 和死连接。
+
+```
+[Summary] last 60s: conns=0 events=16 stream_idle=16 | stream_idle: tunnel: stream 16 (127.0.0.1:8081) idle for 55s, reclaimed (lane was 16/16 in use)
+```
+
+验证：
+
+- 单测 4 条：无压力不回收、满容量按年龄回收、汇总行带目标地址、`ActiveWithin` 判活。
+- 本地 e2e（同一套服务端、`stream_idle_timeout: 30s`）：容量 512 + 1 条静默流 → **120 秒没被回收**；容量 16 + 16 条静默流 → **55 秒内 16/16 回收**。
+- 排空续期：单 lane、`session_lifetime: 5m`、慢速源每 5 秒 64 字节。寿命到点进入 draining（`1 active`），5 分钟后宽限到点打出 `drain extended: 1/1 streams alive, next check in 5m0s` 而不是强制关闭；读端连续读了 **801 秒 / 11342 字节，一次没断**。
+
+这一版不改线路协议，服务端不用动。
+
 ### v1.6.14（2026-10-30）
 
 #### 🩺 让“卡死”留下证据：日志落盘、分钟级汇总、僵尸流回收
@@ -90,7 +113,7 @@ WSS、另一个常驻 QUIC。
 ```
 
 ​       每分钟的 `conns=` 也顺便替代了“每连接一行”的连接风暴证据，所以 `log_verbose` 默认关闭。
-- **僵尸流回收**（`stream_idle_timeout`，默认 10 分钟）。播放器丢弃连接但不关 socket 时，这条流会一直占着名额和窗口；攒够就表现为“隧道连着、应用全连不上”。超过阈值没有字节流动就回收，并给服务端发 RESET 关掉目标连接。
+- **僵尸流回收**（`stream_idle_timeout`，本版默认 10 分钟，v1.6.15 起改为 30 分钟且只在 lane 接近满时回收）。播放器丢弃连接但不关 socket 时，这条流会一直占着名额和窗口；攒够就表现为“隧道连着、应用全连不上”。超过阈值没有字节流动就回收，并给服务端发 RESET 关掉目标连接。
 - **单 lane 建连并发上限**（`max_pending_dials`，默认 64）。连接风暴时不再把几百个 dial 一起丢给服务端等超时：超出的排队（受调用方自己的 deadline 约束），前面的先跑完。
 - **时间戳统一到配置时区**（`log_timezone`，缺省跟随 `schedule_timezone`）。实测 110 的系统时区是 UTC、111 是 UTC+8，同一次事故两边的日志差 8 小时；现在两台机器的日志时间可以直接对齐。
 - **`deploy.sh` 不再吞掉时段表**。它生成 `client.yaml` 是整份覆盖，而模板里没有 `transport_schedule`：重跑一次部署，"晚上走 QUIC"就悄悄变成"24 小时 WebSocket"，还没有任何提示。现在模板里带注释示例，并且已有的 `transport_schedule` / `schedule_timezone` 会在重写后原样追加回去，同时打印一行 `Transport schedule preserved:`。
@@ -655,7 +678,7 @@ sudo ./deploy.sh transport client websocket # 或直接指定
 | `session_lifetime` | 外层连接寿命，到期后 drain（不再接新流）并重连；多 lane 自动错开 0–15%；`0` 关闭 | `1h` | 5m–24h |
 | `timing_jitter_ms` | 小帧随机延迟；大帧不受影响 | `0` | 0–100 |
 | `up_mbps` / `down_mbps` | QUIC 固定带宽提示；`0` 表示自适应 BBR | `0` | 0 或链路值 |
-| `stream_idle_timeout` | 单条流**双向都无字节**多久后回收（发 RESET 并释放名额）；`0` 关闭 | `10m` | 0 或 ≥30s |
+| `stream_idle_timeout` | 单条流**双向都无字节**多久后成为回收候选；只在 lane 达到 80% 并发上限时才真的回收（发 RESET 并释放名额）；`0` 关闭 | `30m` | 0 或 ≥30s |
 | `max_pending_dials` | **每条 lane** 同时在建连的上限；超出的排队而不是直接失败；`0` 关闭 | `64` | 0–4096 |
 
 `stream_window` 现在同时决定吞吐与延迟：调大更抗抖动但排队更久，调小更跟手；单流吞吐上限约为 `窗口 / RTT`（1 MiB @ 55ms ≈ 145 Mbps）。`max_concurrent_streams` 是每隧道上限，客户端本地代理的总并发按 `max_concurrent_streams × tunnel_connections` 推导（限制在 512–4096）。

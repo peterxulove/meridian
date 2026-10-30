@@ -46,6 +46,53 @@ Meridian is a custom secure proxy protocol designed to deliver **undetectable en
 
 ## Changelog
 
+### v1.6.15 (2026-10-30)
+
+#### 🎬 Stop killing streams on a timer: reclaim under pressure, drain by liveness
+
+v1.6.14 reclaimed a stream after 10 minutes without a byte. The trouble is that
+**a paused video, a keep-alive socket the browser still intends to use, and a
+connection the application forgot are identical from the byte stream**. The
+instance on router 111 reclaimed 12 streams in 1.5 hours, every one of them
+between 10m01s and 10m30s, and in the same window logged
+`drain grace expired with 1 active, closing` — a retired lane whose grace ran
+out took a playing stream with it. Both look like "playback interrupted" to the
+viewer, and both belong to the same family as the three causes fixed in v1.6.9
+(the Happy Eyeballs regression, the 60 second flow stall, the 5 minute lane
+close), just with different triggers.
+
+- **Reclamation is gated on lane pressure**: it starts at 80% of the lane's
+  stream cap. While there is room, nothing is evicted — ordinary browsing and a
+  paused video are never touched by a timer. When the lane does fill, the oldest
+  streams go, so a forgotten connection is still cleaned out.
+- **Threshold 10 → 30 minutes**, as a ceiling on how long a leak can hide
+  rather than a schedule that kills idle streams.
+- **A draining lane is checked for life before its grace expires**: if any
+  stream moved a byte in the last two minutes the deadline is pushed forward,
+  and only a lane whose streams have all gone silent is closed. Rotation still
+  happens for idle lanes; a playing video is never cut.
+- Reclamation logs now name the **target address** and the lane occupancy, so
+  "is the client killing my video?" is answerable from the log.
+
+```
+[Summary] last 60s: conns=0 events=16 stream_idle=16 | stream_idle: tunnel: stream 16 (127.0.0.1:8081) idle for 55s, reclaimed (lane was 16/16 in use)
+```
+
+Verification:
+
+- Four new unit tests: no reclamation without pressure, age-based reclamation on
+  a full lane, target address in the summary line, `ActiveWithin` liveness.
+- Local end to end (same server, `stream_idle_timeout: 30s`): a lane with room
+  for 512 and one silent stream → **untouched after 120s**; a lane capped at 16
+  with 16 silent streams → **16/16 reclaimed within 55s**.
+- Drain: one lane, `session_lifetime: 5m`, a slow source emitting 64 bytes every
+  5 seconds. The lane starts draining at its lifetime, and when the grace
+  expires five minutes later it logs
+  `drain extended: 1/1 streams alive, next check in 5m0s` instead of closing;
+  the reader pulled **11342 bytes over 801 seconds without one break**.
+
+No wire-format change; the server does not need an update.
+
 ### v1.6.14 (2026-10-30)
 
 #### 🩺 Make a freeze leave evidence: file logging, per-minute summaries, half-dead stream reclamation
@@ -73,7 +120,7 @@ Four changes:
 
 ​       `conns=` also replaces the per-connection flood as evidence of a
 connection storm, which is why `log_verbose` defaults to off.
-- **Reclaim half-dead streams** (`stream_idle_timeout`, default 10 minutes).
+- **Reclaim half-dead streams** (`stream_idle_timeout`, 10 minutes in this release; 30 minutes and pressure-gated from v1.6.15).
   When a player drops a connection without closing the socket, the stream keeps
   its slot and its window forever; enough of them and the tunnel looks
   connected while applications cannot connect at all. A stream with no bytes in
@@ -650,7 +697,7 @@ change is rolled back if the service fails to restart.
 | `session_lifetime` | Outer connection lifetime; the lane drains and reconnects at expiry, `0` disables | `1h` | 5m–24h |
 | `timing_jitter_ms` | Random delay applied to small frames only | `0` | 0–100 |
 | `up_mbps` / `down_mbps` | Fixed QUIC bandwidth hint; `0` selects adaptive BBR | `0` | 0 or link rate |
-| `stream_idle_timeout` | Reclaim a stream that carried **no byte in either direction** for this long (RESET, slot freed); `0` disables | `10m` | 0 or ≥30s |
+| `stream_idle_timeout` | A stream with **no byte in either direction** for this long becomes a reclamation candidate; it is only actually reclaimed when the lane is at 80% of `max_concurrent_streams` (RESET, slot freed); `0` disables | `30m` | 0 or ≥30s |
 | `max_pending_dials` | Concurrent dials awaiting the server, **per lane**; the rest queue instead of failing; `0` disables | `64` | 0–4096 |
 
 The local proxy listener is sized as `max_concurrent_streams ×

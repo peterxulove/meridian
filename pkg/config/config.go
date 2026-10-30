@@ -143,11 +143,17 @@ type ClientConfig struct {
 	RenewalInterval  time.Duration `yaml:"renewal_interval" json:"renewal_interval"`
 	RenewalDataLimit uint64        `yaml:"renewal_data_limit" json:"renewal_data_limit"`
 
-	// StreamIdleTimeout reclaims a stream that carried no byte in either
-	// direction for this long. A player that abandons a connection without
-	// closing its socket leaves a half-dead stream holding a slot forever;
-	// without this the slots fill up and every new connection is refused while
-	// the tunnel still looks healthy. Zero disables reclamation.
+	// StreamIdleTimeout is how long a stream may carry no byte in either
+	// direction before it becomes a candidate for reclamation. A player that
+	// abandons a connection without closing its socket leaves a half-dead
+	// stream holding a slot; enough of them and every new connection is
+	// refused while the tunnel still looks healthy.
+	//
+	// Being a candidate is not enough to be closed: the reaper only acts when
+	// the lane is near its stream cap (see reapIdle). A paused video and a
+	// forgotten socket are indistinguishable from the byte stream alone, so
+	// the client must not throw streams away while it has room to keep them.
+	// Zero disables reclamation.
 	StreamIdleTimeout time.Duration `yaml:"stream_idle_timeout" json:"stream_idle_timeout"`
 
 	// MaxPendingDials bounds how many streams on one lane may be waiting for
@@ -517,10 +523,12 @@ func NormalizeTunnelConnections(n int) int {
 // Client-side operational defaults.
 const (
 	// DefaultStreamIdleTimeout is how long a stream may carry no traffic
-	// before the client reclaims it. Abandoned player connections are the
-	// reason this exists; the value is well above any legitimate idle period a
-	// browser or media player keeps open.
-	DefaultStreamIdleTimeout = 10 * time.Minute
+	// before the client may reclaim it. 30 minutes sits above the pauses a
+	// viewer actually takes: a video paused at 10 minutes was being reset
+	// mid-session, which the player reports as an interruption. Reclamation is
+	// additionally gated on lane pressure, so this is a ceiling on how long a
+	// forgotten stream survives a squeeze, not a timer that kills idle ones.
+	DefaultStreamIdleTimeout = 30 * time.Minute
 	// minStreamIdleTimeout protects against a config that would shred healthy
 	// connections. Zero still means "disabled".
 	minStreamIdleTimeout = 30 * time.Second

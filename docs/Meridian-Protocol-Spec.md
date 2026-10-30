@@ -1,4 +1,4 @@
-# Meridian Protocol Specification v1.9
+# Meridian Protocol Specification v1.10
 
 > A hybrid high-efficiency, anti-detection secure communication protocol.
 > Combines strengths of Shadowsocks, Hysteria/Hysteria2, VLESS, and REALITY.
@@ -18,6 +18,7 @@ Revision history:
 | 1.7.1 | 2026-10-30 | Schedule windows are evaluated in an explicitly configured zone |
 | 1.8 | 2026-10-30 | Handshake surface: browser-only client ALPN, CA-issued certificate, cover-site response for unauthenticated requests |
 | 1.9 | 2026-10-30 | Idle stream reclamation on the client (RESET after `stream_idle_timeout`); per-lane dial admission (`max_pending_dials`) |
+| 1.10 | 2026-10-30 | Reclamation gated on lane pressure rather than age alone (`stream_idle_timeout` default 30m); a draining lane is extended while it still carries an active stream |
 
 ---
 
@@ -787,18 +788,35 @@ lands on.
 Both rules are local to the client; neither changes the wire format.
 
 **Idle reclamation.** A stream that carries no byte in either direction for
-`stream_idle_timeout` (default `10m`, `0` disables) is closed by the client,
-which sends `RESET` for that stream so the server tears down its target
-connection instead of holding it until the target itself times out. This exists
-because an application may abandon a connection without closing the socket
-(players replace connections as they seek); those half-dead streams otherwise
-keep their slot and their share of the credit window indefinitely, and enough
-of them make a healthy tunnel refuse new work.
+`stream_idle_timeout` (default `30m`, `0` disables) becomes a *candidate* for
+reclamation. A candidate is closed only while its lane is at or above 80% of
+`max_concurrent_streams`; below that the reaper does nothing. Closing means a
+`RESET` for that stream, so the server tears down its target connection
+instead of holding it until the target itself times out.
+
+The pressure gate is part of the contract, not an optimisation. From the byte
+stream alone, three different things are identical: a video the viewer paused,
+a browser keep-alive socket the application still intends to use, and a socket
+the application forgot. Only the last one deserves to be closed. A timer that
+kills all three looks exactly like a broken proxy to the user — a 10 minute
+threshold reset every paused video, and the player reports it as an
+interruption. Evicting only under pressure keeps every stream that still has
+room to exist, and still bounds what a leak can cost: a forgotten stream
+survives until its lane is squeezed, and then it is the first to go because it
+is the oldest.
 
 Peers must therefore tolerate a `RESET` on a stream that is still open from
 their side — it is the same frame used for an ordinary abandoned connection.
-The reaper runs on a 30s tick, so the effective threshold is
-`stream_idle_timeout` plus at most one tick.
+The reaper runs on a 30s tick, so a candidate is at least
+`stream_idle_timeout` old, and is claimed within one tick of the lane filling.
+
+**Draining lanes.** A lane that reaches `session_lifetime` stops taking new
+streams and is closed once its streams finish. The grace period only bounds a
+stream that never ends, and when it expires the client re-checks whether any
+stream moved a byte in the last two minutes: if so the deadline is pushed
+forward another period, and only a lane whose streams have all gone silent is
+closed. A lane therefore never cuts a transfer that is still running, while an
+idle lane still rotates on schedule.
 
 **Dial admission.** `max_pending_dials` (default `64`, `0` disables) bounds how
 many streams on one lane may be waiting for the server to complete its target

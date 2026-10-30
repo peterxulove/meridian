@@ -308,13 +308,29 @@ func (c *Client) maintainTunnel(lane int) {
 				logf("[Tunnel %d/%d] session lifetime reached, draining (%d active)",
 					lane+1, len(c.tunnels), tunnel.ActiveLoad())
 			}
-			if tunnel.Draining() && (tunnel.ActiveLoad() == 0 || time.Now().After(drainDeadline)) {
-				if tunnel.ActiveLoad() > 0 {
-					logf("[Tunnel %d/%d] drain grace expired with %d active, closing",
-						lane+1, len(c.tunnels), tunnel.ActiveLoad())
-				}
+			if tunnel.Draining() && tunnel.ActiveLoad() == 0 {
 				tunnel.Close()
 				break
+			}
+			if tunnel.Draining() && time.Now().After(drainDeadline) {
+				// A retired lane is meant to disappear quietly, but not at the
+				// cost of the transfer running on it: a video longer than the
+				// grace was cut mid-stream every time its lane came up for
+				// rotation, which the player reports as an interruption.
+				// Extending is cheap — the lane already takes no new streams —
+				// so a lane that is still moving bytes keeps its deadline
+				// pushed forward, and only a lane whose streams have gone
+				// silent is closed on schedule.
+				if n := tunnel.ActiveWithin(drainActiveWindow); n > 0 {
+					drainDeadline = time.Now().Add(drainGrace(lifetime))
+					logf("[Tunnel %d/%d] drain extended: %d/%d streams alive, next check in %v",
+						lane+1, len(c.tunnels), n, tunnel.ActiveLoad(), drainGrace(lifetime))
+				} else {
+					logf("[Tunnel %d/%d] drain grace expired with %d stalled streams, closing",
+						lane+1, len(c.tunnels), tunnel.ActiveLoad())
+					tunnel.Close()
+					break
+				}
 			}
 			time.Sleep(1 * time.Second)
 		}
@@ -328,6 +344,12 @@ func (c *Client) maintainTunnel(lane int) {
 		}
 	}
 }
+
+// drainActiveWindow is how recently a stream must have moved a byte for the
+// drain path to treat it as alive. Two minutes is far above the gap between
+// chunks of a playing video and far below any pause a viewer takes, so a
+// paused stream still counts as stalled and the lane is released.
+const drainActiveWindow = 2 * time.Minute
 
 // drainGrace bounds how long a draining lane may keep its remaining streams.
 //

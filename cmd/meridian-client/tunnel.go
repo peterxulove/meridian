@@ -340,6 +340,7 @@ func (tc *TunnelClient) DialStream(ctx context.Context, targetAddr string) (net.
 	sc := &StreamConn{
 		sid:         sid,
 		client:      tc,
+		target:      targetAddr,
 		readChan:    make(chan []byte, config.StreamQueueFrames),
 		confirmChan: make(chan bool, 1),
 		closed:      make(chan struct{}),
@@ -698,7 +699,7 @@ func (tc *TunnelClient) readLoop() {
 				// window allows in flight, reset just that stream. The
 				// application sees EOF and retries on a fresh connection.
 				if !sc.enqueue(frame.Data) {
-					noteEvent("stream_stalled", "tunnel: stream %d consumer stalled, resetting", sid)
+					noteEvent("stream_stalled", "tunnel: stream %d (%s) consumer stalled, resetting", sid, sc.target)
 					tc.removeStream(sid)
 					sc.CloseFromServer()
 					go func(id uint32) {
@@ -708,6 +709,23 @@ func (tc *TunnelClient) readLoop() {
 			}
 		}
 	}
+}
+
+// ActiveWithin counts the streams that moved a byte within the window. The
+// drain path uses it to tell "nobody is using this lane any more" from "a
+// transfer is still running on it"; the stream count alone cannot, because a
+// paused video and a finished one both sit there holding a slot.
+func (tc *TunnelClient) ActiveWithin(window time.Duration) int {
+	now := time.Now()
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	n := 0
+	for _, sc := range tc.activeStreams {
+		if sc.idleFor(now) <= window {
+			n++
+		}
+	}
+	return n
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -732,16 +750,48 @@ func (tc *TunnelClient) reapLoop() {
 	}
 }
 
-// reapIdle closes every stream that has carried no byte in either direction
-// for longer than the idle timeout, and reports how many it reclaimed.
+// reapPressurePermille is the share of a lane's stream cap at which reclaiming
+// idle streams starts. Below it the reaper does nothing at all.
+//
+// The gate matters more than the threshold. A paused video, a browser's
+// keep-alive socket and a connection the application forgot all look the same
+// from the byte stream: no traffic in either direction. Only one of the three
+// deserves to be closed, and there is no way to tell which from here — so the
+// client keeps them all while it has room, and starts evicting only when the
+// lane is 80% full and new connections are about to be refused.
+const reapPressurePermille = 800
+
+// underStreamPressure reports whether this lane is close enough to its stream
+// cap that idle streams are worth evicting.
+func (tc *TunnelClient) underStreamPressure() bool {
+	limit := int64(tc.cfg.MaxConcurrentStream)
+	if limit <= 0 {
+		// No cap configured: nothing is being squeezed out, so reclaim on
+		// age alone as before.
+		return true
+	}
+	return tc.activeLoad.Load()*1000 >= limit*reapPressurePermille
+}
+
+// reapIdle closes streams that have carried no byte in either direction for
+// longer than the idle timeout, but only while the lane is under pressure. It
+// returns how many it reclaimed.
 //
 // This is the difference between "a player abandoned some connections" and "the
-// proxy stopped accepting connections": the abandoned streams keep their slots
-// (and their share of the flow-control window) until the application closes a
-// socket it has already forgotten about. Each reclaimed stream is reset on the
-// wire so the server closes its target instead of holding it open.
+// proxy stopped accepting connections": abandoned streams keep their slots (and
+// their share of the flow-control window) until the application closes a socket
+// it has already forgotten about. Each reclaimed stream is reset on the wire so
+// the server closes its target instead of holding it open.
+//
+// Reclaiming on a timer alone is what cut videos: at a 10 minute threshold the
+// reaper reset a stream every time a viewer paused for ten minutes, and the
+// player reported it as an interruption. The threshold is now a lower bound on
+// age, not a schedule.
 func (tc *TunnelClient) reapIdle(now time.Time) int {
 	if tc.idleTimeout <= 0 {
+		return 0
+	}
+	if !tc.underStreamPressure() {
 		return 0
 	}
 	tc.mu.Lock()
@@ -753,13 +803,18 @@ func (tc *TunnelClient) reapIdle(now time.Time) int {
 	}
 	tc.mu.Unlock()
 
+	// Capture the load that justified the eviction before anything is removed:
+	// the counter falls as the loop runs, and the last line then reads "0/16
+	// full", which describes the state after the fact instead of the reason.
+	load := tc.activeLoad.Load()
 	for _, sc := range victims {
 		idle := sc.idleFor(now)
 		sid := sc.sid
 		tc.removeStream(sid)
 		sc.CloseFromServer()
 		go func() { _ = tc.sendFrame(mfp.TypeRESET, sid, 0, nil, 0) }()
-		noteEvent("stream_idle", "tunnel: stream %d idle for %v, reclaimed", sid, idle.Round(time.Second))
+		noteEvent("stream_idle", "tunnel: stream %d (%s) idle for %v, reclaimed (lane was %d/%d in use)",
+			sid, sc.target, idle.Round(time.Second), load, tc.cfg.MaxConcurrentStream)
 	}
 	return len(victims)
 }
@@ -815,6 +870,10 @@ type StreamConn struct {
 	// direction. The reaper uses it to find streams the application abandoned
 	// without closing.
 	lastActive atomic.Int64
+	// target is the address this stream dialled. It exists for the logs: a
+	// reclaimed stream used to be reported as a bare number, so "is the client
+	// killing my video or a dead socket?" was unanswerable from the file.
+	target string
 	// dialTimer releases the lane's dial slot if the server never answers;
 	// endDialOnce makes the release idempotent across every path.
 	dialTimer   *time.Timer
@@ -967,7 +1026,7 @@ func (sc *StreamConn) Write(b []byte) (int, error) {
 		}
 		jitter := sc.client.encoder.JitterDelayFor(len(chunk))
 		if err := sc.flow.Acquire(int64(len(chunk))); err != nil {
-			noteEvent("uplink_stalled", "tunnel: stream %d uplink stalled: %v", sc.sid, err)
+			noteEvent("uplink_stalled", "tunnel: stream %d (%s) uplink stalled: %v", sc.sid, sc.target, err)
 			sc.Close()
 			return written, err
 		}

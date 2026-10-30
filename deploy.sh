@@ -455,9 +455,10 @@ max_concurrent_streams: 512
 tunnel_connections: ${client_lanes}
 session_lifetime: "1h"
 dial_timeout: "15s"
-# Reclaim a stream that carried no byte either way for this long; an
-# abandoned connection otherwise keeps its slot forever. 0 disables.
-stream_idle_timeout: "10m"
+# A stream silent for this long becomes a reclamation candidate; it is only
+# actually reclaimed while the lane is 80% full, so paused videos survive.
+# An abandoned connection otherwise keeps its slot forever. 0 disables.
+stream_idle_timeout: "30m"
 # Per-lane cap on connections waiting for the server to dial. The excess
 # queues behind a slot instead of all timing out together. 0 disables.
 max_pending_dials: 64
