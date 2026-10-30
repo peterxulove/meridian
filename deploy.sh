@@ -462,6 +462,13 @@ stream_idle_timeout: "30m"
 # Per-lane cap on connections waiting for the server to dial. The excess
 # queues behind a slot instead of all timing out together. 0 disables.
 max_pending_dials: 64
+# QUIC runs on UDP, so a path that drops UDP fails the handshake or kills the
+# association ("no recent network activity"). After this many failures in a
+# row the lane parks itself on WebSocket — same port, same handshake — instead
+# of retrying a transport that cannot work. 0 retries QUIC forever.
+quic_fallback_failures: 3
+quic_fallback_hold: "10m"        # doubles per trip, capped at 1h
+quic_fallback_min_uptime: "15s"  # shorter-lived QUIC counts as a failure
 
 # 0 = adaptive BBR; set explicit Mbps only for a known QUIC link.
 up_mbps: 0

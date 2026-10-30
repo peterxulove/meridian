@@ -52,6 +52,20 @@ stream_idle_timeout: "30m"
 # Excess dials queue instead of all timing out together during a burst.
 # 0 disables the cap.
 max_pending_dials: 64
+# QUIC rides on UDP, so a path that drops UDP fails the handshake or kills an
+# established association with "no recent network activity". After this many
+# failures in a row the lane parks itself on WebSocket, which shares the port
+# and the handshake, instead of retrying a transport that cannot work right
+# now. 0 keeps the old behaviour: retry QUIC forever.
+quic_fallback_failures: 3
+# How long a lane stays on WebSocket before probing QUIC again. Doubles on
+# each consecutive trip (capped at 1h) and is forgotten as soon as a QUIC
+# connection carries traffic for quic_fallback_min_uptime.
+quic_fallback_hold: "10m"
+# Uptime that makes a QUIC connection count as healthy. A handshake that
+# succeeds and dies immediately is what a blocked UDP path looks like, so it
+# counts as a failure too rather than resetting the streak.
+quic_fallback_min_uptime: "15s"
 
 # ─── Logging ───
 # Empty keeps everything on stdout (procd/syslog). A path also tees the same

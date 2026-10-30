@@ -52,6 +52,40 @@ func TestNormalizeLogRotate(t *testing.T) {
 	}
 }
 
+func TestNormalizeQUICFallback(t *testing.T) {
+	failures, hold, minUp := NormalizeQUICFallback(0, 0, 0)
+	if failures != 0 || hold != DefaultQUICFallbackHold || minUp != DefaultQUICFallbackMinUptime {
+		t.Errorf("zero values = (%d,%v,%v), want (0,%v,%v)",
+			failures, hold, minUp, DefaultQUICFallbackHold, DefaultQUICFallbackMinUptime)
+	}
+
+	if failures, _, _ := NormalizeQUICFallback(-1, 0, 0); failures != 0 {
+		t.Errorf("negative failures = %d, want 0 (disabled)", failures)
+	}
+	if failures, _, _ := NormalizeQUICFallback(1000, 0, 0); failures != maxQUICFallbackFailures {
+		t.Errorf("huge failures = %d, want cap %d", failures, maxQUICFallbackFailures)
+	}
+
+	if _, hold, _ := NormalizeQUICFallback(3, time.Second, 0); hold != minQUICFallbackHold {
+		t.Errorf("tiny hold = %v, want floor %v", hold, minQUICFallbackHold)
+	}
+	if _, hold, _ := NormalizeQUICFallback(3, 48*time.Hour, 0); hold != maxQUICFallbackHold {
+		t.Errorf("huge hold = %v, want cap %v", hold, maxQUICFallbackHold)
+	}
+
+	// A min-uptime of zero must not turn every connection into a failure.
+	if _, _, minUp := NormalizeQUICFallback(3, 0, time.Millisecond); minUp != minQUICFallbackMinUptime {
+		t.Errorf("tiny min uptime = %v, want floor %v", minUp, minQUICFallbackMinUptime)
+	}
+	if _, _, minUp := NormalizeQUICFallback(3, 0, time.Hour); minUp != maxQUICFallbackMinUptime {
+		t.Errorf("huge min uptime = %v, want cap %v", minUp, maxQUICFallbackMinUptime)
+	}
+
+	if f, h, u := NormalizeQUICFallback(5, 15*time.Minute, 20*time.Second); f != 5 || h != 15*time.Minute || u != 20*time.Second {
+		t.Errorf("valid values were changed to (%d,%v,%v)", f, h, u)
+	}
+}
+
 func TestDefaultClientConfigIncludesNewLimits(t *testing.T) {
 	cfg := DefaultClientConfig()
 	if cfg.StreamIdleTimeout != DefaultStreamIdleTimeout {
@@ -62,5 +96,12 @@ func TestDefaultClientConfigIncludesNewLimits(t *testing.T) {
 	}
 	if cfg.LogRotateSize != DefaultLogRotateSize || cfg.LogRotateKeep != DefaultLogRotateKeep {
 		t.Errorf("log rotation defaults = (%d,%d)", cfg.LogRotateSize, cfg.LogRotateKeep)
+	}
+	if cfg.QUICFallbackFailures != DefaultQUICFallbackFailures ||
+		cfg.QUICFallbackHold != DefaultQUICFallbackHold ||
+		cfg.QUICFallbackMinUptime != DefaultQUICFallbackMinUptime {
+		t.Errorf("QUIC fallback defaults = (%d,%v,%v), want (%d,%v,%v)",
+			cfg.QUICFallbackFailures, cfg.QUICFallbackHold, cfg.QUICFallbackMinUptime,
+			DefaultQUICFallbackFailures, DefaultQUICFallbackHold, DefaultQUICFallbackMinUptime)
 	}
 }

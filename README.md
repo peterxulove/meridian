@@ -73,6 +73,38 @@ WSS、另一个常驻 QUIC。
 
 ## 更新日志
 
+### v1.6.16（2026-10-30）
+
+#### 🛬 QUIC 走不通就换 WSS：连续失败自动回落
+
+111 在 19:22:40 有四条 QUIC lane 同时断开，全是 `timeout: no recent network activity`，一分钟内 159 条连接失败，60 秒后自愈；同一时段 110 一次失败都没有——不是服务端挂了，是那条路径那一刻把 UDP 丢了。旧逻辑只会每 5 秒重试 QUIC：路径不通就一直重试同一条走不通的路，而同端口的 WebSocket 明明就在那儿，客户端自己不会拐过去。
+
+- **连败计数**：握手失败算一次；连上后活不过 `quic_fallback_min_uptime`（默认 15 秒）也算一次——**握手成功但立刻死，正是被挡住的 UDP 路径的样子**，不能让它把连败清零。
+- **连续 3 次失败**（`quic_fallback_failures`）→ 这条 lane 换到 WebSocket，保持 `quic_fallback_hold`（默认 10 分钟）。
+- **保持期按次翻倍**（10m → 20m → 40m → 1h 封顶），一旦有 QUIC 连接活过 min uptime 就全部清零。被挡一晚上的路径不会每十分钟被打扰一次，恢复正常后第一次成功就忘掉前嫌。
+- **探测不打断在播的流**：到期后先在新 transport 上建好连接、再退役旧的，和时段切换同一套顺序，视频不会因为一次失败的探测被切。
+- **分 lane 独立**：四条 lane 各自判断，天然错开，不会同一秒集体掉头。
+- `quic_fallback_failures: 0` 关掉回落，回到“永远重试 QUIC”的老行为。
+
+日志：
+
+```
+[19:38:34] [Tunnel 1/1] QUIC connect failed: tunnel: Hysteria client creation failed: connect error: timeout: no recent network activity, retrying in 5s
+[19:38:54] [Tunnel 1/1] QUIC failed 3 times in a row, falling back to WebSocket for 1m0s
+[19:38:54] [Tunnel] handshake successful over WebSocket, cipher MERIDIAN-CHACHA
+[19:39:59] [Tunnel 1/1] switch to QUIC failed: … no recent network activity, staying on WebSocket
+[19:40:19] [Tunnel 1/1] QUIC still unreachable after 3 tries, staying on WebSocket for 2m0s
+```
+
+验证：
+
+- 单测 9 条（连败阈值、保持期到期、翻倍与封顶、长连接清零连败、短命连接记失败、WSS 失败不触发、`0` 关闭、HTTP-POST 不受影响）+ 配置归一化 1 条；`go test -race ./...` 全绿。
+- **e2e A｜模拟 UDP 被丢**（服务端只开 WSS，UDP 端口无监听）：3 次 QUIC 失败（每次约 10 秒）后 `19:38:54` 回落，**同一秒** WebSocket 握手成功，SOCKS 请求 200；1 分钟保持期到点后重探 3 次仍失败，保持期翻倍到 2 分钟，整个探测过程中 curl 一直 200。
+- **e2e B｜QUIC 正常**（混合模式服务端）：改动前后两个客户端都**秒连 QUIC**，12 次请求全 200，`connect failed` 计数为 0，没有任何误判。
+- **e2e C｜复现 111**（QUIC 已连上 → 撤掉 UDP 换成纯 WSS 服务端）：`19:47:42 QUIC disconnected after 40s` → 3 次失败 → `19:48:07` 回落，同一秒 200。旧版本在这个场景会一直重试 QUIC 直到路径恢复。
+
+这一版不改线路协议，服务端不用动。
+
 ### v1.6.15（2026-10-30）
 
 #### 🎬 不再按时间杀流：回收看压力，排空看活跃
@@ -432,6 +464,8 @@ WSS 多隧道在高负载下会把小请求堵在大流后面（实测 4 路持�
 | **QUIC** | 低延迟、UDP 质量好 | 单流受 BDP 限制，适合交互而非高速下载 |
 | **HTTP-POST** | 强力 DPI 环境 | 模拟云存储上传行为 |
 
+QUIC 走 UDP，是链路上最先被丢的东西，而它失败的样子和“服务端挂了”一模一样：握手超时，或者已建立的连接以 `timeout: no recent network activity` 断掉。客户端默认在连续 3 次 QUIC 失败后把这条 lane 换到 WebSocket（同端口、同握手），10 分钟后再探一次 QUIC，见 `quic_fallback_*`。
+
 ### 高吞吐部署（500 Mbps+）
 
 单条 TCP/QUIC 流受带宽时延积限制，实测 111 → Oracle 单条约 196–250 Mbps；把所有用户流复用到一条外层隧道不会突破这个上限。高吞吐配置使用 4 条独立 WSS 隧道并按负载分配用户流：
@@ -680,6 +714,9 @@ sudo ./deploy.sh transport client websocket # 或直接指定
 | `up_mbps` / `down_mbps` | QUIC 固定带宽提示；`0` 表示自适应 BBR | `0` | 0 或链路值 |
 | `stream_idle_timeout` | 单条流**双向都无字节**多久后成为回收候选；只在 lane 达到 80% 并发上限时才真的回收（发 RESET 并释放名额）；`0` 关闭 | `30m` | 0 或 ≥30s |
 | `max_pending_dials` | **每条 lane** 同时在建连的上限；超出的排队而不是直接失败；`0` 关闭 | `64` | 0–4096 |
+| `quic_fallback_failures` | 连续多少次 QUIC 失败后把这条 lane 停到 WebSocket 上；`0` 表示永远重试 QUIC | `3` | 0–20 |
+| `quic_fallback_hold` | 停到 WebSocket 后多久再探一次 QUIC；每次连续触发翻倍，上限 1h | `10m` | 30s–6h |
+| `quic_fallback_min_uptime` | QUIC 连接活过多久才算“能用”（否则算一次失败，不让它清空连败计数） | `15s` | 5s–10m |
 
 `stream_window` 现在同时决定吞吐与延迟：调大更抗抖动但排队更久，调小更跟手；单流吞吐上限约为 `窗口 / RTT`（1 MiB @ 55ms ≈ 145 Mbps）。`max_concurrent_streams` 是每隧道上限，客户端本地代理的总并发按 `max_concurrent_streams × tunnel_connections` 推导（限制在 512–4096）。
 

@@ -46,6 +46,64 @@ Meridian is a custom secure proxy protocol designed to deliver **undetectable en
 
 ## Changelog
 
+### v1.6.16 (2026-10-30)
+
+#### 🛬 When QUIC cannot get through, use WSS: fall back after repeated failures
+
+At 19:22:40 router 111 dropped four QUIC lanes at once, every one of them with
+`timeout: no recent network activity`; 159 connections failed inside a minute
+and it healed itself 60 seconds later. Router 110 had zero failures in the same
+window — the server was fine, that path simply dropped UDP for a while. The old
+loop retried QUIC every five seconds: it kept sending into the one path that
+could not work, while a WebSocket listener on the same port sat there unused.
+
+- **Failure streak**: a failed handshake counts once; so does a connection that
+  dies inside `quic_fallback_min_uptime` (15s default) — **a handshake that
+  immediately dies is exactly what a blocked UDP path looks like**, so it must
+  not reset the streak.
+- **Three failures in a row** (`quic_fallback_failures`) park that lane on
+  WebSocket for `quic_fallback_hold` (10 minutes).
+- **The hold doubles per trip** (10m → 20m → 40m → 1h cap) and is forgotten as
+  soon as a QUIC connection survives the min uptime. A path blocked all evening
+  is not re-probed every ten minutes, and a restored one is picked up at once.
+- **Probing never cuts a playing stream**: the replacement is connected on the
+  new transport before the old lane is retired, the same order the daily
+  schedule uses.
+- **Per lane**: four lanes decide independently, so they stagger instead of
+  turning around in the same second.
+- `quic_fallback_failures: 0` disables the fallback and restores "retry QUIC
+  forever".
+
+```
+[19:38:34] [Tunnel 1/1] QUIC connect failed: tunnel: Hysteria client creation failed: connect error: timeout: no recent network activity, retrying in 5s
+[19:38:54] [Tunnel 1/1] QUIC failed 3 times in a row, falling back to WebSocket for 1m0s
+[19:38:54] [Tunnel] handshake successful over WebSocket, cipher MERIDIAN-CHACHA
+[19:39:59] [Tunnel 1/1] switch to QUIC failed: … no recent network activity, staying on WebSocket
+[19:40:19] [Tunnel 1/1] QUIC still unreachable after 3 tries, staying on WebSocket for 2m0s
+```
+
+Verification:
+
+- Nine new unit tests (threshold, hold expiry, doubling and cap, a healthy
+  connection clearing the streak, a short-lived connection counting as a
+  failure, WebSocket failures ignored, `0` disabling it, HTTP-POST untouched)
+  plus one for the config normaliser; `go test -race ./...` is green.
+- **E2E A — UDP blocked** (server offering WebSocket only, nothing listening on
+  UDP): after three QUIC failures, one every ~10s, the lane fell back at
+  `19:38:54`, the WebSocket handshake succeeded **in the same second** and a
+  SOCKS request returned 200. When the one-minute hold expired it probed QUIC
+  three more times, failed, doubled the hold to two minutes, and curl kept
+  returning 200 throughout.
+- **E2E B — QUIC healthy** (hybrid server): both the pre-change and post-change
+  clients connected over QUIC immediately, 12/12 requests returned 200, and the
+  `connect failed` count stayed at zero.
+- **E2E C — replaying the 111 incident** (QUIC connected, then the UDP listener
+  is replaced by a WebSocket-only server): `19:47:42 QUIC disconnected after
+  40s` → three failures → fell back at `19:48:07`, 200 in the same second. The
+  old build would have retried QUIC until the path came back.
+
+No wire-format change; the server does not need an update.
+
 ### v1.6.15 (2026-10-30)
 
 #### 🎬 Stop killing streams on a timer: reclaim under pressure, drain by liveness
@@ -488,6 +546,8 @@ A saturated WebSocket lane used to queue small responses behind bulk data — me
 | **WebSocket** | UDP/QUIC blocked networks | Disguised as standard WSS traffic |
 | **HTTP-POST** | Deep packet inspection environments | Mimics cloud storage file uploads |
 
+QUIC runs on UDP, the first thing an unfriendly path drops, and it fails in a way indistinguishable from "the server is down": the handshake times out, or an established association dies with `timeout: no recent network activity`. By default the client parks a lane on WebSocket — same port, same handshake — after three consecutive QUIC failures, then probes QUIC again ten minutes later. See `quic_fallback_*`.
+
 ---
 
 ## Features
@@ -699,6 +759,9 @@ change is rolled back if the service fails to restart.
 | `up_mbps` / `down_mbps` | Fixed QUIC bandwidth hint; `0` selects adaptive BBR | `0` | 0 or link rate |
 | `stream_idle_timeout` | A stream with **no byte in either direction** for this long becomes a reclamation candidate; it is only actually reclaimed when the lane is at 80% of `max_concurrent_streams` (RESET, slot freed); `0` disables | `30m` | 0 or ≥30s |
 | `max_pending_dials` | Concurrent dials awaiting the server, **per lane**; the rest queue instead of failing; `0` disables | `64` | 0–4096 |
+| `quic_fallback_failures` | Consecutive QUIC failures that park the lane on WebSocket; `0` retries QUIC forever | `3` | 0–20 |
+| `quic_fallback_hold` | How long a parked lane stays on WebSocket before probing QUIC again; doubles per trip, capped at 1h | `10m` | 30s–6h |
+| `quic_fallback_min_uptime` | Uptime that makes a QUIC connection count as healthy; anything shorter is another failure | `15s` | 5s–10m |
 
 The local proxy listener is sized as `max_concurrent_streams ×
 tunnel_connections` (clamped to 512–4096), so multiple lanes are not throttled

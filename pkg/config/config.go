@@ -163,6 +163,27 @@ type ClientConfig struct {
 	// for a slot instead of failing outright. Zero disables the cap.
 	MaxPendingDials int `yaml:"max_pending_dials" json:"max_pending_dials"`
 
+	// QUICFallbackFailures is how many QUIC attempts in a row may fail before
+	// the lane parks itself on WebSocket for a while. A path that drops every
+	// QUIC handshake recovers in seconds on the alternative, but retrying the
+	// blocked transport is the one thing that cannot work; the two transports
+	// share the port, so the switch costs nothing but a dial. Zero disables
+	// the fallback, which is what a deployment that must stay on QUIC wants.
+	QUICFallbackFailures int `yaml:"quic_fallback_failures" json:"quic_fallback_failures"`
+
+	// QUICFallbackHold is how long a lane stays on WebSocket before it tries
+	// QUIC again. It doubles on each consecutive trip (capped at an hour) so a
+	// path that is blocked for the evening is not re-probed every ten minutes,
+	// and it is forgotten as soon as a QUIC connection carries traffic again.
+	QUICFallbackHold time.Duration `yaml:"quic_fallback_hold" json:"quic_fallback_hold"`
+
+	// QUICFallbackMinUptime is how long a QUIC connection must survive to
+	// count as proof the transport works. A handshake that succeeds and dies
+	// immediately is a failure like any other — that is exactly what a blocked
+	// or throttled UDP path looks like — so it must also drive the fallback
+	// instead of resetting the streak.
+	QUICFallbackMinUptime time.Duration `yaml:"quic_fallback_min_uptime" json:"quic_fallback_min_uptime"`
+
 	// Local logging. LogFile empty keeps the historical behaviour: everything
 	// goes to stdout, which procd/syslog captures. A path tees the same lines
 	// into a size-rotated file so a burst of errors cannot evict the evidence
@@ -385,10 +406,13 @@ func DefaultClientConfig() ClientConfig {
 		// Ten minutes is long enough that a browser's idle keep-alive socket
 		// survives, and short enough that abandoned streams free their slots
 		// within one playback session.
-		StreamIdleTimeout: DefaultStreamIdleTimeout,
-		MaxPendingDials:   DefaultMaxPendingDials,
-		LogRotateSize:     DefaultLogRotateSize,
-		LogRotateKeep:     DefaultLogRotateKeep,
+		StreamIdleTimeout:     DefaultStreamIdleTimeout,
+		MaxPendingDials:       DefaultMaxPendingDials,
+		QUICFallbackFailures:  DefaultQUICFallbackFailures,
+		QUICFallbackHold:      DefaultQUICFallbackHold,
+		QUICFallbackMinUptime: DefaultQUICFallbackMinUptime,
+		LogRotateSize:         DefaultLogRotateSize,
+		LogRotateKeep:         DefaultLogRotateKeep,
 	}
 }
 
@@ -549,6 +573,27 @@ const (
 	// DefaultLogRotateKeep is how many rolled files are kept (log.1 .. log.N).
 	DefaultLogRotateKeep = 3
 	maxLogRotateKeep     = 20
+
+	// DefaultQUICFallbackFailures is the streak length that means "this path
+	// is not going to carry QUIC right now" rather than "one unlucky dial".
+	// Three attempts is about 15s of retrying at the reconnect interval.
+	DefaultQUICFallbackFailures = 3
+	maxQUICFallbackFailures     = 20
+
+	// DefaultQUICFallbackHold keeps a fallen-back lane on WebSocket for long
+	// enough that a blocked path is not re-probed in the middle of a video,
+	// and short enough that a restored path is picked up within the hour.
+	DefaultQUICFallbackHold = 10 * time.Minute
+	minQUICFallbackHold     = 30 * time.Second
+	maxQUICFallbackHold     = 6 * time.Hour
+
+	// DefaultQUICFallbackMinUptime is the uptime that makes a QUIC
+	// connection count as healthy. It is far above the handshake and far below
+	// the time a blocked path takes to drop the association, so a flap is
+	// still visible as a failure.
+	DefaultQUICFallbackMinUptime = 15 * time.Second
+	minQUICFallbackMinUptime     = 5 * time.Second
+	maxQUICFallbackMinUptime     = 10 * time.Minute
 )
 
 // NormalizeStreamIdleTimeout clamps the idle reclamation threshold. Zero and
@@ -572,6 +617,33 @@ func NormalizeMaxPendingDials(n int) int {
 		return maxMaxPendingDials
 	}
 	return n
+}
+
+// NormalizeQUICFallback clamps the QUIC fallback policy. Zero failures keeps
+// the fallback off; the durations fall back to their defaults so an omitted
+// key can never turn the hold into zero (which would flap every reconnect).
+func NormalizeQUICFallback(failures int, hold, minUptime time.Duration) (int, time.Duration, time.Duration) {
+	if failures < 0 {
+		failures = 0
+	}
+	if failures > maxQUICFallbackFailures {
+		failures = maxQUICFallbackFailures
+	}
+	if hold <= 0 {
+		hold = DefaultQUICFallbackHold
+	} else if hold < minQUICFallbackHold {
+		hold = minQUICFallbackHold
+	} else if hold > maxQUICFallbackHold {
+		hold = maxQUICFallbackHold
+	}
+	if minUptime <= 0 {
+		minUptime = DefaultQUICFallbackMinUptime
+	} else if minUptime < minQUICFallbackMinUptime {
+		minUptime = minQUICFallbackMinUptime
+	} else if minUptime > maxQUICFallbackMinUptime {
+		minUptime = maxQUICFallbackMinUptime
+	}
+	return failures, hold, minUptime
 }
 
 // NormalizeLogRotate clamps the log rotation settings so a typo cannot turn
@@ -622,6 +694,8 @@ func LoadClientConfig(path string) (ClientConfig, error) {
 	cfg.TunnelConnections = NormalizeTunnelConnections(cfg.TunnelConnections)
 	cfg.StreamIdleTimeout = NormalizeStreamIdleTimeout(cfg.StreamIdleTimeout)
 	cfg.MaxPendingDials = NormalizeMaxPendingDials(cfg.MaxPendingDials)
+	cfg.QUICFallbackFailures, cfg.QUICFallbackHold, cfg.QUICFallbackMinUptime =
+		NormalizeQUICFallback(cfg.QUICFallbackFailures, cfg.QUICFallbackHold, cfg.QUICFallbackMinUptime)
 	cfg.LogRotateSize, cfg.LogRotateKeep = NormalizeLogRotate(cfg.LogRotateSize, cfg.LogRotateKeep)
 	return cfg, nil
 }

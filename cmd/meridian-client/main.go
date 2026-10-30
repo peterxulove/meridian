@@ -92,6 +92,14 @@ func main() {
 	} else {
 		logf("  Dial cap:  unlimited")
 	}
+	if usesQUIC(cfg) {
+		if cfg.QUICFallbackFailures > 0 {
+			logf("  Fallback:  %d QUIC failures in a row => WebSocket for %v (min uptime %v)",
+				cfg.QUICFallbackFailures, cfg.QUICFallbackHold, cfg.QUICFallbackMinUptime)
+		} else {
+			logf("  Fallback:  disabled, QUIC failures retry forever")
+		}
+	}
 
 	client, err := NewClient(cfg)
 	if err != nil {
@@ -207,6 +215,20 @@ func NewClient(cfg config.ClientConfig) (*Client, error) {
 	}, nil
 }
 
+// usesQUIC reports whether this config may run on QUIC at some point of the
+// day. It only decides whether the fallback policy is worth a log line.
+func usesQUIC(cfg config.ClientConfig) bool {
+	if cfg.Transport == config.TransportHysteria {
+		return true
+	}
+	for _, w := range cfg.TransportSchedule {
+		if w.Transport == config.TransportHysteria {
+			return true
+		}
+	}
+	return false
+}
+
 // desiredTransport is the transport the schedule asks for right now, or the
 // configured one when no window matches.
 func (c *Client) desiredTransport() config.TransportType {
@@ -253,13 +275,22 @@ func (c *Client) maintainTunnel(lane int) {
 	cfg := c.cfg
 	cfg.SessionID = c.laneSessions[lane]
 	store := mtp.NewSessionStore()
-	active := c.desiredTransport()
+	guard := newTransportGuard(c.cfg)
+	active := guard.effective(c.desiredTransport())
 
 	for !c.stopping.Load() {
 		cfg.Transport = active
 		tunnel := NewTunnelClient(cfg, store)
 		if err := tunnel.Connect(); err != nil {
-			logf("[Tunnel %d/%d] connection failed: %v, retrying in 5s", lane+1, len(c.tunnels), err)
+			logf("[Tunnel %d/%d] %s connect failed: %v, retrying in 5s",
+				lane+1, len(c.tunnels), active, err)
+			if guard.failure(active) {
+				next := guard.effective(c.desiredTransport())
+				logf("[Tunnel %d/%d] %s failed %d times in a row, falling back to %s for %v",
+					lane+1, len(c.tunnels), active, guard.after, next, guard.remaining().Round(time.Second))
+				active = next
+				continue
+			}
 			select {
 			case <-time.After(5 * time.Second):
 			case <-c.stopCh:
@@ -275,25 +306,31 @@ func (c *Client) maintainTunnel(lane int) {
 		lifetime := staggerLifetime(c.cfg.SessionLifetime, lane, len(c.tunnels))
 		var drainDeadline time.Time
 		for !tunnel.closed.Load() && !c.stopping.Load() {
-			// A transport window boundary just passed. Build the replacement
-			// on the new transport first and swap it in, so the lane never has
-			// a gap where new streams have nowhere to go; only then retire the
-			// old tunnel, which keeps serving the streams already on it.
-			if want := c.desiredTransport(); want != active {
-				replacement := NewTunnelClient(withTransport(cfg, want), store)
+			// A transport window boundary just passed, or the fallback hold on
+			// this lane ended. Build the replacement on the new transport
+			// first and swap it in, so the lane never has a gap where new
+			// streams have nowhere to go; only then retire the old tunnel,
+			// which keeps serving the streams already on it.
+			if target := guard.effective(c.desiredTransport()); target != active {
+				replacement := NewTunnelClient(withTransport(cfg, target), store)
 				if err := replacement.Connect(); err != nil {
 					logf("[Tunnel %d/%d] switch to %s failed: %v, staying on %s",
-						lane+1, len(c.tunnels), want, err, active)
+						lane+1, len(c.tunnels), target, err, active)
+					if guard.failure(target) {
+						logf("[Tunnel %d/%d] %s still unreachable after %d tries, staying on %s for %v",
+							lane+1, len(c.tunnels), target, guard.after, active,
+							guard.remaining().Round(time.Second))
+					}
 					time.Sleep(5 * time.Second)
 					continue
 				}
 				c.mu.Lock()
 				c.tunnels[lane] = replacement
 				c.mu.Unlock()
-				logf("[Tunnel %d/%d] schedule switched %s -> %s (draining %d active)",
-					lane+1, len(c.tunnels), active, want, tunnel.ActiveLoad())
+				logf("[Tunnel %d/%d] transport switched %s -> %s (draining %d active)",
+					lane+1, len(c.tunnels), active, target, tunnel.ActiveLoad())
 				go c.retireLane(lane, tunnel, scheduledSwitchGrace)
-				active = want
+				active = target
 				tunnel = replacement
 				drainDeadline = time.Time{}
 				continue
@@ -339,9 +376,22 @@ func (c *Client) maintainTunnel(lane int) {
 			c.tunnels[lane] = nil
 		}
 		c.mu.Unlock()
-		if !c.stopping.Load() {
-			logf("[Tunnel %d/%d] disconnected, reconnecting", lane+1, len(c.tunnels))
+		if c.stopping.Load() {
+			return
 		}
+		// A connection that carried traffic for a while proves the transport
+		// works; one that died sooner is a failure like a refused handshake,
+		// and enough of them move the lane to the fallback transport.
+		uptime := time.Since(tunnel.ConnectedAt())
+		used := active
+		if guard.ended(used, uptime) {
+			active = guard.effective(c.desiredTransport())
+			logf("[Tunnel %d/%d] %s kept dropping (last one after %v), falling back to %s for %v",
+				lane+1, len(c.tunnels), used, uptime.Round(time.Second), active,
+				guard.remaining().Round(time.Second))
+		}
+		logf("[Tunnel %d/%d] %s disconnected after %v, reconnecting",
+			lane+1, len(c.tunnels), used, uptime.Round(time.Second))
 	}
 }
 
