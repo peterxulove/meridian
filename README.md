@@ -44,6 +44,33 @@ Meridian 是一个自定义安全代理协议，设计目标是在恶劣的网�
 
 ---
 
+## 多节点与多实例
+
+一台机器可以跑多个服务端，一个客户端也可以同时连多台服务器。每个实例只是
+一份配置加一个服务单元，没有共享状态。
+
+服务端（systemd）：
+
+```
+/etc/meridian/server.yaml                       listen_addr: "0.0.0.0:19443"
+/etc/systemd/system/meridian-server.service     /usr/local/bin/meridian-server -config ...
+```
+
+客户端第二实例（OpenWrt / procd）：
+
+```
+/etc/meridian/client2.yaml      listen_addr: "0.0.0.0:10809"，server_addr 指向另一台服务器
+/etc/init.d/meridian-client2    /usr/sbin/meridian-client -config /etc/meridian/client2.yaml
+```
+
+启用：`/etc/init.d/meridian-client2 enable && /etc/init.d/meridian-client2 start`。
+
+三点注意：监听端口必须互不相同；每个进程各自生成 session ID，互不干扰；
+`sni_spoof`、`transport_schedule` 都是逐实例配置，所以可以让一个实例白天走
+WSS、另一个常驻 QUIC。
+
+---
+
 ## 更新日志
 
 ### v1.6.13（2026-10-30）
