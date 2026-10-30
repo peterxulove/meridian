@@ -73,6 +73,35 @@ WSS、另一个常驻 QUIC。
 
 ## 更新日志
 
+### v1.6.18（2026-10-30）
+
+#### ⏱ 首字节看门狗：服务端不答，不再无限挂死
+
+110 的 10809 昨晚也断过一次，症状和 111 完全不同：四条 lane 握手成功、之后没有任何 `disconnect`，SOCKS 握手也成功、请求字节进了隧道，然后**没有任何回音**——日志里 `total` 一直停在 4，连一条 `dial_other` 都没有，八分钟不自愈，重启才恢复。
+
+原因在早数据（early data）：`DialStream` 在 `tc.earlyData` 为真时直接返回，不等服务端的 `confirmChan`。这是为了省一个往返（视频首帧最敏感），代价是**服务端不回应就变成了无限等待**——没有超时、没有计数、没有任何日志。那台服务端（132.226.1.144）当时既答 PING 又不拨号，客户端看着一切正常。
+
+- **首字节看门狗**：CONNECT 发出后开始计时（`first_byte_timeout`，默认 10 秒），期间收到任何属于该流的东西——CONNECT SUCCESS、数据、RESET——就收工。到期一条都没等到，就 RESET 这条流并把错误交给应用，`stream_silent` 计数进入每分钟汇总。
+- **连续三次重建 lane**（`first_byte_failures`，默认 3）：一个慢目标不算数，三次不同拨号都没回音说明服务端已经不再服务。日志 `3 streams in a row went unanswered within 10s, server is not serving; reconnecting`。
+- **同一批不算多次**：按拨号序号判断，同一时刻在飞的流属于同一次事故——浏览器同时开 5 个连接指向一个死地址，只记 1 次，不会因为一个死站把正常 lane 拆掉。任何一条流收到回应都会立刻清零连败。
+- `first_byte_timeout: 0` 关掉看门狗；`first_byte_failures: 0` 只重置流、永不重建 lane。
+
+日志：
+
+```
+[Summary] last 60s: conns=10 events=3 stream_silent=2 dial_other=1 | stream_silent: tunnel: stream 3 (127.0.0.1:8080) got no answer in 10s, resetting
+[Tunnel] 3 streams in a row went unanswered within 4s, server is not serving; reconnecting
+```
+
+验证见下（`SIGSTOP` 冻住服务端：socket 还在、内核还 ACK、但什么都不答，正是 10809 当时的状态）。
+
+- **冻结后**：三个请求分别在 **4 秒**（测试配置 `first_byte_timeout: 4s`）失败返回，而不是等到应用的 45 秒超时；第 4 个直接 0 秒失败（lane 正在重建）。
+- **日志**：`3 streams in a row went unanswered within 4s, server is not serving; reconnecting` → `QUIC disconnected after 16s, reconnecting` → 新 lane 握手。
+- **解冻后**：5 秒内恢复 200，之后 30 秒持续正常。
+- 单测 7 条（静默流被重置且错误交给应用、有回应则收工、三次连败重建 lane、一次回应清零连败、同批只算一次、0 值关闭、配置归一化）+ `go test -race ./...` 全绿。
+
+这一版不改线路协议，服务端不用动。
+
 ### v1.6.17（2026-10-30）
 
 #### 🔁 lane 到期改为“接班”，不是“让位”

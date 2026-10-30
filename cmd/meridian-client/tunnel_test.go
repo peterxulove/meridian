@@ -23,14 +23,14 @@ func newIdleTestTunnel(idle time.Duration, dialCap int) *TunnelClient {
 }
 
 func newTestStream(tc *TunnelClient, sid uint32, lastActive time.Time) *StreamConn {
-	sc := &StreamConn{
+	stream := &StreamConn{
 		sid:      sid,
 		client:   tc,
 		readChan: make(chan []byte, 4),
 		closed:   make(chan struct{}),
 	}
-	sc.lastActive.Store(lastActive.UnixNano())
-	return sc
+	stream.lastActive.Store(lastActive.UnixNano())
+	return stream
 }
 
 func TestReapIdleReclaimsOnlySilentStreams(t *testing.T) {
@@ -215,11 +215,139 @@ func TestEndDialReleasesSlotOnce(t *testing.T) {
 }
 
 // closedClosed reports whether the stream's closed channel is already closed.
-func (sc *StreamConn) closedClosed() bool {
+func (stream *StreamConn) closedClosed() bool {
 	select {
-	case <-sc.closed:
+	case <-stream.closed:
 		return true
 	default:
 		return false
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// First-byte watchdog
+// ─────────────────────────────────────────────────────────────────────────────
+
+func newWatchdogTunnel(timeout time.Duration, failures int) *TunnelClient {
+	cfg := config.DefaultClientConfig()
+	cfg.FirstByteTimeout = timeout
+	cfg.FirstByteFailures = failures
+	return NewTunnelClient(cfg, nil)
+}
+
+func registerStream(tc *TunnelClient, sid uint32) *StreamConn {
+	stream := newTestStream(tc, sid, time.Now())
+	stream.dialSeq = tc.dialSeq.Add(1)
+	tc.mu.Lock()
+	tc.activeStreams[sid] = stream
+	tc.activeLoad.Add(1)
+	tc.mu.Unlock()
+	return stream
+}
+
+func TestWatchdogResetsStreamTheServerNeverAnswers(t *testing.T) {
+	tc := newWatchdogTunnel(10*time.Second, 3)
+	stream := registerStream(tc, 1)
+
+	tc.watchFirstByte(stream)
+
+	if _, ok := tc.activeStreams[1]; ok {
+		t.Error("silent stream is still registered, it would hold its slot and hang the caller")
+	}
+	if !stream.closedClosed() {
+		t.Error("silent stream was not closed; the application keeps waiting")
+	}
+	if _, err := stream.Read(make([]byte, 8)); err == nil {
+		t.Error("read returned no error after the watchdog fired")
+	}
+	if n := tc.silentStreak.Load(); n != 1 {
+		t.Errorf("silent streak = %d, want 1", n)
+	}
+	if tc.closed.Load() {
+		t.Error("lane was closed after a single silent stream; one slow target must not kill it")
+	}
+}
+
+func TestWatchdogDisarmedByServerResponse(t *testing.T) {
+	tc := newWatchdogTunnel(10*time.Second, 3)
+	stream := registerStream(tc, 1)
+
+	// CONNECT SUCCESS, data and a reset all arrive as frames on the stream.
+	stream.noteResponded()
+	tc.watchFirstByte(stream)
+
+	if _, ok := tc.activeStreams[1]; !ok {
+		t.Error("a stream the server answered was reset")
+	}
+	if stream.closedClosed() {
+		t.Error("a stream the server answered was closed")
+	}
+	if n := tc.silentStreak.Load(); n != 0 {
+		t.Errorf("silent streak = %d after a response, want 0", n)
+	}
+}
+
+func TestSilentStreakCondemnsTheLane(t *testing.T) {
+	tc := newWatchdogTunnel(10*time.Second, 3)
+
+	for sid := uint32(1); sid <= 2; sid++ {
+		tc.watchFirstByte(registerStream(tc, sid))
+		if tc.closed.Load() {
+			t.Fatalf("lane closed after %d silent streams, want 3", sid)
+		}
+	}
+	tc.watchFirstByte(registerStream(tc, 3))
+
+	if !tc.closed.Load() {
+		t.Error("three unanswered dials in a row did not condemn the lane")
+	}
+}
+
+func TestSilentStreakClearedByTrafficOnAnotherStream(t *testing.T) {
+	tc := newWatchdogTunnel(10*time.Second, 3)
+	tc.watchFirstByte(registerStream(tc, 1))
+	tc.watchFirstByte(registerStream(tc, 2))
+
+	// One target answering proves the lane's dial path works, whatever the
+	// other two did.
+	registerStream(tc, 3).noteResponded()
+	if got := tc.silentStreak.Load(); got != 0 {
+		t.Fatalf("silent streak = %d after a response, want 0", got)
+	}
+
+	tc.watchFirstByte(registerStream(tc, 4))
+	if tc.closed.Load() {
+		t.Error("lane closed on the first silent stream after a healthy one")
+	}
+}
+
+func TestBurstOfSilentStreamsCountsOnce(t *testing.T) {
+	tc := newWatchdogTunnel(10*time.Second, 2)
+
+	// Both dials were in flight when the first silence was counted, so they are
+	// one incident: a browser opening two sockets to a dead host must not
+	// condemn a lane that is serving everything else.
+	first := registerStream(tc, 1)
+	second := registerStream(tc, 2)
+	tc.watchFirstByte(first)
+	tc.watchFirstByte(second)
+
+	if tc.closed.Load() {
+		t.Error("lane closed on a single burst of unanswered dials")
+	}
+	if n := tc.silentStreak.Load(); n != 1 {
+		t.Errorf("silent streak = %d for one burst, want 1", n)
+	}
+}
+
+func TestWatchdogOffWhenTimeoutIsZero(t *testing.T) {
+	cfg := config.DefaultClientConfig()
+	cfg.FirstByteTimeout = 0
+	tc := NewTunnelClient(cfg, nil)
+	if tc.firstByteTimeout != 0 {
+		t.Fatalf("timeout = %v, want 0 (disabled)", tc.firstByteTimeout)
+	}
+	if n := tc.silentStreak.Load(); n != 0 {
+		t.Errorf("streak = %d on a fresh lane", n)
 	}
 }

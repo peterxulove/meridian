@@ -86,6 +86,33 @@ func TestNormalizeQUICFallback(t *testing.T) {
 	}
 }
 
+func TestNormalizeFirstByteWatchdog(t *testing.T) {
+	if timeout, failures := NormalizeFirstByteWatchdog(0, 0); timeout != 0 || failures != 0 {
+		t.Errorf("zero values = (%v,%d), want (0,0): a zero timeout disables the watchdog", timeout, failures)
+	}
+	if timeout, _ := NormalizeFirstByteWatchdog(time.Millisecond, 3); timeout != minFirstByteTimeout {
+		t.Errorf("tiny timeout = %v, want floor %v", timeout, minFirstByteTimeout)
+	}
+	if timeout, _ := NormalizeFirstByteWatchdog(time.Hour, 3); timeout != maxFirstByteTimeout {
+		t.Errorf("huge timeout = %v, want cap %v", timeout, maxFirstByteTimeout)
+	}
+	if _, failures := NormalizeFirstByteWatchdog(10*time.Second, -5); failures != 0 {
+		t.Errorf("negative failures = %d, want 0 (never condemn the lane)", failures)
+	}
+	if _, failures := NormalizeFirstByteWatchdog(10*time.Second, 1000); failures != maxFirstByteFailures {
+		t.Errorf("huge failures = %d, want cap %d", failures, maxFirstByteFailures)
+	}
+	if timeout, failures := NormalizeFirstByteWatchdog(4*time.Second, 2); timeout != 4*time.Second || failures != 2 {
+		t.Errorf("valid values were changed to (%v,%d)", timeout, failures)
+	}
+
+	cfg := DefaultClientConfig()
+	if cfg.FirstByteTimeout != DefaultFirstByteTimeout || cfg.FirstByteFailures != DefaultFirstByteFailures {
+		t.Errorf("defaults = (%v,%d), want (%v,%d)",
+			cfg.FirstByteTimeout, cfg.FirstByteFailures, DefaultFirstByteTimeout, DefaultFirstByteFailures)
+	}
+}
+
 func TestDefaultClientConfigIncludesNewLimits(t *testing.T) {
 	cfg := DefaultClientConfig()
 	if cfg.StreamIdleTimeout != DefaultStreamIdleTimeout {

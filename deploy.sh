@@ -470,6 +470,12 @@ quic_fallback_failures: 3
 quic_fallback_hold: "10m"        # doubles per trip, capped at 1h
 quic_fallback_min_uptime: "15s"  # shorter-lived QUIC counts as a failure
 
+# A stream the server never answers — no CONNECT SUCCESS, no data, no reset —
+# used to hang forever once early data stopped waiting for the confirmation.
+# Reset it after this long; three in a row rebuild the lane. 0 disables.
+first_byte_timeout: "10s"
+first_byte_failures: 3
+
 # 0 = adaptive BBR; set explicit Mbps only for a known QUIC link.
 up_mbps: 0
 down_mbps: 0

@@ -55,6 +55,27 @@ type TunnelClient struct {
 	// server to finish dialling the target, so a connection storm queues
 	// instead of timing out en masse. Nil means unlimited.
 	dialSem chan struct{}
+
+	// firstByteTimeout bounds how long a new stream may wait for the server's
+	// first word. A server that accepted the tunnel but stopped answering
+	// leaves every request hanging with its SOCKS handshake complete and no
+	// error anywhere; this turns that into a reset the application can retry.
+	// Zero disables the watchdog.
+	firstByteTimeout time.Duration
+	// silentLimit is how many streams in a row may time out unanswered before
+	// this lane is declared dead and reconnected. Zero never closes the lane.
+	silentLimit int
+	// silentStreak counts consecutive unanswered streams. Any response on any
+	// stream clears it: it measures the lane, not the target.
+	silentStreak atomic.Int32
+	// dialSeq numbers the streams this lane opens, and lastSilentSeq remembers
+	// the one whose silence was counted last. A stream numbered at or below it
+	// was already in flight then, so it belongs to the same incident — a
+	// browser opening five sockets to a dead host is one failure, not five —
+	// and only a later dial counts as new evidence. A sequence number is used
+	// instead of a timestamp because two dials can share a clock tick.
+	dialSeq       atomic.Int64
+	lastSilentSeq atomic.Int64
 }
 
 // errLaneSaturated is returned when a lane already carries its configured
@@ -82,12 +103,14 @@ const (
 // NewTunnelClient creates a new TunnelClient.
 func NewTunnelClient(cfg config.ClientConfig, sessionStore *mtp.SessionStore) *TunnelClient {
 	tc := &TunnelClient{
-		cfg:           cfg,
-		activeStreams: make(map[uint32]*StreamConn),
-		handshakeDone: make(chan struct{}),
-		sessionStore:  sessionStore,
-		closeCh:       make(chan struct{}),
-		idleTimeout:   cfg.StreamIdleTimeout,
+		cfg:              cfg,
+		activeStreams:    make(map[uint32]*StreamConn),
+		handshakeDone:    make(chan struct{}),
+		sessionStore:     sessionStore,
+		closeCh:          make(chan struct{}),
+		idleTimeout:      cfg.StreamIdleTimeout,
+		firstByteTimeout: cfg.FirstByteTimeout,
+		silentLimit:      cfg.FirstByteFailures,
 	}
 	if cfg.MaxPendingDials > 0 {
 		tc.dialSem = make(chan struct{}, cfg.MaxPendingDials)
@@ -345,6 +368,7 @@ func (tc *TunnelClient) DialStream(ctx context.Context, targetAddr string) (net.
 		confirmChan: make(chan bool, 1),
 		closed:      make(chan struct{}),
 		maxBuffer:   config.StreamBufferLimit(tc.cfg.StreamWindow),
+		dialSeq:     tc.dialSeq.Add(1),
 	}
 	if tc.flowControl {
 		sc.flow = mfp.NewFlowWindow(int64(tc.cfg.StreamWindow))
@@ -379,6 +403,14 @@ func (tc *TunnelClient) DialStream(ctx context.Context, targetAddr string) (net.
 		tc.removeStream(sid)
 		sc.CloseFromServer()
 		return nil, fmt.Errorf("tunnel: failed to send connect frame: %w", err)
+	}
+
+	// Arm the first-byte watchdog before the stream can reach the application.
+	// With early data the CONNECT is not awaited here, so without this a server
+	// that has stopped answering leaves the request hanging forever; the SOCKS
+	// handshake has already succeeded and no counter moves anywhere.
+	if tc.firstByteTimeout > 0 {
+		sc.firstByteTimer = time.AfterFunc(tc.firstByteTimeout, func() { tc.watchFirstByte(sc) })
 	}
 
 	// Wait for confirmation (Flags = 0x01 from server)
@@ -430,6 +462,57 @@ func (tc *TunnelClient) DialStream(ctx context.Context, targetAddr string) (net.
 func (tc *TunnelClient) abortStream(sid uint32) {
 	tc.removeStream(sid)
 	go func() { _ = tc.sendFrame(mfp.TypeRESET, sid, 0, nil, 0) }()
+}
+
+// watchFirstByte runs when a stream has waited firstByteTimeout without the
+// server saying anything at all — no CONNECT SUCCESS, no data, no reset.
+//
+// This is the failure the tunnel cannot otherwise see: the SOCKS handshake
+// succeeded, the request bytes went into a live tunnel, and the server (which
+// still answers keepalives) never completes the dial. Early data makes it
+// worse, because the client deliberately does not wait for the confirmation.
+// On router 110 that state held for eight minutes: every request sat until the
+// application gave up, and no counter in the log moved. Resetting the stream
+// hands the failure to the application, which retries, and enough of them in a
+// row condemn the lane so the supervisor builds a fresh one.
+func (tc *TunnelClient) watchFirstByte(sc *StreamConn) {
+	if !sc.responded.CompareAndSwap(false, true) {
+		return
+	}
+	select {
+	case <-sc.closed:
+		return
+	default:
+	}
+	noteEvent("stream_silent", "tunnel: stream %d (%s) got no answer in %v, resetting",
+		sc.sid, sc.target, tc.firstByteTimeout)
+	tc.abortStream(sc.sid)
+	sc.failWith(fmt.Errorf("tunnel: no response from the server in %v", tc.firstByteTimeout))
+	tc.noteSilentStream(sc)
+}
+
+// noteSilentStream decides whether this silence is new evidence about the lane.
+// A stream that was already in flight when the previous silence was counted
+// belongs to the same incident, so only a dial made after that one advances the
+// streak: three sockets opened together to one dead host must not condemn a
+// lane that is serving everything else.
+func (tc *TunnelClient) noteSilentStream(sc *StreamConn) {
+	prev := tc.lastSilentSeq.Load()
+	if sc.dialSeq <= prev {
+		return
+	}
+	// Count everything dialled so far, not just this stream: whatever else is
+	// already in flight is part of the same incident.
+	if cut := tc.dialSeq.Load(); !tc.lastSilentSeq.CompareAndSwap(prev, cut) {
+		// Another stream's silence won the race and already counted.
+		return
+	}
+	n := tc.silentStreak.Add(1)
+	if tc.silentLimit > 0 && int(n) >= tc.silentLimit {
+		logf("[Tunnel] %d streams in a row went unanswered within %v, server is not serving; reconnecting",
+			n, tc.firstByteTimeout)
+		tc.Close()
+	}
 }
 
 func (tc *TunnelClient) removeStream(sid uint32) {
@@ -666,6 +749,12 @@ func (tc *TunnelClient) readLoop() {
 			continue
 		}
 
+		// Any frame for this stream means the server is serving the lane: it
+		// disarms the first-byte watchdog and clears the silent streak. PING
+		// answers deliberately do not count — a server whose dial path is hung
+		// still answers keepalives, which is what made that failure invisible.
+		sc.noteResponded()
+
 		switch frame.Header.Type {
 		case mfp.TypeRESET:
 			tc.removeStream(sid)
@@ -878,6 +967,36 @@ type StreamConn struct {
 	// endDialOnce makes the release idempotent across every path.
 	dialTimer   *time.Timer
 	endDialOnce sync.Once
+	// firstByteTimer fires when the server has said nothing at all about this
+	// stream; responded is the flag that decides the race between the watchdog
+	// and the first frame that arrives, whichever comes first.
+	firstByteTimer *time.Timer
+	responded      atomic.Bool
+	// dialSeq is this stream's number in the lane's dial order. The lane
+	// compares it against the last counted silence to tell a new failure from
+	// the same burst.
+	dialSeq int64
+}
+
+// noteResponded records that the server answered this stream. It disarms the
+// first-byte watchdog and clears the lane's silent streak: a server that
+// answers anything is serving that lane, whatever the next target does.
+func (sc *StreamConn) noteResponded() {
+	if sc.responded.CompareAndSwap(false, true) && sc.firstByteTimer != nil {
+		sc.firstByteTimer.Stop()
+	}
+	if sc.client != nil {
+		sc.client.silentStreak.Store(0)
+		sc.client.lastSilentSeq.Store(0)
+	}
+}
+
+// stopWatchdog disarms the first-byte timer when the stream ends, so a closed
+// stream cannot leave a timer that fires into a finished conversation.
+func (sc *StreamConn) stopWatchdog() {
+	if sc.firstByteTimer != nil {
+		sc.firstByteTimer.Stop()
+	}
 }
 
 // touch records traffic on the stream, deferring idle reclamation.
@@ -1043,6 +1162,7 @@ func (sc *StreamConn) Write(b []byte) (int, error) {
 func (sc *StreamConn) Close() error {
 	sc.closeOnce.Do(func() {
 		close(sc.closed)
+		sc.stopWatchdog()
 		sc.flow.Close()
 		sc.endDial()
 		sc.client.removeStream(sc.sid)
@@ -1056,6 +1176,7 @@ func (sc *StreamConn) Close() error {
 func (sc *StreamConn) CloseFromServer() {
 	sc.closeOnce.Do(func() {
 		close(sc.closed)
+		sc.stopWatchdog()
 		sc.flow.Close()
 		sc.endDial()
 	})

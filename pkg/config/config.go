@@ -184,6 +184,25 @@ type ClientConfig struct {
 	// instead of resetting the streak.
 	QUICFallbackMinUptime time.Duration `yaml:"quic_fallback_min_uptime" json:"quic_fallback_min_uptime"`
 
+	// FirstByteTimeout bounds how long a freshly opened stream may sit with
+	// the server saying nothing at all. With early data the client hands the
+	// stream to the application before the server has confirmed the dial, so a
+	// server that accepted the tunnel but stopped answering leaves every
+	// request hanging forever with no error anywhere: the SOCKS handshake
+	// succeeded, the bytes went into the tunnel, and nothing came back. The
+	// watchdog turns that into a reset stream the application can retry.
+	// Any server response for the stream (CONNECT SUCCESS, data, reset)
+	// cancels it, so an established but quiet connection is never touched.
+	// Zero disables the watchdog.
+	FirstByteTimeout time.Duration `yaml:"first_byte_timeout" json:"first_byte_timeout"`
+
+	// FirstByteFailures is how many streams in a row may time out with no
+	// response before the lane itself is declared dead and reconnected. One
+	// silent stream can be a slow target; three in a row after three separate
+	// dials means the server is no longer serving anything, and a fresh
+	// connection is the only thing that helps. Zero never closes the tunnel.
+	FirstByteFailures int `yaml:"first_byte_failures" json:"first_byte_failures"`
+
 	// Local logging. LogFile empty keeps the historical behaviour: everything
 	// goes to stdout, which procd/syslog captures. A path tees the same lines
 	// into a size-rotated file so a burst of errors cannot evict the evidence
@@ -411,6 +430,8 @@ func DefaultClientConfig() ClientConfig {
 		QUICFallbackFailures:  DefaultQUICFallbackFailures,
 		QUICFallbackHold:      DefaultQUICFallbackHold,
 		QUICFallbackMinUptime: DefaultQUICFallbackMinUptime,
+		FirstByteTimeout:      DefaultFirstByteTimeout,
+		FirstByteFailures:     DefaultFirstByteFailures,
 		LogRotateSize:         DefaultLogRotateSize,
 		LogRotateKeep:         DefaultLogRotateKeep,
 	}
@@ -594,6 +615,20 @@ const (
 	DefaultQUICFallbackMinUptime = 15 * time.Second
 	minQUICFallbackMinUptime     = 5 * time.Second
 	maxQUICFallbackMinUptime     = 10 * time.Minute
+
+	// DefaultFirstByteTimeout is how long a stream may wait for the server's
+	// first word after the CONNECT. A healthy dial answers in one round trip;
+	// ten seconds is far beyond that while still being short enough that a
+	// hung server costs the user a retry, not a hung browser tab.
+	DefaultFirstByteTimeout = 10 * time.Second
+	minFirstByteTimeout     = 1 * time.Second
+	maxFirstByteTimeout     = 2 * time.Minute
+
+	// DefaultFirstByteFailures is how many silent streams in a row condemn the
+	// lane. One is a slow target; three separate dials that all go unanswered
+	// mean the server stopped serving.
+	DefaultFirstByteFailures = 3
+	maxFirstByteFailures     = 20
 )
 
 // NormalizeStreamIdleTimeout clamps the idle reclamation threshold. Zero and
@@ -646,6 +681,26 @@ func NormalizeQUICFallback(failures int, hold, minUptime time.Duration) (int, ti
 	return failures, hold, minUptime
 }
 
+// NormalizeFirstByteWatchdog clamps the first-byte watchdog. A zero timeout
+// disables it; a zero failure count keeps the stream resets but never
+// condemns the lane, which is the right choice for a deployment whose targets
+// are legitimately slow to speak.
+func NormalizeFirstByteWatchdog(timeout time.Duration, failures int) (time.Duration, int) {
+	if timeout <= 0 {
+		timeout = 0
+	} else if timeout < minFirstByteTimeout {
+		timeout = minFirstByteTimeout
+	} else if timeout > maxFirstByteTimeout {
+		timeout = maxFirstByteTimeout
+	}
+	if failures < 0 {
+		failures = 0
+	} else if failures > maxFirstByteFailures {
+		failures = maxFirstByteFailures
+	}
+	return timeout, failures
+}
+
 // NormalizeLogRotate clamps the log rotation settings so a typo cannot turn
 // rotation into either "never rotates" or "keeps a thousand files".
 func NormalizeLogRotate(size uint64, keep int) (uint64, int) {
@@ -696,6 +751,8 @@ func LoadClientConfig(path string) (ClientConfig, error) {
 	cfg.MaxPendingDials = NormalizeMaxPendingDials(cfg.MaxPendingDials)
 	cfg.QUICFallbackFailures, cfg.QUICFallbackHold, cfg.QUICFallbackMinUptime =
 		NormalizeQUICFallback(cfg.QUICFallbackFailures, cfg.QUICFallbackHold, cfg.QUICFallbackMinUptime)
+	cfg.FirstByteTimeout, cfg.FirstByteFailures =
+		NormalizeFirstByteWatchdog(cfg.FirstByteTimeout, cfg.FirstByteFailures)
 	cfg.LogRotateSize, cfg.LogRotateKeep = NormalizeLogRotate(cfg.LogRotateSize, cfg.LogRotateKeep)
 	return cfg, nil
 }

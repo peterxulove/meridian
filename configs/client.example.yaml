@@ -67,6 +67,19 @@ quic_fallback_hold: "10m"
 # counts as a failure too rather than resetting the streak.
 quic_fallback_min_uptime: "15s"
 
+# How long a new stream may wait for the server's first word — CONNECT SUCCESS,
+# data, or a reset. Early data means the client hands the stream to the
+# application before the dial is confirmed, so a server that keeps the tunnel up
+# but stops completing dials leaves every request hanging with nothing in the
+# log. On expiry the stream is reset, which the application can retry.
+# 0 disables the watchdog.
+first_byte_timeout: "10s"
+# How many streams in a row may time out unanswered before the lane itself is
+# considered dead and reconnected. One is a slow target; three separate dials
+# that all go unanswered mean the server stopped serving. 0 keeps stream resets
+# but never reconnects the lane.
+first_byte_failures: 3
+
 # ─── Logging ───
 # Empty keeps everything on stdout (procd/syslog). A path also tees the same
 # lines into a size-rotated file, which is what survives a burst of errors:

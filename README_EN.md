@@ -46,6 +46,28 @@ Meridian is a custom secure proxy protocol designed to deliver **undetectable en
 
 ## Changelog
 
+### v1.6.18 (2026-10-30)
+
+#### ⏱ First-byte watchdog: a silent server no longer hangs forever
+
+Router 110's 10809 broke last night with a signature nothing like 111's: four lanes handshook successfully and never logged a disconnect, the SOCKS handshake succeeded, the request bytes went into the tunnel, and then nothing came back. `total` sat at 4, not one `dial_other` event, and it did not recover in eight minutes — a restart fixed it.
+
+The cause is early data: `DialStream` returns immediately when `tc.earlyData` is set instead of waiting on `confirmChan`. That saves a round trip (the first frame of a video notices), and the price is that a server which never answers becomes an infinite wait — no timeout, no counter, no log line. That server (132.226.1.144) was answering keepalives the whole time, so the client saw nothing wrong.
+
+- **First-byte watchdog**: armed when the CONNECT is sent (`first_byte_timeout`, default 10s) and disarmed by anything the server says about that stream — CONNECT SUCCESS, data, reset. If nothing arrives, the stream is reset and the application gets the error; `stream_silent` joins the per-minute summary.
+- **Three in a row rebuild the lane** (`first_byte_failures`, default 3): one slow target does not count, but three separate dials with no answer mean the server stopped serving. Logged as `3 streams in a row went unanswered within 10s, server is not serving; reconnecting`.
+- **One burst counts once**: dial order decides — streams already in flight when the previous silence was counted belong to the same incident, so a browser opening five sockets to a dead host is one failure and will not tear down a lane that is serving everything else. Any response clears the streak immediately.
+- `first_byte_timeout: 0` disables the watchdog; `first_byte_failures: 0` resets streams but never rebuilds the lane.
+
+Verified by freezing the server with `SIGSTOP` — socket open, kernel still acknowledging, nothing ever answered, exactly the 10809 state:
+
+- Three requests failed after **4s** each (test config `first_byte_timeout: 4s`) instead of sitting until the application's 45s timeout; the fourth failed in 0s while the lane was being rebuilt.
+- The log showed `3 streams in a row went unanswered within 4s, server is not serving; reconnecting`, then `QUIC disconnected after 16s, reconnecting`, then a fresh handshake.
+- After `SIGCONT`: 200 within 5s and stable for the following 30s.
+- 7 unit tests plus `go test -race ./...` clean.
+
+No wire change; the server does not need to be updated.
+
 ### v1.6.17 (2026-10-30)
 
 #### 🔁 A lane now hands over instead of stepping aside

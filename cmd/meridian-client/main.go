@@ -100,6 +100,16 @@ func main() {
 			logf("  Fallback:  disabled, QUIC failures retry forever")
 		}
 	}
+	if cfg.FirstByteTimeout > 0 {
+		if cfg.FirstByteFailures > 0 {
+			logf("  Watchdog:  stream reset if the server says nothing for %v; %d in a row reconnect the lane",
+				cfg.FirstByteTimeout, cfg.FirstByteFailures)
+		} else {
+			logf("  Watchdog:  stream reset if the server says nothing for %v", cfg.FirstByteTimeout)
+		}
+	} else {
+		logf("  Watchdog:  disabled")
+	}
 
 	client, err := NewClient(cfg)
 	if err != nil {

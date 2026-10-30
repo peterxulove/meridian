@@ -20,6 +20,7 @@ Revision history:
 | 1.9 | 2026-10-30 | Idle stream reclamation on the client (RESET after `stream_idle_timeout`); per-lane dial admission (`max_pending_dials`) |
 | 1.10 | 2026-10-30 | Reclamation gated on lane pressure rather than age alone (`stream_idle_timeout` default 30m); a draining lane is extended while it still carries an active stream |
 | 1.11 | 2026-10-30 | Lane rotation publishes a successor before retiring the old connection; a retired lane is used as a last resort rather than leaving the client with no lane |
+| 1.12 | 2026-10-30 | Client-side first-byte watchdog: a stream the server never answers is reset after `first_byte_timeout`, and three in a row rebuild the lane |
 
 ---
 
@@ -827,6 +828,26 @@ re-arms the deadline, so a transfer is never cut while a retired socket that
 has gone silent is closed on schedule. If every lane is retired at once — a
 state rotation should no longer produce — a request is served by the least
 loaded retired lane rather than refused.
+
+**First-byte watchdog.** With early data (handshake version 3) the client does
+not wait for CONNECT SUCCESS: it hands the stream to the application as soon as
+the CONNECT is written. A server that keeps the tunnel up but stops completing
+dials therefore produces no error at all — the SOCKS handshake succeeded, the
+bytes went into the tunnel, and the application waits until it gives up on its
+own. Router 110 spent eight minutes in exactly that state.
+
+Each CONNECT therefore arms a timer for `first_byte_timeout` (default `10s`,
+`0` disables). Any frame for that stream — CONNECT SUCCESS, CONNECT ERROR, DATA
+or RESET — disarms it; PING answers deliberately do not, because a server whose
+dial path is stuck still answers keepalives. On expiry the client sends RESET,
+hands the failure to the application, and counts the stream as silent.
+
+Silences are counted in dial order: a stream that was already in flight when the
+previous silence was counted belongs to the same incident, so a burst of
+connections to one dead host advances the streak once. Any response on any
+stream clears it. `first_byte_failures` (default `3`, `0` never rebuilds) such
+silences in a row mean the server is no longer serving and the lane is closed so
+the supervisor builds a fresh one.
 
 **Dial admission.** `max_pending_dials` (default `64`, `0` disables) bounds how
 many streams on one lane may be waiting for the server to complete its target
