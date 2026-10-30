@@ -12,7 +12,7 @@
 
 set -e
 
-DEFAULT_RELEASE_VERSION="v1.6.11"
+DEFAULT_RELEASE_VERSION="v1.6.12"
 
 # Re-execute with bash if run with sh
 if [ -z "$BASH_VERSION" ]; then
@@ -224,18 +224,75 @@ configure_server() {
     
     local cert_path="${CONFIG_DIR}/cert.pem"
     local key_path="${CONFIG_DIR}/key.pem"
-    
-    # Generate self-signed certificate if not exists
-    if [ ! -f "$cert_path" ] || [ ! -f "$key_path" ]; then
-        echo -e "Generating self-signed SSL Certificate for REALITY mode..."
-        $SUDO openssl req -x509 -newkey rsa:2048 -nodes \
+
+    # Certificate resolution, best camouflage first:
+    #   1. MERIDIAN_CERT / MERIDIAN_KEY  — a pair you already have
+    #   2. MERIDIAN_DOMAIN               — install from acme.sh, renewals wired up
+    #   3. self-signed                   — last resort, only with explicit consent
+    #
+    # A self-signed certificate is not a neutral default: issuer == subject is
+    # the clearest "not a website" signal a passive observer can read, and it
+    # makes every other anti-detection measure pointless. It used to be
+    # generated silently, which is how a 10-year CN=www.apple.com ended up in
+    # production.
+    local cert_source=""
+    if [ -n "${MERIDIAN_CERT:-}" ] && [ -n "${MERIDIAN_KEY:-}" ]; then
+        $SUDO install -m 644 "$MERIDIAN_CERT" "$cert_path"
+        $SUDO install -m 600 "$MERIDIAN_KEY" "$key_path"
+        cert_source="provided pair"
+    elif [ -n "${MERIDIAN_DOMAIN:-}" ]; then
+        local acme_home="${MERIDIAN_ACME_HOME:-/root/.acme.sh}"
+        local acme_sh="${acme_home}/acme.sh"
+        if [ ! -x "$acme_sh" ]; then
+            echo -e "${RED}[Error] MERIDIAN_DOMAIN is set but ${acme_sh} is not executable.${NC}"
+            return 1
+        fi
+        local keylen_flag=""
+        if [ -d "${acme_home}/${MERIDIAN_DOMAIN}_ecc" ]; then
+            keylen_flag="--ecc"
+        elif [ ! -d "${acme_home}/${MERIDIAN_DOMAIN}" ]; then
+            echo -e "${RED}[Error] No acme.sh certificate for ${MERIDIAN_DOMAIN}.${NC}"
+            echo -e "Issue one first, for example:"
+            echo -e "  ${acme_sh} --issue -d ${MERIDIAN_DOMAIN} -w /var/www/html --keylength ec-256"
+            return 1
+        fi
+        # --install-cert copies the pair and registers the reload command, so a
+        # renewal restarts the tunnel without anyone remembering to do it.
+        $SUDO "$acme_sh" --install-cert -d "$MERIDIAN_DOMAIN" $keylen_flag \
+            --key-file "$key_path" \
+            --fullchain-file "$cert_path" \
+            --reloadcmd "systemctl restart meridian-server 2>/dev/null || true" >/dev/null
+        cert_source="acme.sh (${MERIDIAN_DOMAIN})"
+    elif [ ! -f "$cert_path" ] || [ ! -f "$key_path" ]; then
+        if [ "${MERIDIAN_ALLOW_SELF_SIGNED:-0}" != "1" ]; then
+            echo -e "${YELLOW}[Warning] No CA-issued certificate configured.${NC}"
+            echo -e "  Set MERIDIAN_CERT/MERIDIAN_KEY, or MERIDIAN_DOMAIN with an acme.sh"
+            echo -e "  issuance, to present a certificate a browser would accept."
+            echo -e "  A self-signed certificate is a passive fingerprint and cannot be"
+            echo -e "  hidden by any other setting."
+            if [ -t 0 ]; then
+                read -rp "  Continue with a self-signed certificate? [y/N]: " selfsigned_ok
+                case "$selfsigned_ok" in
+                    y|Y|yes|YES) ;;
+                    *) echo -e "${RED}Aborted.${NC}"; return 1 ;;
+                esac
+            fi
+        fi
+        local cn="${MERIDIAN_SNI:-localhost}"
+        echo -e "Generating self-signed SSL Certificate (CN=${cn}, 90 days)..."
+        $SUDO openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
             -keyout "$key_path" \
             -out "$cert_path" \
-            -subj "/CN=www.apple.com" \
-            -days 3650 >/dev/null 2>&1
+            -subj "/CN=${cn}" \
+            -addext "subjectAltName=DNS:${cn}" \
+            -days 90 >/dev/null 2>&1
         $SUDO chmod 600 "$key_path"
         $SUDO chmod 644 "$cert_path"
+        cert_source="self-signed (not recommended)"
+    else
+        cert_source="existing ${cert_path}"
     fi
+    echo -e "  Certificate: ${cert_source}"
     
     # Calculate SPKI Hash
     local spki_hex
@@ -254,6 +311,10 @@ transport: "QUIC+WebSocket"
 cipher_suite: 1
 password: "${password}"
 wss_path: "/ws/"
+# Everything that is not a tunnel upgrade is proxied here, so the port answers
+# like a real site instead of returning Go's 404 to a prober.
+fallback_url: "${MERIDIAN_FALLBACK_URL:-}"
+fallback_sni: "${MERIDIAN_FALLBACK_SNI:-}"
 
 # ─── REALITY Mode (anti-detection) ───
 reality_mode: true
@@ -315,19 +376,21 @@ configure_client() {
         exit 1
     fi
     
-    read -rp "3. Reality SPKI Hash (64 hex characters): " client_spki
-    if [ -z "$client_spki" ]; then
-        echo -e "${RED}[Error] SPKI hash cannot be empty.${NC}"
-        exit 1
-    fi
-    
-    read -rp "4. Local Proxy Protocol (socks5 / http) [default: socks5]: " client_proto
+    read -rp "3. SNI / cover domain (must match the server certificate) [default: www.apple.com]: " client_sni
+    client_sni="${client_sni:-www.apple.com}"
+
+    # An empty pin means "verify with the CA chain", which is what you want
+    # with an ACME certificate: the pair is renewed every 60-90 days, and a
+    # pinned leaf would break every client at each renewal.
+    read -rp "4. Reality SPKI Hash (64 hex, empty = CA verification): " client_spki
+
+    read -rp "5. Local Proxy Protocol (socks5 / http) [default: socks5]: " client_proto
     client_proto="${client_proto:-socks5}"
-    
-    read -rp "5. Local Listen Port [default: 1080]: " client_port
+
+    read -rp "6. Local Listen Port [default: 1080]: " client_port
     client_port="${client_port:-1080}"
 
-    read -rp "6. Tunnel connections for throughput (1-16) [default: 4]: " client_lanes
+    read -rp "7. Tunnel connections for throughput (1-16) [default: 4]: " client_lanes
     client_lanes="${client_lanes:-4}"
     case "$client_lanes" in
         ''|*[!0-9]*) client_lanes=4 ;;
@@ -345,9 +408,8 @@ password: "${client_password}"
 wss_path: "/ws/"
 
 # ─── REALITY Mode (anti-detection) ───
-sni_spoof: "www.apple.com"
+sni_spoof: "${client_sni}"
 reality_mode: true
-reality_spki: "${client_spki}"
 reality_short_id: 12345
 reality_max_time: 0
 
@@ -376,7 +438,11 @@ down_mbps: 0
 listen_addr: "0.0.0.0:${client_port}"
 proxy_protocol: "${client_proto}"
 EOF
-    
+
+    if [ -n "$client_spki" ]; then
+        printf 'reality_spki: "%s"\n' "$client_spki" | $SUDO tee -a "$client_yaml" >/dev/null
+    fi
+
     $SUDO chmod 600 "$client_yaml"
     echo -e "${GREEN}Configuration generated: $client_yaml${NC}"
 }

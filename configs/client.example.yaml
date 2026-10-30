@@ -8,9 +8,15 @@ password: "your-strong-random-password-here"
 wss_path: "/ws/"
 
 # ─── REALITY Mode (anti-detection) ───
+# The name sent in SNI. With a CA-issued certificate it must be the name the
+# certificate was issued to (otherwise verification fails).
 sni_spoof: "www.google.com"
 reality_mode: true
-reality_spki: "0000000000000000000000000000000000000000000000000000000000000000"
+# Optional SPKI pin. When present, the CA chain is not checked and this key
+# must match the server or the handshake fails. Omit it to verify normally
+# against the system roots — required with an ACME certificate, whose leaf
+# changes at every renewal.
+# reality_spki: "0000000000000000000000000000000000000000000000000000000000000000"
 reality_short_id: 0
 reality_max_time: 0
 

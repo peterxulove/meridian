@@ -7,9 +7,19 @@ cipher_suite: 1
 password: "your-strong-random-password-here"
 wss_path: "/ws/"
 
+# ─── Cover site (active-probe resistance) ───
+# Every request that is not a tunnel upgrade is reverse-proxied here, so a
+# prober that GETs the port sees this site (same status, headers and body)
+# instead of a 404 from the tunnel process. Point it at a real site on the
+# same host when you can, so its certificate and content stay consistent.
+# fallback_url: "https://127.0.0.1"
+# fallback_sni: "arm.198208.xyz"
+
 # ─── REALITY Mode (anti-detection) ───
 reality_mode: true
 reality_enabled: true
+# Use a CA-issued pair. A self-signed certificate is the clearest "not a
+# website" signal a passive observer can read; the server warns at start-up.
 server_cert: "cert.pem"
 server_key: "key.pem"
 # Generate SPKI hash from your server cert:

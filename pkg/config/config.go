@@ -252,6 +252,15 @@ type ServerConfig struct {
 	Password    string        `yaml:"password" json:"-"`
 	WSSPath     string        `yaml:"wss_path" json:"wss_path"`
 
+	// FallbackURL is where the WebSocket listener sends everything that is not
+	// a tunnel upgrade. An endpoint that answers 404 to a plain GET confirms
+	// itself to an active prober in one request; proxying to a real site makes
+	// the port answer like that site instead. Empty keeps the old 404.
+	FallbackURL string `yaml:"fallback_url" json:"fallback_url"`
+	// FallbackSNI is the TLS name to verify when FallbackURL points at a
+	// loopback address but the cover site's certificate names a domain.
+	FallbackSNI string `yaml:"fallback_sni" json:"fallback_sni"`
+
 	// HTTP-POST mirror mode: the path the client uploads frames to.
 	MirrorPath string `yaml:"mirror_path" json:"mirror_path"`
 

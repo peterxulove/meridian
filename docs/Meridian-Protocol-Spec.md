@@ -1,4 +1,4 @@
-# Meridian Protocol Specification v1.7
+# Meridian Protocol Specification v1.8
 
 > A hybrid high-efficiency, anti-detection secure communication protocol.
 > Combines strengths of Shadowsocks, Hysteria/Hysteria2, VLESS, and REALITY.
@@ -16,6 +16,7 @@ Revision history:
 | 1.6 | 2026-10-30 | Address racing for target dials; flow-stall timeout raised to 10 min; lane drain waits for idle |
 | 1.7 | 2026-10-30 | Client transport schedule: per-lane hot switch between transports on a daily window |
 | 1.7.1 | 2026-10-30 | Schedule windows are evaluated in an explicitly configured zone |
+| 1.8 | 2026-10-30 | Handshake surface: browser-only client ALPN, CA-issued certificate, cover-site response for unauthenticated requests |
 
 ---
 
@@ -534,6 +535,40 @@ Client                                    Server
 
 Because `Read` on the client polls by issuing an upload, the poll path must not
 re-enter the code that takes the transport lock while it is already held.
+
+### 5.7 Handshake Surface: ALPN, Certificate, Probe Response
+
+Everything above is wasted if the handshake itself announces the protocol. Three
+fields are readable without breaking any encryption and therefore carry the
+entire identification cost:
+
+| Surface | Requirement |
+|---------|-------------|
+| ALPN (client) | MUST contain only values a browser sends (`h3` over QUIC, `h2` + `http/1.1` over TLS). MUST NOT contain a protocol-unique token. |
+| Certificate | MUST be issued by a public CA for the configured SNI. A self-signed certificate MUST be treated as a deployment error, not a default. |
+| Unauthenticated request | MUST be answered by the cover site (status, headers and body), not by the tunnel process. |
+
+The client's ALPN list travels in the cleartext ClientHello — and, under QUIC,
+inside an Initial packet whose keys any observer derives from the public
+connection ID. A token such as `meridian-1` in that list identifies the protocol
+regardless of padding, fingerprint emulation or timing jitter.
+
+The server's ALPN list is inside the encrypted ServerHello / EncryptedExtensions
+and may keep accepting older tokens for compatibility; this does not expose
+anything. Implementations SHOULD do so to allow a client fleet to upgrade
+without a flag day.
+
+Certificate pinning and CA verification are alternatives, not complements. A
+pinned deployment replaces the chain check with a key comparison, which makes
+every certificate rotation a client update; a CA-verified deployment requires
+`sni_spoof` to equal the certificate's name. Implementations MUST NOT default
+to skipping verification when no pin is configured — that turns deleting one
+line of configuration into a silent loss of server authentication.
+
+Finally, the response to an unauthenticated connection is itself a signal: a
+`404 page not found` from the tunnel process, or the WebSocket upgrader's
+`400 Bad Request`, is a one-request confirmation for an active prober. Such
+requests MUST be proxied to the cover site named by `fallback_url`.
 
 ---
 

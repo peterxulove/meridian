@@ -46,6 +46,23 @@ Meridian is a custom secure proxy protocol designed to deliver **undetectable en
 
 ## Changelog
 
+### v1.6.12 (2026-10-30)
+
+#### 🪪 Closing the handshake surface: no self-named ALPN, no self-signed cert, no 404
+
+Identification cost is concentrated in the fields nobody needs to decrypt, so
+this release only touches those:
+
+- **The client offers browser ALPN values only**: `h3` over QUIC, `h2` + `http/1.1` over WSS. The WSS ClientHello used to carry `meridian-1` in cleartext, which names the protocol to every observer. The server keeps accepting `meridian-1` for old clients — its choice lives in the encrypted ServerHello, so it exposes nothing — which allows a fleet-wide upgrade without a flag day.
+- **The certificate must come from a CA**: `deploy.sh` now installs from acme.sh when `MERIDIAN_DOMAIN` is set (with the renewal reload hook), or takes `MERIDIAN_CERT`/`MERIDIAN_KEY`. A self-signed pair is generated only with explicit consent, and is now 90 days with a SAN. The server prints the certificate CN and expiry at start-up and warns on self-signed or near-expiry.
+- **Unauthenticated requests get the cover site**: `fallback_url` / `fallback_sni` reverse-proxy everything that is not a tunnel upgrade (including a plain GET on `/ws/`), so a probe gets the cover site's status, headers and body instead of Go's `404 page not found` or the upgrader's 400.
+
+Also fixed a silent downgrade: with `reality_mode: true` and no `reality_spki`,
+the client used to skip certificate verification entirely. No pin now means
+normal CA verification, so deleting one line no longer disables authentication.
+
+Specification is now v1.8 (§5.7, handshake surface).
+
 ### v1.6.11 (2026-10-30)
 
 #### 🕘 The schedule no longer trusts the system timezone

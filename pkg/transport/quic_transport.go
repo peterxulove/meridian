@@ -372,10 +372,26 @@ const mirrorPollHeader = "Mir-Poll"
 // TLSConfig
 // ---------------------------------------------------------------------------
 
+// ALPN lists.
+//
+// The client's list is the only one an observer can read: the TLS 1.3
+// ClientHello travels in the clear (and, under QUIC, inside an Initial packet
+// whose keys are derived from the public connection ID). Anything custom in it
+// names the protocol on the wire, so the client offers exactly what a browser
+// would. The server's list sits inside the encrypted ServerHello /
+// EncryptedExtensions, so it can keep accepting the old "meridian-1" token to
+// avoid breaking clients that have not been upgraded yet.
+var (
+	alpnClientQUIC = []string{"h3"}
+	alpnClientWS   = []string{"h2", "http/1.1"}
+	alpnServerQUIC = []string{"meridian-1", "h3"}
+	alpnServerWS   = []string{"http/1.1", "meridian-1"}
+)
+
 // ServerTLSConfig builds a *tls.Config for the server.
 func ServerTLSConfig(cfg config.ServerConfig) (*tls.Config, error) {
 	tlsConfig := &tls.Config{
-		NextProtos: []string{"meridian-1", "h3"},
+		NextProtos: alpnServerQUIC,
 		MinVersion: tls.VersionTLS13,
 	}
 
@@ -402,14 +418,18 @@ func ServerTLSConfig(cfg config.ServerConfig) (*tls.Config, error) {
 // ClientTLSConfig builds a *tls.Config for the client.
 func ClientTLSConfig(cfg config.ClientConfig) (*tls.Config, error) {
 	tlsConfig := &tls.Config{
-		NextProtos: []string{"meridian-1", "h3"},
+		NextProtos: alpnClientWS,
 		MinVersion: tls.VersionTLS13,
 	}
 
-	// Client side: REALITY mode uses SPKI pinning instead of normal CA chain.
+	// Client side: REALITY mode can pin the server's SPKI key instead of
+	// trusting a CA chain. Pinning is opt-in: a REALITY client with no pin is
+	// downgraded to ordinary PKI verification rather than skipping the check
+	// entirely, which is what it used to do (and meant that dropping one line
+	// from the config silently disabled server authentication).
 	if cfg.RealityMode {
-		tlsConfig.InsecureSkipVerify = true // CA chain verification bypassed; SPKI pin used instead.
 		if len(cfg.RealitySPKIHash) > 0 {
+			tlsConfig.InsecureSkipVerify = true // chain check replaced by the pin below
 			expectedSPKI := make([]byte, len(cfg.RealitySPKIHash))
 			copy(expectedSPKI, cfg.RealitySPKIHash)
 			tlsConfig.VerifyPeerCertificate = func(certs [][]byte, _ [][]*x509.Certificate) error {
@@ -433,20 +453,16 @@ func ClientTLSConfig(cfg config.ClientConfig) (*tls.Config, error) {
 			}
 		}
 
-		// Apply the spoofed SNI so the handshake presents as a visit to the
-		// cover domain rather than to the tunnel server.
-		if cfg.SNISpoof != "" {
-			tlsConfig.ServerName = cfg.SNISpoof
-		}
 	}
 
 	// Apply the emulated TLS fingerprint last so it cannot clobber the REALITY
 	// verification callback or the insecure-skip flag set above.
 	anti.ApplyFingerprintWithSNI(tlsConfig, string(cfg.Fingerprint), cfg.SNISpoof)
-
-	// Meridian's ALPN must win so the peer recognises the tunnel protocol;
-	// the browser ALPN list would advertise h2/http1.1 instead.
-	tlsConfig.NextProtos = []string{"meridian-1", "h3"}
+	// The fingerprint may carry its own ALPN list. Replace it with the
+	// browser-like one: whether the name is negotiated is irrelevant to us, the
+	// MTP handshake identifies the tunnel, but a unique ALPN names the protocol
+	// to every DPI that reads the ClientHello.
+	tlsConfig.NextProtos = alpnClientWS
 
 	return tlsConfig, nil
 }
