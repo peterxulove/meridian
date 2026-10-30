@@ -73,6 +73,35 @@ WSS、另一个常驻 QUIC。
 
 ## 更新日志
 
+### v1.6.17（2026-10-30）
+
+#### 🔁 lane 到期改为“接班”，不是“让位”
+
+21:03 起 111 的 10808 全挂：每个请求都是 `dial … failed: tunnel not connected or unavailable`，`failed` 从 0 涨到 1780，直到手动重启才恢复。日志里四条 lane 分别在 20:53、20:56、20:59、21:02 打出 `session lifetime reached, draining`，然后**一条都没有重连过**。
+
+原因不是网络：lane 到期后原地排空——停止接收新流，等自己手上的流跑完再关。可每一轮排空都还在扛着长连接（Telegram 这类连接不会自己结束），`ActiveLoad()` 永远不归零，于是一条都关不掉。四条 lane 相差 3 分钟依次到期，**全部进入排空状态**，`pickTunnel` 找不到任何可用 lane，整个代理对外就是一个黑洞；`drainGrace(1h)` 是 30 分钟，所以这个状态最长可以持续半小时。
+
+- **先建后拆**：lane 到期时先在同一 transport 上建好接替连接、放进 `tunnels[lane]`，再把旧连接交给后台退休。新流立刻有新家，旧流继续在旧连接上跑完——和时段切换、QUIC 回落同一套顺序。
+- **接班失败不裸奔**：接替连接建不起来就继续用当前这条服务，5 秒后重试，失败照常计入 QUIC 连败。
+- **退休连接不再按点砍**：宽限期到点时若仍有流在最近 2 分钟内动过字节，就顺延一个宽限期（日志 `retired lane still moving N/M streams, holding it for another 30m0s`），彻底安静的才关。
+- **兜底**：万一所有 lane 都处于退休状态，`pickTunnel` 改用负载最低的那条退休 lane 服务，而不是回 `tunnel not connected`（每分钟最多一行 `[Proxy] no fresh lane, serving on retired lane …`）。
+
+日志（正常轮换 / 旧行为的黑洞）：
+
+```
+[Tunnel 1/4] session lifetime reached, rotating (draining 17 active)
+[Tunnel 1/4] retired lane still moving 1/17 streams, holding it for another 30m0s
+[Tunnel 1/4] retired lane had 0 stalled streams at grace expiry, closing
+```
+
+验证（`session_lifetime: 5m`、2 条 lane，每条 lane 上挂一个 6KB/s 的慢下载，轮换时两条 lane 各有 1 条活跃流，每 4 秒探一次，共 8 分钟）：
+
+- **旧版**：`21:30:29` 与 `21:30:44` 两条 lane 依次 `draining (1 active)`，此后请求全部 `tunnel not connected or unavailable`，直到 `21:32:47` 才恢复 —— 120 次探测里 90 次 200、**30 次失败，黑洞 2 分 18 秒**。和 111 现场一致。
+- **新版**：同一秒建好接替连接（`rotating (draining 1 active)` 紧跟一条 `handshake successful over QUIC`），**120/120 全 200**，两条 lane 各轮换一次，没有任何一次请求被拒。
+- 单测 `go test -race ./...` 全绿。
+
+这一版不改线路协议，服务端不用动。
+
 ### v1.6.16（2026-10-30）
 
 #### 🛬 QUIC 走不通就换 WSS：连续失败自动回落

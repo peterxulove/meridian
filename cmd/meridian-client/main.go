@@ -175,6 +175,9 @@ type Client struct {
 	stopCh       chan struct{}
 	stopOnce     sync.Once
 	proxy        ProxyServer
+	// staleLogAt throttles the "serving on a retired lane" warning to one line
+	// per minute while a rotation is in progress.
+	staleLogAt atomic.Int64
 }
 
 // NewClient initialises a Client, generating a session ID if none is set.
@@ -252,7 +255,13 @@ func withTransport(cfg config.ClientConfig, t config.TransportType) config.Clien
 }
 
 // retireLane stops a replaced lane from taking new streams and closes it once
-// its streams finish, or when the grace expires.
+// its streams finish, or when the grace expires with nothing still moving.
+//
+// The grace is not a hard deadline. A retired lane no longer accepts streams,
+// so the only thing holding it is a transfer that is still running — exactly
+// the video that used to be cut every time its lane came up for rotation. Each
+// expiry is therefore re-armed while some stream has moved a byte recently;
+// a lane whose streams have all gone quiet is closed on schedule.
 func (c *Client) retireLane(lane int, tunnel *TunnelClient, grace time.Duration) {
 	tunnel.draining.Store(true)
 	deadline := time.Now().Add(grace)
@@ -262,7 +271,14 @@ func (c *Client) retireLane(lane int, tunnel *TunnelClient, grace time.Duration)
 			return
 		}
 		if time.Now().After(deadline) {
-			logf("[Tunnel %d/%d] retired lane still had %d active at grace expiry, closing",
+			if n := tunnel.ActiveWithin(drainActiveWindow); n > 0 {
+				deadline = time.Now().Add(grace)
+				logf("[Tunnel %d/%d] retired lane still moving %d/%d streams, holding it for another %v",
+					lane+1, len(c.tunnels), n, tunnel.ActiveLoad(), grace)
+				time.Sleep(time.Second)
+				continue
+			}
+			logf("[Tunnel %d/%d] retired lane had %d stalled streams at grace expiry, closing",
 				lane+1, len(c.tunnels), tunnel.ActiveLoad())
 			tunnel.Close()
 			return
@@ -304,7 +320,6 @@ func (c *Client) maintainTunnel(lane int) {
 		c.mu.Unlock()
 
 		lifetime := staggerLifetime(c.cfg.SessionLifetime, lane, len(c.tunnels))
-		var drainDeadline time.Time
 		for !tunnel.closed.Load() && !c.stopping.Load() {
 			// A transport window boundary just passed, or the fallback hold on
 			// this lane ended. Build the replacement on the new transport
@@ -332,42 +347,45 @@ func (c *Client) maintainTunnel(lane int) {
 				go c.retireLane(lane, tunnel, scheduledSwitchGrace)
 				active = target
 				tunnel = replacement
-				drainDeadline = time.Time{}
 				continue
 			}
-			// A lane that reaches session_lifetime stops taking new streams and
-			// is closed once the streams already on it finish. This refreshes
-			// the outer TCP/TLS connection periodically without cutting an
-			// active download.
-			if lifetime > 0 && !tunnel.Draining() && time.Since(tunnel.ConnectedAt()) >= lifetime {
-				tunnel.draining.Store(true)
-				drainDeadline = time.Now().Add(drainGrace(lifetime))
-				logf("[Tunnel %d/%d] session lifetime reached, draining (%d active)",
-					lane+1, len(c.tunnels), tunnel.ActiveLoad())
-			}
-			if tunnel.Draining() && tunnel.ActiveLoad() == 0 {
-				tunnel.Close()
-				break
-			}
-			if tunnel.Draining() && time.Now().After(drainDeadline) {
-				// A retired lane is meant to disappear quietly, but not at the
-				// cost of the transfer running on it: a video longer than the
-				// grace was cut mid-stream every time its lane came up for
-				// rotation, which the player reports as an interruption.
-				// Extending is cheap — the lane already takes no new streams —
-				// so a lane that is still moving bytes keeps its deadline
-				// pushed forward, and only a lane whose streams have gone
-				// silent is closed on schedule.
-				if n := tunnel.ActiveWithin(drainActiveWindow); n > 0 {
-					drainDeadline = time.Now().Add(drainGrace(lifetime))
-					logf("[Tunnel %d/%d] drain extended: %d/%d streams alive, next check in %v",
-						lane+1, len(c.tunnels), n, tunnel.ActiveLoad(), drainGrace(lifetime))
-				} else {
-					logf("[Tunnel %d/%d] drain grace expired with %d stalled streams, closing",
-						lane+1, len(c.tunnels), tunnel.ActiveLoad())
-					tunnel.Close()
-					break
+			// A lane that reaches session_lifetime rotates its outer connection:
+			// the successor is built and put in place first, then this lane is
+			// retired with the streams it still carries.
+			//
+			// Draining in place instead — stop taking streams, close when the
+			// last one finishes — looks equivalent and is not: it relies on the
+			// other lanes to accept everything in the meantime. On router 111
+			// four lanes reached their 1h lifetime three minutes apart while
+			// each still carried long-lived streams (Telegram), so all four
+			// were draining at once. Nothing accepted a new connection and the
+			// proxy answered "tunnel not connected" for every request until the
+			// 30m grace expired. The lane now hands over, it does not step
+			// aside.
+			if lifetime > 0 && time.Since(tunnel.ConnectedAt()) >= lifetime {
+				replacement := NewTunnelClient(withTransport(cfg, active), store)
+				if err := replacement.Connect(); err != nil {
+					logf("[Tunnel %d/%d] rotation failed: %v, still serving on the current connection",
+						lane+1, len(c.tunnels), err)
+					if guard.failure(active) {
+						next := guard.effective(c.desiredTransport())
+						logf("[Tunnel %d/%d] %s failed %d times in a row, falling back to %s for %v",
+							lane+1, len(c.tunnels), active, guard.after, next,
+							guard.remaining().Round(time.Second))
+						active = next
+						continue
+					}
+					time.Sleep(5 * time.Second)
+					continue
 				}
+				c.mu.Lock()
+				c.tunnels[lane] = replacement
+				c.mu.Unlock()
+				logf("[Tunnel %d/%d] session lifetime reached, rotating (draining %d active)",
+					lane+1, len(c.tunnels), tunnel.ActiveLoad())
+				go c.retireLane(lane, tunnel, drainGrace(lifetime))
+				tunnel = replacement
+				continue
 			}
 			time.Sleep(1 * time.Second)
 		}
@@ -455,7 +473,45 @@ func (c *Client) pickTunnel() (*TunnelClient, int) {
 			bestLoad = load
 		}
 	}
+	if best != nil {
+		return best, bestLane
+	}
+
+	// Every lane has been retired but at least one is still open, carrying the
+	// streams it had when it rotated. Refusing the connection at this point is
+	// what turned a slow lane rotation into a whole-proxy outage: the caller
+	// gets "tunnel not connected" even though a retired lane would have served
+	// the request perfectly well. Prefer a fresh lane, but never prefer
+	// nothing.
+	for offset := 0; offset < len(tunnels); offset++ {
+		lane := (start + offset) % len(tunnels)
+		tunnel := tunnels[lane]
+		if tunnel == nil || tunnel.closed.Load() {
+			continue
+		}
+		load := tunnel.ActiveLoad()
+		if best == nil || load < bestLoad {
+			best = tunnel
+			bestLane = lane
+			bestLoad = load
+		}
+	}
+	if best != nil {
+		c.noteStaleLane(len(tunnels), bestLane, bestLoad)
+	}
 	return best, bestLane
+}
+
+// noteStaleLane reports that no fresh lane was available, at most once a
+// minute: the condition lasts as long as a rotation does, and a line per
+// connection would bury it.
+func (c *Client) noteStaleLane(lanes, lane int, load int64) {
+	now := time.Now().Unix()
+	last := c.staleLogAt.Load()
+	if now-last < 60 || !c.staleLogAt.CompareAndSwap(last, now) {
+		return
+	}
+	logf("[Proxy] no fresh lane, serving on retired lane %d/%d (%d active)", lane+1, lanes, load)
 }
 
 func (c *Client) dial(ctx context.Context, network, addr string) (net.Conn, error) {

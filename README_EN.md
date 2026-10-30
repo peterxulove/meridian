@@ -46,6 +46,34 @@ Meridian is a custom secure proxy protocol designed to deliver **undetectable en
 
 ## Changelog
 
+### v1.6.17 (2026-10-30)
+
+#### 🔁 A lane now hands over instead of stepping aside
+
+At 21:03 every request through router 111's 10808 returned `dial … failed: tunnel not connected or unavailable`; `failed` climbed from 0 to 1780 and it stayed that way until the process was restarted. The log showed all four lanes printing `session lifetime reached, draining` at 20:53, 20:56, 20:59 and 21:02 — and not one reconnect afterwards.
+
+The network was fine. A lane that reached its lifetime drained in place: stop taking streams, close once the ones already running finish. But every drain was still carrying long-lived streams (Telegram-style connections that never end), so `ActiveLoad()` never reached zero and no lane ever closed. Four lanes three minutes apart meant all four were draining at once, `pickTunnel` had nothing to hand a request to, and the proxy was a black hole — for as long as `drainGrace(1h)`, i.e. up to half an hour.
+
+- **Successor first**: a lane reaching its lifetime gets a replacement connection built on the same transport and published, and only then is the old one retired in the background. New streams go to the successor immediately; the old connection keeps serving what it already carries. Same ordering as a transport switch and as the QUIC fallback.
+- **A failed handover never strands the lane**: if the successor cannot connect, the current connection keeps serving and the handover is retried in 5s; the failure still counts towards `quic_fallback_*`.
+- **Retired connections are no longer cut on a timer**: at the end of the grace the deadline is re-armed if any stream moved a byte in the last two minutes (`retired lane still moving N/M streams, holding it for another 30m0s`), and a lane whose streams have all gone quiet is closed.
+- **Last resort**: if every lane happens to be retired, `pickTunnel` serves the least loaded retired lane instead of answering `tunnel not connected`, logging `[Proxy] no fresh lane, serving on retired lane …` at most once a minute.
+
+No wire change; the server does not need to be updated.
+
+Verified with `session_lifetime: 5m`, two lanes, one 6KB/s download per lane so
+each lane is still carrying a live stream when it rotates, probing every 4s for
+8 minutes:
+
+- **Before**: lanes printed `draining (1 active)` at 21:30:29 and 21:30:44, then
+  every request returned `tunnel not connected or unavailable` until 21:32:47 —
+  90 of 120 probes succeeded, 30 failed, a black hole of 2m18s. Same shape as
+  the router 111 incident.
+- **After**: the successor handshake lands in the same second as the rotation
+  (`rotating (draining 1 active)` immediately followed by `handshake successful
+  over QUIC`), 120/120 probes succeeded across both rotations.
+- `go test -race ./...` clean.
+
 ### v1.6.16 (2026-10-30)
 
 #### 🛬 When QUIC cannot get through, use WSS: fall back after repeated failures

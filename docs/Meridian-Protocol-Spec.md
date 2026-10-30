@@ -19,6 +19,7 @@ Revision history:
 | 1.8 | 2026-10-30 | Handshake surface: browser-only client ALPN, CA-issued certificate, cover-site response for unauthenticated requests |
 | 1.9 | 2026-10-30 | Idle stream reclamation on the client (RESET after `stream_idle_timeout`); per-lane dial admission (`max_pending_dials`) |
 | 1.10 | 2026-10-30 | Reclamation gated on lane pressure rather than age alone (`stream_idle_timeout` default 30m); a draining lane is extended while it still carries an active stream |
+| 1.11 | 2026-10-30 | Lane rotation publishes a successor before retiring the old connection; a retired lane is used as a last resort rather than leaving the client with no lane |
 
 ---
 
@@ -810,13 +811,22 @@ their side — it is the same frame used for an ordinary abandoned connection.
 The reaper runs on a 30s tick, so a candidate is at least
 `stream_idle_timeout` old, and is claimed within one tick of the lane filling.
 
-**Draining lanes.** A lane that reaches `session_lifetime` stops taking new
-streams and is closed once its streams finish. The grace period only bounds a
-stream that never ends, and when it expires the client re-checks whether any
-stream moved a byte in the last two minutes: if so the deadline is pushed
-forward another period, and only a lane whose streams have all gone silent is
-closed. A lane therefore never cuts a transfer that is still running, while an
-idle lane still rotates on schedule.
+**Lane rotation.** A lane that reaches `session_lifetime` is *replaced*, not
+merely drained: the client opens the successor on the same transport, publishes
+it, and only then retires the old connection with the streams it still carries.
+Draining in place looks equivalent and is not, because it hands the lane's
+share of new streams to the other lanes. With four lanes rotating three minutes
+apart, each still holding long-lived streams, every lane ended up draining at
+once and the client answered "tunnel not connected" to every request until the
+grace expired — twenty minutes of total outage on router 111. A lane hands
+over; it does not step aside.
+
+The grace still bounds the retired connection: when it expires the client
+re-checks whether any stream moved a byte in the last two minutes, and if so
+re-arms the deadline, so a transfer is never cut while a retired socket that
+has gone silent is closed on schedule. If every lane is retired at once — a
+state rotation should no longer produce — a request is served by the least
+loaded retired lane rather than refused.
 
 **Dial admission.** `max_pending_dials` (default `64`, `0` disables) bounds how
 many streams on one lane may be waiting for the server to complete its target

@@ -74,9 +74,21 @@ func TestPickTunnelSkipsDrainingLane(t *testing.T) {
 		t.Fatalf("picked lane %d, want the non-draining lane 1", lane)
 	}
 
+	// All lanes retired: the old behaviour was to refuse the request, which
+	// turned a lane rotation into a whole-proxy outage. A retired lane that is
+	// still open can serve, so it is used rather than answering "no tunnel".
 	lanes[1].draining.Store(true)
+	lanes[1].activeLoad.Store(3)
+	lanes[0].activeLoad.Store(1)
+	if tunnel, lane := client.pickTunnel(); tunnel != lanes[0] || lane != 0 {
+		t.Fatalf("picked lane %d while all lanes drain, want the least loaded retired lane 0", lane)
+	}
+
+	// Closed lanes are still unusable.
+	lanes[0].closed.Store(true)
+	lanes[1].closed.Store(true)
 	if tunnel, lane := client.pickTunnel(); tunnel != nil || lane != -1 {
-		t.Fatalf("picked lane %d while all lanes drain, want none", lane)
+		t.Fatalf("picked lane %d while all lanes are closed, want none", lane)
 	}
 }
 
