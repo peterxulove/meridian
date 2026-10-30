@@ -16,7 +16,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"os"
 	"sync"
 	"time"
 )
@@ -140,7 +139,7 @@ func (s *Socks5Server) Start() error {
 		return fmt.Errorf("socks5: listen %s: %w", s.listenAddr, err)
 	}
 	s.listener = ln
-	fmt.Printf("  [SOCKS5] Listening on %s (LAN, max %d concurrent)\n", s.listenAddr, s.maxConcurrent)
+	logf("SOCKS5 listening on %s (max %d concurrent)", s.listenAddr, s.maxConcurrent)
 	s.wg.Add(1)
 	go s.acceptLoop()
 	return nil
@@ -179,7 +178,7 @@ func (s *Socks5Server) acceptLoop() {
 			s.mu.Lock()
 			s.failed++
 			s.mu.Unlock()
-			logf("[warn] connection limit reached (%d), dropped %s", s.maxConcurrent, conn.RemoteAddr())
+			noteEvent("limit_dropped", "socks5: connection limit reached (%d), dropped %s", s.maxConcurrent, conn.RemoteAddr())
 			continue
 		}
 
@@ -207,14 +206,14 @@ func (s *Socks5Server) handleConn(conn net.Conn) {
 
 	// ── Phase 1: negotiate authentication method ──────────────────────────
 	if err := s.negotiate(conn); err != nil {
-		logf("socks5: [%s] negotiation failed: %v", conn.RemoteAddr(), err)
+		noteEvent("negotiate", "socks5: [%s] negotiation failed: %v", conn.RemoteAddr(), err)
 		return
 	}
 
 	// ── Phase 2: authenticate if required ────────────────────────────────
 	if s.username != "" {
 		if err := s.authenticate(conn); err != nil {
-			logf("socks5: [%s] auth failed: %v", conn.RemoteAddr(), err)
+			noteEvent("auth", "socks5: [%s] auth failed: %v", conn.RemoteAddr(), err)
 			return
 		}
 	}
@@ -222,7 +221,7 @@ func (s *Socks5Server) handleConn(conn net.Conn) {
 	// ── Phase 3: read CONNECT / UDP ASSOCIATE request ─────────────────────
 	cmd, target, err := s.readRequest(conn)
 	if err != nil {
-		logf("socks5: [%s] request error: %v", conn.RemoteAddr(), err)
+		noteEvent("request", "socks5: [%s] request error: %v", conn.RemoteAddr(), err)
 		return
 	}
 
@@ -231,7 +230,8 @@ func (s *Socks5Server) handleConn(conn net.Conn) {
 		return
 	}
 
-	logf("socks5: [%s] → %s", conn.RemoteAddr(), target)
+	noteConn()
+	logConnf("socks5: [%s] → %s", conn.RemoteAddr(), target)
 
 	// ── Phase 4: dial upstream using public DNS ────────────────────────────
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -239,7 +239,7 @@ func (s *Socks5Server) handleConn(conn net.Conn) {
 
 	upstream, err := s.dial(ctx, "tcp", target)
 	if err != nil {
-		logf("socks5: [%s] dial %s failed: %v", conn.RemoteAddr(), target, err)
+		noteEvent(dialReason(err), "socks5: [%s] dial %s failed: %v", conn.RemoteAddr(), target, err)
 		s.writeReply(conn, replyHostUnreachable, nil)
 		s.mu.Lock()
 		s.failed++
@@ -270,14 +270,14 @@ func (s *Socks5Server) handleUDPAssociate(conn net.Conn, clientUDPAddrStr string
 
 	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: listenIP, Port: 0})
 	if err != nil {
-		logf("socks5: [%s] UDP associate listen failed: %v", conn.RemoteAddr(), err)
+		noteEvent("udp_listen", "socks5: [%s] UDP associate listen failed: %v", conn.RemoteAddr(), err)
 		s.writeReply(conn, replyGeneralFailure, nil)
 		return
 	}
 	defer udpConn.Close()
 
 	boundUDPAddr := udpConn.LocalAddr().(*net.UDPAddr)
-	logf("socks5: [%s] UDP associate bound to UDP %s", conn.RemoteAddr(), boundUDPAddr)
+	logConnf("socks5: [%s] UDP associate bound to UDP %s", conn.RemoteAddr(), boundUDPAddr)
 
 	// Send success reply with the bound UDP IP and Port
 	s.writeReply(conn, replySuccess, &net.TCPAddr{IP: boundUDPAddr.IP, Port: boundUDPAddr.Port})
@@ -301,9 +301,9 @@ func (s *Socks5Server) handleUDPAssociate(conn net.Conn, clientUDPAddrStr string
 
 	select {
 	case <-tcpClosed:
-		logf("socks5: [%s] UDP associate TCP closed, terminating session", conn.RemoteAddr())
+		logConnf("socks5: [%s] UDP associate TCP closed, terminating session", conn.RemoteAddr())
 	case <-relayDone:
-		logf("socks5: [%s] UDP associate relay finished", conn.RemoteAddr())
+		logConnf("socks5: [%s] UDP associate relay finished", conn.RemoteAddr())
 	}
 }
 
@@ -387,7 +387,7 @@ func (s *Socks5Server) udpRelay(udpConn *net.UDPConn, tcpClosed chan struct{}, r
 			outConn, err = net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
 			if err != nil {
 				mu.Unlock()
-				logf("socks5: outbound UDP listen failed: %v", err)
+				noteEvent("udp_outbound", "socks5: outbound UDP listen failed: %v", err)
 				continue
 			}
 			outConns[clientKey] = outConn
@@ -625,10 +625,4 @@ func (s *Socks5Server) relay(client, upstream net.Conn) {
 	go pipe(client, upstream, &s.bytesOut)
 	<-done
 	<-done
-}
-
-// logf logs a formatted message with timestamp to stdout.
-func logf(format string, args ...any) {
-	ts := time.Now().Format("2006-01-02 15:04:05")
-	fmt.Fprintf(os.Stdout, "[%s] "+format+"\n", append([]any{ts}, args...)...)
 }

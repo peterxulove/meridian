@@ -43,6 +43,29 @@ tunnel_connections: 4
 # connection is not kept alive indefinitely. 0 disables recycling.
 session_lifetime: "1h"
 dial_timeout: "15s"
+# Reclaims a stream that carried no byte in either direction for this long.
+# A player that abandons a connection without closing the socket leaves a
+# half-dead stream holding a slot; enough of them and the proxy refuses new
+# work while the tunnel still looks healthy. 0 disables reclamation.
+stream_idle_timeout: "10m"
+# Per-lane cap on connections waiting for the server to finish dialling.
+# Excess dials queue instead of all timing out together during a burst.
+# 0 disables the cap.
+max_pending_dials: 64
+
+# ─── Logging ───
+# Empty keeps everything on stdout (procd/syslog). A path also tees the same
+# lines into a size-rotated file, which is what survives a burst of errors:
+# a router's syslog ring is only tens of KiB and drops the oldest lines.
+# log_file: "/var/log/meridian-client.log"
+# log_rotate_size: 4194304     # bytes; defaults to 4 MiB
+# log_rotate_keep: 3           # keeps log_file plus .1 .. .3
+# Clock used for the timestamp. Defaults to schedule_timezone, then the system
+# zone — routers often fall back to UTC, which breaks cross-host correlation.
+# log_timezone: "UTC+8"
+# One line per proxied connection. Counters are logged every minute either
+# way, so this is only useful for packet-level forensics.
+log_verbose: false
 
 # ─── Daily Transport Schedule (optional) ───
 # Switches the outer transport by local time. The first window containing the

@@ -3,7 +3,6 @@
 package main
 
 import (
-	"fmt"
 	"syscall"
 )
 
@@ -12,7 +11,7 @@ import (
 func RaiseFileLimit(target uint64) {
 	var rl syscall.Rlimit
 	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rl); err != nil {
-		fmt.Printf("[sys] getrlimit failed: %v\n", err)
+		logf("[sys] getrlimit failed: %v", err)
 		return
 	}
 	if rl.Cur >= target {
@@ -24,8 +23,8 @@ func RaiseFileLimit(target uint64) {
 		rl.Max = target
 	}
 	if err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rl); err != nil {
-		fmt.Printf("[sys] could not raise open-file limit from %d to %d: %v (run with sudo or set 'ulimit -n %d' before starting)\n", original, target, err, target)
+		logf("[sys] could not raise open-file limit from %d to %d: %v (run with sudo or set 'ulimit -n %d' before starting)", original, target, err, target)
 		return
 	}
-	fmt.Printf("[sys] open-file limit raised from %d → %d\n", original, target)
+	logf("[sys] open-file limit raised from %d to %d", original, target)
 }

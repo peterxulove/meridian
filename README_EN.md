@@ -46,6 +46,57 @@ Meridian is a custom secure proxy protocol designed to deliver **undetectable en
 
 ## Changelog
 
+### v1.6.14 (2026-10-30)
+
+#### 🩺 Make a freeze leave evidence: file logging, per-minute summaries, half-dead stream reclamation
+
+This started from the freeze on router 111: the SOCKS layer reported
+`failed=617` out of `total=1585` (~39%), but the window that would explain it
+had already been evicted — one line per failed connection cleared out logd's
+64 KiB ring.
+
+Four changes:
+
+- **Log to a rotated file** (`log_file` / `log_rotate_size` /
+  `log_rotate_keep`). Stdout stays, so `logread` still works; the file is what
+  survives a storm. 4 MiB × (1+3) by default, rotating on line boundaries so a
+  line is never split across two files.
+- **Failures become one summary line per minute**, counted by reason
+  (`dial_timeout` / `dial_refused` / `dial_dns` / `dial_reset` /
+  `dial_lane_full` / `limit_dropped` / `negotiate` / `stream_idle` …) with a
+  single sample kept per reason:
+
+```
+[Summary] last 60s: conns=0 events=1 stream_idle=1 | stream_idle: tunnel: stream 65 idle for 39s, reclaimed
+[Summary] last 60s: conns=319 events=612 dial_timeout=590 limit_dropped=22 | dial_timeout: socks5: [192.168.1.111:36890] dial www.gstatic.com:443 failed: tunnel: dial timeout …
+```
+
+​       `conns=` also replaces the per-connection flood as evidence of a
+connection storm, which is why `log_verbose` defaults to off.
+- **Reclaim half-dead streams** (`stream_idle_timeout`, default 10 minutes).
+  When a player drops a connection without closing the socket, the stream keeps
+  its slot and its window forever; enough of them and the tunnel looks
+  connected while applications cannot connect at all. A stream with no bytes in
+  either direction past the threshold is reset on the wire.
+- **Timestamps follow a configured zone** (`log_timezone`, defaulting to
+  `schedule_timezone`). Router 110's system zone turned out to be UTC while 111
+  was UTC+8, so the same incident sat 8 hours apart in the two logs.
+- **Cap concurrent dials per lane** (`max_pending_dials`, default 64). A storm
+  no longer hands hundreds of simultaneous dials to the server to time out
+  together: the excess queue behind a slot, bounded by the caller's deadline.
+
+Local verification (`stream_idle_timeout: 5s` clamped up to the 30s floor,
+reaper every 30s):
+
+- One silent connection against a black-hole target **was reclaimed after 39s**,
+  and the next summary reported `stream_idle=1`.
+- 60 concurrent connections to the same target with `max_pending_dials: 2`
+  (deliberately tiny): **60/60 succeeded**, none failed because of queueing.
+- The file matched stdout, and after rotation `client.log` / `.1` / `.2` were
+  all under the limit and ended on a newline.
+
+No wire-format change: the server does not need to be updated.
+
 ### v1.6.13 (2026-10-30)
 
 #### 🩹 Fallback fixes: preserve Host, bound every phase, pin HTTP/1.1
@@ -593,10 +644,47 @@ change is rolled back if the service fails to restart.
 | `session_lifetime` | Outer connection lifetime; the lane drains and reconnects at expiry, `0` disables | `1h` | 5m–24h |
 | `timing_jitter_ms` | Random delay applied to small frames only | `0` | 0–100 |
 | `up_mbps` / `down_mbps` | Fixed QUIC bandwidth hint; `0` selects adaptive BBR | `0` | 0 or link rate |
+| `stream_idle_timeout` | Reclaim a stream that carried **no byte in either direction** for this long (RESET, slot freed); `0` disables | `10m` | 0 or ≥30s |
+| `max_pending_dials` | Concurrent dials awaiting the server, **per lane**; the rest queue instead of failing; `0` disables | `64` | 0–4096 |
 
 The local proxy listener is sized as `max_concurrent_streams ×
 tunnel_connections` (clamped to 512–4096), so multiple lanes are not throttled
 by a single lane's budget.
+
+### Logging and diagnosis
+
+By default the client only writes to stdout, which procd/systemd forwards to
+the system log. A router's logd ring holds only tens of KiB, so **one burst of
+errors overwrites the window that explains it**. Enable the file sink when you
+expect to dig through an incident:
+
+```yaml
+log_file: "/var/log/meridian-client.log"   # stdout keeps working
+log_rotate_size: 4194304                   # 4 MiB per file
+log_rotate_keep: 3                         # keep .1 .. .3
+log_verbose: false                         # true logs one line per connection
+# log_timezone: "UTC+8"                    # clock for timestamps; defaults to schedule_timezone
+```
+
+Three shapes of line:
+
+```
+[2026-10-30 16:51:28] [Tunnel] handshake successful over QUIC, cipher MERIDIAN-CHACHA   # event
+[2026-10-30 16:52:28]   [Stats] active=1 total=65 failed=0 in=4KB out=7KB               # running totals
+[2026-10-30 16:52:28] [Summary] last 60s: conns=65 events=0                             # per-minute summary
+```
+
+Timestamps follow `schedule_timezone` (then the system zone): two routers do not
+necessarily agree on `/etc/localtime` — measured 110 in UTC and 111 in UTC+8, so
+the same incident was 8 hours apart in the two logs.
+
+`conns=` is how many proxied connections were opened in that minute (a restart
+storm is obvious), `events=` counts failures and reclaims by reason, and the
+`|` part shows one sample for the three busiest reasons. Read it in this order:
+whether `conns=` spiked, then the ratio of `dial_timeout` (upstream is slow) to
+`limit_dropped` (local slots are exhausted); `stream_idle` counts reclaimed
+half-dead streams.
+
 
 ---
 

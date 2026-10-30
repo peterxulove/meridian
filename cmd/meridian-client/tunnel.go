@@ -45,6 +45,16 @@ type TunnelClient struct {
 	// stream does not have to wait a round trip before the application can
 	// speak. It is negotiated as ServerHello version 3.
 	earlyData bool
+
+	// idleTimeout reclaims streams that stopped carrying bytes in either
+	// direction. An abandoned player connection keeps its slot forever
+	// otherwise, and enough of them make the proxy refuse new work while the
+	// tunnel still reports itself healthy. Zero disables reclamation.
+	idleTimeout time.Duration
+	// dialSem bounds how many streams on this lane may be waiting for the
+	// server to finish dialling the target, so a connection storm queues
+	// instead of timing out en masse. Nil means unlimited.
+	dialSem chan struct{}
 }
 
 // errLaneSaturated is returned when a lane already carries its configured
@@ -71,13 +81,18 @@ const (
 
 // NewTunnelClient creates a new TunnelClient.
 func NewTunnelClient(cfg config.ClientConfig, sessionStore *mtp.SessionStore) *TunnelClient {
-	return &TunnelClient{
+	tc := &TunnelClient{
 		cfg:           cfg,
 		activeStreams: make(map[uint32]*StreamConn),
 		handshakeDone: make(chan struct{}),
 		sessionStore:  sessionStore,
 		closeCh:       make(chan struct{}),
+		idleTimeout:   cfg.StreamIdleTimeout,
 	}
+	if cfg.MaxPendingDials > 0 {
+		tc.dialSem = make(chan struct{}, cfg.MaxPendingDials)
+	}
+	return tc
 }
 
 // Connect establishes the TCP or QUIC connection and performs the MTP handshake.
@@ -217,7 +232,7 @@ func (tc *TunnelClient) Connect() error {
 		// Server accepted resume
 		keys = resumeKeys
 		if config.DebugMode {
-			fmt.Printf("[DEBUG] [Tunnel] 0-RTT session resumed successfully\n")
+			logf("[Tunnel] 0-RTT session resumed successfully")
 		}
 	} else {
 		// Compute shared secret
@@ -267,11 +282,7 @@ func (tc *TunnelClient) Connect() error {
 		tc.decoder.SetBalancer(tc.balancer)
 	}
 
-	if config.DebugMode {
-		fmt.Printf("[DEBUG] [Tunnel] Handshake successful over %s! Cipher: MERIDIAN-CHACHA\n", tc.cfg.Transport)
-	} else {
-		fmt.Printf("  [Tunnel] Handshake successful over %s! Cipher: MERIDIAN-CHACHA\n", tc.cfg.Transport)
-	}
+	logf("[Tunnel] handshake successful over %s, cipher MERIDIAN-CHACHA", tc.cfg.Transport)
 	if config.DebugMode {
 		features := "none"
 		switch {
@@ -280,13 +291,19 @@ func (tc *TunnelClient) Connect() error {
 		case tc.flowControl:
 			features = fmt.Sprintf("flow-control (window %d KiB)", tc.cfg.StreamWindow/1024)
 		}
-		fmt.Printf("[DEBUG] [Tunnel] Server features: %s\n", features)
+		logf("[Tunnel] server features: %s", features)
 	}
 
 	tc.connectedAt = time.Now()
 
 	// Start read loop
 	go tc.readLoop()
+
+	// Reclaim half-dead streams: the slot they hold is what turns "a few
+	// abandoned connections" into "the proxy refuses everything".
+	if tc.idleTimeout > 0 {
+		go tc.reapLoop()
+	}
 
 	// Keepalive keeps the tunnel alive through NAT/firewall idle timeouts and
 	// gives the balancer a reason to emit traffic when it is enabled.
@@ -305,6 +322,21 @@ func (tc *TunnelClient) DialStream(ctx context.Context, targetAddr string) (net.
 
 	sid := atomic.AddUint32(&tc.streamIDAlloc, 1)
 
+	// Wait for a dial slot before spending a server-side dial. Waiting (instead
+	// of failing) is what keeps a connection storm from turning into a burst of
+	// timeouts: the dials that do go through finish quickly and the rest queue
+	// behind them under the caller's own deadline. Taking the slot before the
+	// stream is published keeps its release path race-free.
+	if tc.dialSem != nil {
+		select {
+		case tc.dialSem <- struct{}{}:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-tc.closeCh:
+			return nil, errors.New("tunnel: closed while waiting for a dial slot")
+		}
+	}
+
 	sc := &StreamConn{
 		sid:         sid,
 		client:      tc,
@@ -316,6 +348,15 @@ func (tc *TunnelClient) DialStream(ctx context.Context, targetAddr string) (net.
 	if tc.flowControl {
 		sc.flow = mfp.NewFlowWindow(int64(tc.cfg.StreamWindow))
 		sc.ack = mfp.NewAckTracker(tc.cfg.StreamWindow)
+	}
+	sc.touch()
+
+	// With early data no confirmation arrives, so the slot would be held until
+	// the first byte comes back. Bound it by the dial timeout: the server has
+	// that long to produce something, otherwise the slot is released and the
+	// stream simply looks slow to the application.
+	if tc.dialSem != nil {
+		sc.dialTimer = time.AfterFunc(tc.cfg.DialTimeout, sc.endDial)
 	}
 
 	tc.mu.Lock()
@@ -353,24 +394,28 @@ func (tc *TunnelClient) DialStream(ctx context.Context, targetAddr string) (net.
 
 	select {
 	case success := <-sc.confirmChan:
+		sc.endDial()
 		if !success {
 			tc.removeStream(sid)
 			sc.CloseFromServer()
 			if config.DebugMode {
-				fmt.Printf("[DEBUG] [Tunnel] Stream %d connection rejected by server\n", sid)
+				logf("[Tunnel] stream %d rejected by server", sid)
 			}
 			return nil, fmt.Errorf("tunnel: connection rejected by server")
 		}
 		if config.DebugMode {
-			fmt.Printf("[DEBUG] [Tunnel] Stream %d connection established to %s\n", sid, targetAddr)
+			logf("[Tunnel] stream %d established to %s", sid, targetAddr)
 		}
 	case <-ctx.Done():
+		sc.endDial()
 		tc.abortStream(sid)
 		return nil, ctx.Err()
 	case <-tc.closeCh:
+		sc.endDial()
 		tc.abortStream(sid)
 		return nil, errors.New("tunnel: closed while dialing")
 	case <-time.After(tc.cfg.DialTimeout):
+		sc.endDial()
 		tc.abortStream(sid)
 		return nil, errors.New("tunnel: dial timeout waiting for server response")
 	}
@@ -433,7 +478,7 @@ func (tc *TunnelClient) keepaliveLoop() {
 			}
 			if last := tc.lastRecv.Load(); last > 0 &&
 				time.Since(time.Unix(0, last)) > timeout {
-				fmt.Println("  [Tunnel] peer silent for too long, reconnecting")
+				logf("[Tunnel] peer silent for too long, reconnecting")
 				tc.Close()
 				return
 			}
@@ -561,7 +606,7 @@ func (tc *TunnelClient) readLoop() {
 		if err != nil {
 			decodeFailures++
 			if decodeFailures >= maxDecodeFailures {
-				fmt.Println("  [Tunnel] downlink desynchronised, reconnecting")
+				logf("[Tunnel] downlink desynchronised, reconnecting")
 				return
 			}
 			continue
@@ -574,7 +619,7 @@ func (tc *TunnelClient) readLoop() {
 		// the same frame even if their clocks or byte counters drift.
 		if frame.Header.Type == mfp.TypeBOUNDARY {
 			if err := tc.decoder.RotateKeys(); err != nil {
-				fmt.Printf("  [Tunnel] key rotation failed: %v\n", err)
+				logf("[Tunnel] key rotation failed: %v", err)
 				return
 			}
 			continue
@@ -653,7 +698,7 @@ func (tc *TunnelClient) readLoop() {
 				// window allows in flight, reset just that stream. The
 				// application sees EOF and retries on a fresh connection.
 				if !sc.enqueue(frame.Data) {
-					fmt.Printf("  [Tunnel] stream %d consumer stalled, resetting\n", sid)
+					noteEvent("stream_stalled", "tunnel: stream %d consumer stalled, resetting", sid)
 					tc.removeStream(sid)
 					sc.CloseFromServer()
 					go func(id uint32) {
@@ -663,6 +708,60 @@ func (tc *TunnelClient) readLoop() {
 			}
 		}
 	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Idle stream reclamation
+// ─────────────────────────────────────────────────────────────────────────────
+
+// reaperInterval is how often abandoned streams are looked for. It is
+// deliberately coarser than the idle timeout: the goal is to free the slot
+// within a few tens of seconds, not to police exact timings.
+const reaperInterval = 30 * time.Second
+
+func (tc *TunnelClient) reapLoop() {
+	ticker := time.NewTicker(reaperInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-tc.done():
+			return
+		case now := <-ticker.C:
+			tc.reapIdle(now)
+		}
+	}
+}
+
+// reapIdle closes every stream that has carried no byte in either direction
+// for longer than the idle timeout, and reports how many it reclaimed.
+//
+// This is the difference between "a player abandoned some connections" and "the
+// proxy stopped accepting connections": the abandoned streams keep their slots
+// (and their share of the flow-control window) until the application closes a
+// socket it has already forgotten about. Each reclaimed stream is reset on the
+// wire so the server closes its target instead of holding it open.
+func (tc *TunnelClient) reapIdle(now time.Time) int {
+	if tc.idleTimeout <= 0 {
+		return 0
+	}
+	tc.mu.Lock()
+	victims := make([]*StreamConn, 0, 8)
+	for _, sc := range tc.activeStreams {
+		if sc.idleFor(now) > tc.idleTimeout {
+			victims = append(victims, sc)
+		}
+	}
+	tc.mu.Unlock()
+
+	for _, sc := range victims {
+		idle := sc.idleFor(now)
+		sid := sc.sid
+		tc.removeStream(sid)
+		sc.CloseFromServer()
+		go func() { _ = tc.sendFrame(mfp.TypeRESET, sid, 0, nil, 0) }()
+		noteEvent("stream_idle", "tunnel: stream %d idle for %v, reclaimed", sid, idle.Round(time.Second))
+	}
+	return len(victims)
 }
 
 // Close gracefully closes the tunnel client.
@@ -712,6 +811,46 @@ type StreamConn struct {
 	// when the stream was opened with early data.
 	errMu   sync.Mutex
 	readErr error
+	// lastActive is the Unix-nano time of the last byte moved in either
+	// direction. The reaper uses it to find streams the application abandoned
+	// without closing.
+	lastActive atomic.Int64
+	// dialTimer releases the lane's dial slot if the server never answers;
+	// endDialOnce makes the release idempotent across every path.
+	dialTimer   *time.Timer
+	endDialOnce sync.Once
+}
+
+// touch records traffic on the stream, deferring idle reclamation.
+func (sc *StreamConn) touch() {
+	sc.lastActive.Store(time.Now().UnixNano())
+}
+
+// idleFor reports how long the stream has been silent.
+func (sc *StreamConn) idleFor(now time.Time) time.Duration {
+	last := sc.lastActive.Load()
+	if last == 0 {
+		return 0
+	}
+	return now.Sub(time.Unix(0, last))
+}
+
+// endDial gives the lane's dial slot back. It runs at most once: the first
+// downlink byte, the confirmation, an error path or the dial timeout all call
+// it, whichever comes first.
+func (sc *StreamConn) endDial() {
+	sc.endDialOnce.Do(func() {
+		if sc.dialTimer != nil {
+			sc.dialTimer.Stop()
+		}
+		if sc.client == nil || sc.client.dialSem == nil {
+			return
+		}
+		select {
+		case <-sc.client.dialSem:
+		default:
+		}
+	})
 }
 
 // enqueue hands one DATA frame to the application reader. It reports false
@@ -723,6 +862,10 @@ func (sc *StreamConn) enqueue(data []byte) bool {
 	if sc.maxBuffer > 0 && sc.buffered.Load()+size > sc.maxBuffer {
 		return false
 	}
+	// The server produced bytes for this stream, so its dial is done and the
+	// lane can spend the slot on the next connection.
+	sc.endDial()
+	sc.touch()
 	sc.buffered.Add(size)
 	select {
 	case sc.readChan <- data:
@@ -763,6 +906,7 @@ func (sc *StreamConn) Read(b []byte) (int, error) {
 		}
 		sc.consume(n)
 		sc.sendAck(n)
+		sc.touch()
 		return n, nil
 	case <-sc.closed:
 		// A RESET arrives right after the final DATA frames. Drain whatever is
@@ -814,6 +958,7 @@ func (sc *StreamConn) Write(b []byte) (int, error) {
 	default:
 	}
 
+	sc.touch()
 	written := 0
 	for len(b) > 0 {
 		chunk := b
@@ -822,7 +967,7 @@ func (sc *StreamConn) Write(b []byte) (int, error) {
 		}
 		jitter := sc.client.encoder.JitterDelayFor(len(chunk))
 		if err := sc.flow.Acquire(int64(len(chunk))); err != nil {
-			fmt.Printf("  [Tunnel] stream %d uplink stalled: %v\n", sc.sid, err)
+			noteEvent("uplink_stalled", "tunnel: stream %d uplink stalled: %v", sc.sid, err)
 			sc.Close()
 			return written, err
 		}
@@ -840,6 +985,7 @@ func (sc *StreamConn) Close() error {
 	sc.closeOnce.Do(func() {
 		close(sc.closed)
 		sc.flow.Close()
+		sc.endDial()
 		sc.client.removeStream(sc.sid)
 		// Best-effort RESET so the server can close its target immediately
 		// instead of waiting for a read timeout.
@@ -852,6 +998,7 @@ func (sc *StreamConn) CloseFromServer() {
 	sc.closeOnce.Do(func() {
 		close(sc.closed)
 		sc.flow.Close()
+		sc.endDial()
 	})
 }
 

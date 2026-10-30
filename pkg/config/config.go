@@ -142,6 +142,36 @@ type ClientConfig struct {
 
 	RenewalInterval  time.Duration `yaml:"renewal_interval" json:"renewal_interval"`
 	RenewalDataLimit uint64        `yaml:"renewal_data_limit" json:"renewal_data_limit"`
+
+	// StreamIdleTimeout reclaims a stream that carried no byte in either
+	// direction for this long. A player that abandons a connection without
+	// closing its socket leaves a half-dead stream holding a slot forever;
+	// without this the slots fill up and every new connection is refused while
+	// the tunnel still looks healthy. Zero disables reclamation.
+	StreamIdleTimeout time.Duration `yaml:"stream_idle_timeout" json:"stream_idle_timeout"`
+
+	// MaxPendingDials bounds how many streams on one lane may be waiting for
+	// the server to finish dialling the target. A connection storm otherwise
+	// sends hundreds of dials at once, the server queues them all, and the
+	// slowest ones time out — which looks like a dead proxy. Extra dials wait
+	// for a slot instead of failing outright. Zero disables the cap.
+	MaxPendingDials int `yaml:"max_pending_dials" json:"max_pending_dials"`
+
+	// Local logging. LogFile empty keeps the historical behaviour: everything
+	// goes to stdout, which procd/syslog captures. A path tees the same lines
+	// into a size-rotated file so a burst of errors cannot evict the evidence
+	// (the router's syslog ring is only a few dozen KiB).
+	LogFile       string `yaml:"log_file" json:"log_file"`
+	LogRotateSize uint64 `yaml:"log_rotate_size" json:"log_rotate_size"`
+	LogRotateKeep int    `yaml:"log_rotate_keep" json:"log_rotate_keep"`
+	// LogTimezone decides which clock the log timestamps use. Empty falls back
+	// to schedule_timezone, then to the system zone. A router whose
+	// /etc/localtime is missing logs in UTC while its neighbour logs in
+	// UTC+8, which makes correlating two boxes during an incident guesswork.
+	LogTimezone string `yaml:"log_timezone" json:"log_timezone"`
+	// LogVerbose logs one line per proxied connection. Per-minute counters are
+	// always logged, so this is only for packet-level forensics.
+	LogVerbose bool `yaml:"log_verbose" json:"log_verbose"`
 }
 
 // TransportWindow is one entry of a daily transport schedule.
@@ -346,6 +376,13 @@ func DefaultClientConfig() ClientConfig {
 		DownMbps:         0,
 		RenewalInterval:  5 * time.Minute,
 		RenewalDataLimit: 67108864, // 64MB
+		// Ten minutes is long enough that a browser's idle keep-alive socket
+		// survives, and short enough that abandoned streams free their slots
+		// within one playback session.
+		StreamIdleTimeout: DefaultStreamIdleTimeout,
+		MaxPendingDials:   DefaultMaxPendingDials,
+		LogRotateSize:     DefaultLogRotateSize,
+		LogRotateKeep:     DefaultLogRotateKeep,
 	}
 }
 
@@ -477,6 +514,74 @@ func NormalizeTunnelConnections(n int) int {
 	return n
 }
 
+// Client-side operational defaults.
+const (
+	// DefaultStreamIdleTimeout is how long a stream may carry no traffic
+	// before the client reclaims it. Abandoned player connections are the
+	// reason this exists; the value is well above any legitimate idle period a
+	// browser or media player keeps open.
+	DefaultStreamIdleTimeout = 10 * time.Minute
+	// minStreamIdleTimeout protects against a config that would shred healthy
+	// connections. Zero still means "disabled".
+	minStreamIdleTimeout = 30 * time.Second
+
+	// DefaultMaxPendingDials is the per-lane cap on connections waiting for
+	// the server to finish dialling. Browsers open a handful of connections
+	// per page, so this leaves plenty of head-room while still absorbing a
+	// restart storm.
+	DefaultMaxPendingDials = 64
+	maxMaxPendingDials     = 4096
+
+	// DefaultLogRotateSize is the size at which the client log file rolls
+	// over. 4 MiB is ~30 hours of steady traffic even with per-minute
+	// summaries and tunnel events.
+	DefaultLogRotateSize = 4 << 20
+	minLogRotateSize     = 64 << 10
+
+	// DefaultLogRotateKeep is how many rolled files are kept (log.1 .. log.N).
+	DefaultLogRotateKeep = 3
+	maxLogRotateKeep     = 20
+)
+
+// NormalizeStreamIdleTimeout clamps the idle reclamation threshold. Zero and
+// negatives disable reclamation, which stays a valid choice.
+func NormalizeStreamIdleTimeout(d time.Duration) time.Duration {
+	if d <= 0 {
+		return 0
+	}
+	if d < minStreamIdleTimeout {
+		return minStreamIdleTimeout
+	}
+	return d
+}
+
+// NormalizeMaxPendingDials clamps the per-lane dial cap. Zero disables it.
+func NormalizeMaxPendingDials(n int) int {
+	if n <= 0 {
+		return 0
+	}
+	if n > maxMaxPendingDials {
+		return maxMaxPendingDials
+	}
+	return n
+}
+
+// NormalizeLogRotate clamps the log rotation settings so a typo cannot turn
+// rotation into either "never rotates" or "keeps a thousand files".
+func NormalizeLogRotate(size uint64, keep int) (uint64, int) {
+	if size == 0 {
+		size = DefaultLogRotateSize
+	} else if size < minLogRotateSize {
+		size = minLogRotateSize
+	}
+	if keep <= 0 {
+		keep = DefaultLogRotateKeep
+	} else if keep > maxLogRotateKeep {
+		keep = maxLogRotateKeep
+	}
+	return size, keep
+}
+
 // LoadClientConfig reads a YAML/JSON config file and returns a ClientConfig.
 // Fix #15: previous code silently ignored parse failures and returned defaults;
 // now returns an error if both YAML and JSON parsing fail.
@@ -507,6 +612,9 @@ func LoadClientConfig(path string) (ClientConfig, error) {
 	cfg.MaxConcurrentStream = NormalizeMaxConcurrentStreams(cfg.MaxConcurrentStream)
 	cfg.SessionLifetime = NormalizeSessionLifetime(cfg.SessionLifetime)
 	cfg.TunnelConnections = NormalizeTunnelConnections(cfg.TunnelConnections)
+	cfg.StreamIdleTimeout = NormalizeStreamIdleTimeout(cfg.StreamIdleTimeout)
+	cfg.MaxPendingDials = NormalizeMaxPendingDials(cfg.MaxPendingDials)
+	cfg.LogRotateSize, cfg.LogRotateKeep = NormalizeLogRotate(cfg.LogRotateSize, cfg.LogRotateKeep)
 	return cfg, nil
 }
 

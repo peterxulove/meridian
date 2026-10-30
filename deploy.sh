@@ -429,10 +429,23 @@ max_concurrent_streams: 512
 tunnel_connections: ${client_lanes}
 session_lifetime: "1h"
 dial_timeout: "15s"
+# Reclaim a stream that carried no byte either way for this long; an
+# abandoned connection otherwise keeps its slot forever. 0 disables.
+stream_idle_timeout: "10m"
+# Per-lane cap on connections waiting for the server to dial. The excess
+# queues behind a slot instead of all timing out together. 0 disables.
+max_pending_dials: 64
 
 # 0 = adaptive BBR; set explicit Mbps only for a known QUIC link.
 up_mbps: 0
 down_mbps: 0
+
+# Optional size-rotated log file; stdout/journal keeps working either way.
+# log_file: "/var/log/meridian-client.log"
+# log_rotate_size: 4194304
+# log_rotate_keep: 3
+# log_timezone: "UTC+8"     # defaults to schedule_timezone
+log_verbose: false
 
 # ─── Local Proxy ───
 listen_addr: "0.0.0.0:${client_port}"

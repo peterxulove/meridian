@@ -58,18 +58,40 @@ func main() {
 		cfg.ListenAddr = listen
 	}
 
-	fmt.Printf("Meridian Client %s\n", Version)
-	fmt.Printf("  Server:    %s\n", cfg.ServerAddr)
+	// Install the log sink before anything else logs: a router's syslog ring
+	// is small enough that a burst of errors erases its own evidence, so the
+	// file is where the timeline has to live.
+	if err := setupLogging(cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: cannot open log file %q: %v\n", cfg.LogFile, err)
+	} else if cfg.LogFile != "" {
+		defer closeLogging()
+	}
+	if logSetupWarning != nil {
+		logf("[warn] log_timezone ignored: %v", logSetupWarning)
+	}
+
+	logf("Meridian Client %s", Version)
+	logf("  Server:    %s", cfg.ServerAddr)
 	if len(cfg.TransportSchedule) == 0 {
-		fmt.Printf("  Transport: %s\n", cfg.Transport)
+		logf("  Transport: %s", cfg.Transport)
 	} else {
-		fmt.Printf("  Transport: %s by default, scheduled:\n", cfg.Transport)
+		logf("  Transport: %s by default, scheduled:", cfg.Transport)
 		for _, w := range cfg.TransportSchedule {
-			fmt.Printf("             %s  %s-%s\n", w.Transport, w.From, w.To)
+			logf("             %s  %s-%s", w.Transport, w.From, w.To)
 		}
 	}
-	fmt.Printf("  Cipher:    %s\n", cfg.CipherSuite)
-	fmt.Printf("  SOCKS5:    %s\n", cfg.ListenAddr)
+	logf("  Cipher:    %s", cfg.CipherSuite)
+	logf("  SOCKS5:    %s", cfg.ListenAddr)
+	if cfg.StreamIdleTimeout > 0 {
+		logf("  Idle:      reclaim streams silent for %v", cfg.StreamIdleTimeout)
+	} else {
+		logf("  Idle:      reclamation disabled")
+	}
+	if cfg.MaxPendingDials > 0 {
+		logf("  Dial cap:  %d pending per lane", cfg.MaxPendingDials)
+	} else {
+		logf("  Dial cap:  unlimited")
+	}
 
 	client, err := NewClient(cfg)
 	if err != nil {
@@ -78,7 +100,7 @@ func main() {
 	}
 	if len(cfg.TransportSchedule) > 0 {
 		now := time.Now().In(client.scheduleLoc)
-		fmt.Printf("  Schedule:  now %s %s (UTC%s) => %s\n",
+		logf("  Schedule:  now %s %s (UTC%s) => %s",
 			now.Format("15:04"), client.scheduleLoc, now.Format("-07:00"), client.desiredTransport())
 	}
 
@@ -94,21 +116,28 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Error starting client: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("Client running (PID %d). Press Ctrl+C to stop.\n", os.Getpid())
+	logf("Client running (PID %d). Press Ctrl+C to stop.", os.Getpid())
+
+	// Failure/interaction counters are reported once per interval, not once per
+	// connection: the per-connection form flooded the log badly enough to push
+	// out the very window it described.
+	stopEvents := make(chan struct{})
+	startEventReporter(summaryInterval, stopEvents)
 
 	// Print stats every 60 seconds
 	ticker := time.NewTicker(60 * time.Second)
 	go func() {
 		for range ticker.C {
 			active, total, failed, in, out := client.proxy.Stats()
-			fmt.Printf("  [Stats] active=%d total=%d failed=%d in=%dKB out=%dKB\n",
+			logf("  [Stats] active=%d total=%d failed=%d in=%dKB out=%dKB",
 				active, total, failed, in/1024, out/1024)
 		}
 	}()
 
 	<-sigch
 	ticker.Stop()
-	fmt.Println("\nShutting down...")
+	close(stopEvents)
+	logf("Shutting down...")
 	client.Stop()
 }
 
@@ -211,7 +240,7 @@ func (c *Client) retireLane(lane int, tunnel *TunnelClient, grace time.Duration)
 			return
 		}
 		if time.Now().After(deadline) {
-			fmt.Printf("  [Tunnel %d/%d] Retired lane still had %d active at grace expiry, closing\n",
+			logf("[Tunnel %d/%d] retired lane still had %d active at grace expiry, closing",
 				lane+1, len(c.tunnels), tunnel.ActiveLoad())
 			tunnel.Close()
 			return
@@ -230,8 +259,7 @@ func (c *Client) maintainTunnel(lane int) {
 		cfg.Transport = active
 		tunnel := NewTunnelClient(cfg, store)
 		if err := tunnel.Connect(); err != nil {
-			fmt.Printf("  [Tunnel %d/%d] Connection failed: %v. Retrying in 5s...\n",
-				lane+1, len(c.tunnels), err)
+			logf("[Tunnel %d/%d] connection failed: %v, retrying in 5s", lane+1, len(c.tunnels), err)
 			select {
 			case <-time.After(5 * time.Second):
 			case <-c.stopCh:
@@ -254,7 +282,7 @@ func (c *Client) maintainTunnel(lane int) {
 			if want := c.desiredTransport(); want != active {
 				replacement := NewTunnelClient(withTransport(cfg, want), store)
 				if err := replacement.Connect(); err != nil {
-					fmt.Printf("  [Tunnel %d/%d] Switch to %s failed: %v. Staying on %s.\n",
+					logf("[Tunnel %d/%d] switch to %s failed: %v, staying on %s",
 						lane+1, len(c.tunnels), want, err, active)
 					time.Sleep(5 * time.Second)
 					continue
@@ -262,7 +290,7 @@ func (c *Client) maintainTunnel(lane int) {
 				c.mu.Lock()
 				c.tunnels[lane] = replacement
 				c.mu.Unlock()
-				fmt.Printf("  [Tunnel %d/%d] Schedule switched %s -> %s (draining %d active)\n",
+				logf("[Tunnel %d/%d] schedule switched %s -> %s (draining %d active)",
 					lane+1, len(c.tunnels), active, want, tunnel.ActiveLoad())
 				go c.retireLane(lane, tunnel, scheduledSwitchGrace)
 				active = want
@@ -277,12 +305,12 @@ func (c *Client) maintainTunnel(lane int) {
 			if lifetime > 0 && !tunnel.Draining() && time.Since(tunnel.ConnectedAt()) >= lifetime {
 				tunnel.draining.Store(true)
 				drainDeadline = time.Now().Add(drainGrace(lifetime))
-				fmt.Printf("  [Tunnel %d/%d] Session lifetime reached, draining (%d active)\n",
+				logf("[Tunnel %d/%d] session lifetime reached, draining (%d active)",
 					lane+1, len(c.tunnels), tunnel.ActiveLoad())
 			}
 			if tunnel.Draining() && (tunnel.ActiveLoad() == 0 || time.Now().After(drainDeadline)) {
 				if tunnel.ActiveLoad() > 0 {
-					fmt.Printf("  [Tunnel %d/%d] Drain grace expired with %d active, closing\n",
+					logf("[Tunnel %d/%d] drain grace expired with %d active, closing",
 						lane+1, len(c.tunnels), tunnel.ActiveLoad())
 				}
 				tunnel.Close()
@@ -296,7 +324,7 @@ func (c *Client) maintainTunnel(lane int) {
 		}
 		c.mu.Unlock()
 		if !c.stopping.Load() {
-			fmt.Printf("  [Tunnel %d/%d] Disconnected. Reconnecting...\n", lane+1, len(c.tunnels))
+			logf("[Tunnel %d/%d] disconnected, reconnecting", lane+1, len(c.tunnels))
 		}
 	}
 }

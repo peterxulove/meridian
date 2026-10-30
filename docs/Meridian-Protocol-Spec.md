@@ -1,4 +1,4 @@
-# Meridian Protocol Specification v1.8
+# Meridian Protocol Specification v1.9
 
 > A hybrid high-efficiency, anti-detection secure communication protocol.
 > Combines strengths of Shadowsocks, Hysteria/Hysteria2, VLESS, and REALITY.
@@ -17,6 +17,7 @@ Revision history:
 | 1.7 | 2026-10-30 | Client transport schedule: per-lane hot switch between transports on a daily window |
 | 1.7.1 | 2026-10-30 | Schedule windows are evaluated in an explicitly configured zone |
 | 1.8 | 2026-10-30 | Handshake surface: browser-only client ALPN, CA-issued certificate, cover-site response for unauthenticated requests |
+| 1.9 | 2026-10-30 | Idle stream reclamation on the client (RESET after `stream_idle_timeout`); per-lane dial admission (`max_pending_dials`) |
 
 ---
 
@@ -780,6 +781,32 @@ path one flow plateaus around 150 Mbps regardless of available bandwidth, while
 four WebSocket lanes reach 500–600 Mbps aggregate. Lanes are independent, so
 their throughput adds up; per-stream throughput is still bounded by the lane it
 lands on.
+
+### 6.6 Idle Stream Reclamation and Dial Admission
+
+Both rules are local to the client; neither changes the wire format.
+
+**Idle reclamation.** A stream that carries no byte in either direction for
+`stream_idle_timeout` (default `10m`, `0` disables) is closed by the client,
+which sends `RESET` for that stream so the server tears down its target
+connection instead of holding it until the target itself times out. This exists
+because an application may abandon a connection without closing the socket
+(players replace connections as they seek); those half-dead streams otherwise
+keep their slot and their share of the credit window indefinitely, and enough
+of them make a healthy tunnel refuse new work.
+
+Peers must therefore tolerate a `RESET` on a stream that is still open from
+their side — it is the same frame used for an ordinary abandoned connection.
+The reaper runs on a 30s tick, so the effective threshold is
+`stream_idle_timeout` plus at most one tick.
+
+**Dial admission.** `max_pending_dials` (default `64`, `0` disables) bounds how
+many streams on one lane may be waiting for the server to complete its target
+dial. Beyond the cap, a new CONNECT waits for a slot rather than being refused,
+and the wait is bounded by the caller's dial deadline. A burst — a restarted
+browser opening hundreds of sockets at once — therefore produces a short queue
+instead of hundreds of simultaneous server-side dials that all time out
+together.
 
 ---
 

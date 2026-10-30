@@ -73,6 +73,35 @@ WSS、另一个常驻 QUIC。
 
 ## 更新日志
 
+### v1.6.14（2026-10-30）
+
+#### 🩺 让“卡死”留下证据：日志落盘、分钟级汇总、僵尸流回收
+
+起因是 111 上那次卡死：SOCKS 层 `failed=617`（`total=1585`，约 39% 失败），可翻日志时 13:00–13:54 的现场**已经被自己挤掉了**——每连接一行的错误日志把 64KB 的 logd 环形缓冲冲干净了。
+
+四项改动：
+
+- **日志同时落盘并按大小轮转**（`log_file` / `log_rotate_size` / `log_rotate_keep`）。stdout 保留，`logread` 照旧可用；文件是时间长度的载体。默认 4 MiB ×（1+3）份，按行边界轮转，不会把一行拆到两个文件。
+- **失败日志改成每分钟一行汇总**。改成按原因计数（`dial_timeout` / `dial_refused` / `dial_dns` / `dial_reset` / `dial_lane_full` / `limit_dropped` / `negotiate` / `stream_idle` …），每个原因只保留最后一条样本：
+
+```
+[Summary] last 60s: conns=0 events=1 stream_idle=1 | stream_idle: tunnel: stream 65 idle for 39s, reclaimed
+[Summary] last 60s: conns=319 events=612 dial_timeout=590 limit_dropped=22 | dial_timeout: socks5: [192.168.1.111:36890] dial www.gstatic.com:443 failed: tunnel: dial timeout …
+```
+
+​       每分钟的 `conns=` 也顺便替代了“每连接一行”的连接风暴证据，所以 `log_verbose` 默认关闭。
+- **僵尸流回收**（`stream_idle_timeout`，默认 10 分钟）。播放器丢弃连接但不关 socket 时，这条流会一直占着名额和窗口；攒够就表现为“隧道连着、应用全连不上”。超过阈值没有字节流动就回收，并给服务端发 RESET 关掉目标连接。
+- **单 lane 建连并发上限**（`max_pending_dials`，默认 64）。连接风暴时不再把几百个 dial 一起丢给服务端等超时：超出的排队（受调用方自己的 deadline 约束），前面的先跑完。
+- **时间戳统一到配置时区**（`log_timezone`，缺省跟随 `schedule_timezone`）。实测 110 的系统时区是 UTC、111 是 UTC+8，同一次事故两边的日志差 8 小时；现在两台机器的日志时间可以直接对齐。
+
+本地实测（`stream_idle_timeout: 5s` 被抬到 30s 下限，reaper 每 30s 扫一次）：
+
+- 黑洞目标上挂一条静默连接，**39 秒后被回收**，下一分钟汇总打出 `stream_idle=1`。
+- 60 个并发连接打同一目标（`max_pending_dials: 2`，故意压到极小）：**60/60 成功**，没有一条因为排队而失败。
+- 日志文件与 stdout 内容一致，轮转后 `client.log` / `.1` / `.2` 均不超过上限且都以换行结尾。
+
+这一版不改线路协议，服务端不用动。
+
 ### v1.6.13（2026-10-30）
 
 #### 🩹 修回源：保留 Host、加上超时、TLS 回源固定 HTTP/1.1
@@ -625,8 +654,35 @@ sudo ./deploy.sh transport client websocket # 或直接指定
 | `session_lifetime` | 外层连接寿命，到期后 drain（不再接新流）并重连；多 lane 自动错开 0–15%；`0` 关闭 | `1h` | 5m–24h |
 | `timing_jitter_ms` | 小帧随机延迟；大帧不受影响 | `0` | 0–100 |
 | `up_mbps` / `down_mbps` | QUIC 固定带宽提示；`0` 表示自适应 BBR | `0` | 0 或链路值 |
+| `stream_idle_timeout` | 单条流**双向都无字节**多久后回收（发 RESET 并释放名额）；`0` 关闭 | `10m` | 0 或 ≥30s |
+| `max_pending_dials` | **每条 lane** 同时在建连的上限；超出的排队而不是直接失败；`0` 关闭 | `64` | 0–4096 |
 
 `stream_window` 现在同时决定吞吐与延迟：调大更抗抖动但排队更久，调小更跟手；单流吞吐上限约为 `窗口 / RTT`（1 MiB @ 55ms ≈ 145 Mbps）。`max_concurrent_streams` 是每隧道上限，客户端本地代理的总并发按 `max_concurrent_streams × tunnel_connections` 推导（限制在 512–4096）。
+
+### 日志与排障
+
+客户端默认只往 stdout 写，由 procd / systemd 收进日志系统。路由器上的 logd 环形缓冲只有几十 KB，**一次错误风暴就会把它自己覆盖掉**，所以现场排查建议打开文件日志：
+
+```yaml
+log_file: "/var/log/meridian-client.log"   # 同时仍写 stdout
+log_rotate_size: 4194304                   # 4 MiB 一份
+log_rotate_keep: 3                         # 保留 .1 .. .3
+log_verbose: false                         # true 才打每连接一行
+# log_timezone: "UTC+8"                    # 时间戳用哪个时钟；缺省跟随 schedule_timezone
+```
+
+日志行的三种形态：
+
+```
+[2026-10-30 16:51:28] [Tunnel] handshake successful over QUIC, cipher MERIDIAN-CHACHA   # 事件
+[2026-10-30 16:52:28]   [Stats] active=1 total=65 failed=0 in=4KB out=7KB               # 每分钟累计
+[2026-10-30 16:52:28] [Summary] last 60s: conns=65 events=0                             # 每分钟汇总
+```
+
+时间戳默认跟随 `schedule_timezone`（再退回系统时区）——两台路由的 `/etc/localtime` 未必一致，实测 110 用 UTC、111 用 UTC+8，同一次事故在日志里差 8 小时，对不上时间线。
+
+`conns=` 是这一分钟新建的代理连接数（连接风暴一眼可见），`events=` 是按原因归类的失败/回收次数，`|` 后面是占比最高的三个原因各一条样本。排障顺序建议：先看 `conns=` 是否异常放大（重启后的连接风暴），再看 `dial_timeout` 与 `limit_dropped` 的比例（前者是上游慢，后者是本地名额打满），`stream_idle` 则是僵尸流回收的计数。
+
 
 ---
 
