@@ -46,6 +46,15 @@ Meridian is a custom secure proxy protocol designed to deliver **undetectable en
 
 ## Changelog
 
+### v1.6.13 (2026-10-30)
+
+#### 🩹 Fallback fixes: preserve Host, bound every phase, pin HTTP/1.1
+
+Two problems showed up as soon as `fallback_url` met a real server:
+
+- The proxy rewrote `Host` to the target address (`127.0.0.1`), which landed on the cover site's default server block and got closed with 444 — the probe saw a 502. Host is now rewritten only for domain targets; an address target (the loopback case) keeps the virtual host the probe asked for.
+- HTTPS fallback hung: after negotiating h2 the exchange stalled and the probe stayed connected. The cover hop is now pinned to HTTP/1.1, with 5s dial, 5s handshake and 8s response-header deadlines, so a dead cover site returns 502 instead of pinning a connection.
+
 ### v1.6.12 (2026-10-30)
 
 #### 🪪 Closing the handshake surface: no self-named ALPN, no self-signed cert, no 404

@@ -139,24 +139,49 @@ func newFallbackHandler(cfg config.ServerConfig) http.Handler {
 	inner := proxy.Director
 	proxy.Director = func(r *http.Request) {
 		inner(r)
-		// The default director keeps the inbound Host header, which would make
-		// the cover site answer for the tunnel's address (nginx: 444).
-		r.Host = target.Host
-	}
-	if cfg.FallbackSNI != "" {
-		proxy.Transport = &http.Transport{
-			TLSClientConfig: &tls.Config{
-				ServerName: cfg.FallbackSNI,
-				MinVersion: tls.VersionTLS12,
-			},
-			ForceAttemptHTTP2: true,
+		// A cover site reached by address (loopback, typically) is the same
+		// virtual host the probe asked for, so its own name must survive:
+		// rewriting it to "127.0.0.1" sends the request to whatever the server
+		// answers by default, which is usually a rejection. A cover site
+		// reached by name is a different site, and needs its own Host.
+		if net.ParseIP(target.Hostname()) == nil {
+			r.Host = target.Host
 		}
 	}
+	proxy.Transport = fallbackTransport(target.Scheme, cfg.FallbackSNI)
 	// A cover site that is down must not leak Go's proxy error page.
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
 	}
 	return proxy
+}
+
+// fallbackTransport builds the connection used to reach the cover site.
+//
+// Two properties matter more than throughput. First, every phase has a
+// deadline: a probe must never be able to hold a handler open by pointing the
+// fallback at something that stops responding. Second, the TLS hop is pinned
+// to HTTP/1.1 — an HTTP/2 upgrade here buys nothing and its preface exchange
+// is one more way for the proxy to stall on a server that negotiated h2 but
+// answers slowly.
+func fallbackTransport(scheme, sni string) *http.Transport {
+	dialer := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
+	tr := &http.Transport{
+		DialContext:           dialer.DialContext,
+		MaxIdleConns:          16,
+		IdleConnTimeout:       60 * time.Second,
+		ResponseHeaderTimeout: 8 * time.Second,
+		ExpectContinueTimeout: time.Second,
+		TLSHandshakeTimeout:   5 * time.Second,
+	}
+	if scheme == "https" {
+		tr.TLSClientConfig = &tls.Config{
+			ServerName: sni,
+			MinVersion: tls.VersionTLS12,
+			NextProtos: []string{"http/1.1"},
+		}
+	}
+	return tr
 }
 
 // ---------------------------------------------------------------------------

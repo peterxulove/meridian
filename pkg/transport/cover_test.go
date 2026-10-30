@@ -4,7 +4,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"strings"
+
 	"testing"
 
 	"meridian/pkg/config"
@@ -121,7 +121,28 @@ func TestFallbackWithoutCoverIs404(t *testing.T) {
 	}
 }
 
-func TestFallbackForwardsCoverHost(t *testing.T) {
+// TestFallbackTransportIsBounded guards the probe path against stalls: every
+// phase needs a deadline, and the TLS hop must not attempt an HTTP/2 upgrade
+// (the preface exchange is one more place for a proxy to sit waiting).
+func TestFallbackTransportIsBounded(t *testing.T) {
+	tr := fallbackTransport("https", "cover.example")
+	if tr.TLSClientConfig == nil || tr.TLSClientConfig.ServerName != "cover.example" {
+		t.Error("TLS hop does not verify against the configured cover name")
+	}
+	if got := tr.TLSClientConfig.NextProtos; len(got) != 1 || got[0] != "http/1.1" {
+		t.Errorf("NextProtos = %v, want [http/1.1]", got)
+	}
+	if tr.ResponseHeaderTimeout <= 0 || tr.TLSHandshakeTimeout <= 0 {
+		t.Error("fallback transport has unbounded phases: a stalled cover site would pin a probe")
+	}
+}
+
+// TestFallbackKeepsVirtualHostForAddressTarget: when the cover site is reached
+// by address (the usual loopback case) the request is still for the virtual
+// host the probe named, so the Host header must survive. Rewriting it to the
+// address sends the request to the server's default vhost, which is exactly
+// the case that answers with a rejection.
+func TestFallbackKeepsVirtualHostForAddressTarget(t *testing.T) {
 	var gotHost string
 	cover := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotHost = r.Host
@@ -132,13 +153,18 @@ func TestFallbackForwardsCoverHost(t *testing.T) {
 	srv := httptest.NewServer(l.fallback)
 	defer srv.Close()
 
-	resp, err := http.Get(srv.URL + "/")
+	req, err := http.NewRequest("GET", srv.URL+"/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = "cover.example"
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	if !strings.HasPrefix(cover.URL, "http://"+gotHost) {
-		t.Errorf("Host forwarded as %q, want the cover site's host", gotHost)
+	if gotHost != "cover.example" {
+		t.Errorf("Host forwarded as %q, want the probe's virtual host", gotHost)
 	}
 }
 

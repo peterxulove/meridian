@@ -12,7 +12,7 @@
 
 set -e
 
-DEFAULT_RELEASE_VERSION="v1.6.12"
+DEFAULT_RELEASE_VERSION="v1.6.13"
 
 # Re-execute with bash if run with sh
 if [ -z "$BASH_VERSION" ]; then
