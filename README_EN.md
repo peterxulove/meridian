@@ -78,6 +78,12 @@ connection storm, which is why `log_verbose` defaults to off.
   its slot and its window forever; enough of them and the tunnel looks
   connected while applications cannot connect at all. A stream with no bytes in
   either direction past the threshold is reset on the wire.
+- **`deploy.sh` no longer drops the transport schedule.** It rewrites
+  `client.yaml` wholesale and the template had no `transport_schedule`, so a
+  re-deploy silently turned "QUIC at night" into "WebSocket around the clock".
+  The template now carries a commented example, and an existing
+  `transport_schedule` / `schedule_timezone` is appended back with a
+  `Transport schedule preserved:` line.
 - **Timestamps follow a configured zone** (`log_timezone`, defaulting to
   `schedule_timezone`). Router 110's system zone turned out to be UTC while 111
   was UTC+8, so the same incident sat 8 hours apart in the two logs.

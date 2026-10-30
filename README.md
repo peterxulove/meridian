@@ -93,6 +93,7 @@ WSS、另一个常驻 QUIC。
 - **僵尸流回收**（`stream_idle_timeout`，默认 10 分钟）。播放器丢弃连接但不关 socket 时，这条流会一直占着名额和窗口；攒够就表现为“隧道连着、应用全连不上”。超过阈值没有字节流动就回收，并给服务端发 RESET 关掉目标连接。
 - **单 lane 建连并发上限**（`max_pending_dials`，默认 64）。连接风暴时不再把几百个 dial 一起丢给服务端等超时：超出的排队（受调用方自己的 deadline 约束），前面的先跑完。
 - **时间戳统一到配置时区**（`log_timezone`，缺省跟随 `schedule_timezone`）。实测 110 的系统时区是 UTC、111 是 UTC+8，同一次事故两边的日志差 8 小时；现在两台机器的日志时间可以直接对齐。
+- **`deploy.sh` 不再吞掉时段表**。它生成 `client.yaml` 是整份覆盖，而模板里没有 `transport_schedule`：重跑一次部署，"晚上走 QUIC"就悄悄变成"24 小时 WebSocket"，还没有任何提示。现在模板里带注释示例，并且已有的 `transport_schedule` / `schedule_timezone` 会在重写后原样追加回去，同时打印一行 `Transport schedule preserved:`。
 
 本地实测（`stream_idle_timeout: 5s` 被抬到 30s 下限，reaper 每 30s 扫一次）：
 

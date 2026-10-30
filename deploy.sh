@@ -399,6 +399,21 @@ configure_client() {
     if [ "$client_lanes" -gt 16 ]; then client_lanes=16; fi
     
     local client_yaml="${CONFIG_DIR}/client.yaml"
+
+    # Carry the transport schedule across a regeneration. Which hours use QUIC
+    # is an operator decision the installer cannot derive — and the heredoc
+    # below truncates the file, so a re-run used to drop the schedule silently
+    # and leave the client on WebSocket around the clock.
+    local sched_block=""
+    if [ -r "$client_yaml" ]; then
+        sched_block=$(awk '
+            /^transport_schedule:[[:space:]]*$/ { inblk = 1; print; next }
+            inblk && /^[[:space:]]+/ { print; next }
+            inblk { inblk = 0 }
+            /^schedule_timezone:/ { print }
+        ' "$client_yaml")
+    fi
+
     cat <<EOF | $SUDO tee "$client_yaml" >/dev/null
 # Meridian Client - Auto-generated configuration
 server_addr: "${client_server_addr}"
@@ -420,6 +435,17 @@ base_payload_size: 1400
 max_payload_size: 1452
 direction_balance: false
 timing_jitter_ms: 0.0
+
+# ─── Transport Schedule ───
+# Optional: use another transport inside a daily window and fall back to the
+# transport above outside it. Set schedule_timezone explicitly — routers
+# usually have no /etc/localtime and Go then reads UTC, which shifts every
+# window by hours. An existing schedule is preserved across re-runs.
+# transport_schedule:
+#   - transport: "QUIC"
+#     from: "18:00"
+#     to: "03:00"
+# schedule_timezone: "UTC+8"
 
 # ─── Connection ───
 keepalive_interval: "30s"
@@ -451,6 +477,13 @@ log_verbose: false
 listen_addr: "0.0.0.0:${client_port}"
 proxy_protocol: "${client_proto}"
 EOF
+
+    if [ -n "$sched_block" ]; then
+        { echo ""; echo "# ─── Transport Schedule (preserved from previous config) ───"; echo "$sched_block"; } \
+            | $SUDO tee -a "$client_yaml" >/dev/null
+        echo -e "${YELLOW}Transport schedule preserved:${NC}"
+        echo "$sched_block" | sed 's/^/    /'
+    fi
 
     if [ -n "$client_spki" ]; then
         printf 'reality_spki: "%s"\n' "$client_spki" | $SUDO tee -a "$client_yaml" >/dev/null
