@@ -76,6 +76,11 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Failed to create client: %v\n", err)
 		os.Exit(1)
 	}
+	if len(cfg.TransportSchedule) > 0 {
+		now := time.Now().In(client.scheduleLoc)
+		fmt.Printf("  Schedule:  now %s %s (UTC%s) => %s\n",
+			now.Format("15:04"), client.scheduleLoc, now.Format("-07:00"), client.desiredTransport())
+	}
 
 	// Raise the open-file descriptor limit before starting so that the
 	// SOCKS5 proxy can handle many concurrent connections without hitting
@@ -127,6 +132,7 @@ type Client struct {
 	// schedule switches the outer transport through the day; empty means the
 	// static cfg.Transport is used for the client's whole life.
 	schedule     []config.CompiledTransportWindow
+	scheduleLoc  *time.Location
 	tunnelCursor atomic.Uint32
 	stopping     atomic.Bool
 	stopCh       chan struct{}
@@ -158,11 +164,16 @@ func NewClient(cfg config.ClientConfig) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	scheduleLoc, err := config.LoadScheduleLocation(cfg.ScheduleTimezone)
+	if err != nil {
+		return nil, err
+	}
 	return &Client{
 		cfg:          cfg,
 		tunnels:      make([]*TunnelClient, laneCount),
 		laneSessions: sessions,
 		schedule:     schedule,
+		scheduleLoc:  scheduleLoc,
 		stopCh:       make(chan struct{}),
 	}, nil
 }
@@ -170,7 +181,7 @@ func NewClient(cfg config.ClientConfig) (*Client, error) {
 // desiredTransport is the transport the schedule asks for right now, or the
 // configured one when no window matches.
 func (c *Client) desiredTransport() config.TransportType {
-	now := time.Now()
+	now := time.Now().In(c.scheduleLoc)
 	for _, w := range c.schedule {
 		if w.Contains(now) {
 			return w.Transport

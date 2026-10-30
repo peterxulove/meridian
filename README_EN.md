@@ -46,6 +46,25 @@ Meridian is a custom secure proxy protocol designed to deliver **undetectable en
 
 ## Changelog
 
+### v1.6.11 (2026-10-30)
+
+#### 🕘 The schedule no longer trusts the system timezone
+
+`transport_schedule` can now pin the zone its windows are evaluated in:
+
+```yaml
+transport: "WebSocket"
+transport_schedule:
+  - transport: "QUIC"
+    from: "19:00"
+    to: "03:00"
+schedule_timezone: "UTC+8"     # IANA names such as Asia/Shanghai also work
+```
+
+- This fixes a bug seen in the field: when the file behind `/etc/localtime` is unreadable, `date` prints only `CST-8` with no time of day and Go's `time.Local` silently falls back to UTC. A client that should have used WebSocket at 10:59 decided it was 02:59 and dialled QUIC.
+- Fixed offsets accept `UTC+8`, `UTC+08:00`, `+08:00`, `-0700`, `GMT+5:30`. A typo is a start-up error instead of a silent shift to UTC.
+- The start-up banner now prints the zone, the current time and the chosen transport, so the decision is verifiable at a glance.
+
 ### v1.6.10 (2026-10-30)
 
 #### 🕒 Time-based transport switching: WebSocket by day, QUIC at night

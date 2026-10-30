@@ -51,6 +51,11 @@ dial_timeout: "15s"
 #   - transport: "QUIC"
 #     from: "19:00"
 #     to: "03:00"
+#
+# Zone used by transport_schedule. Leave empty to use the system zone. On
+# routers /etc/localtime is often missing and the system zone silently becomes
+# UTC, which shifts every window by hours — set a fixed offset to be safe.
+# schedule_timezone: "UTC+8"
 
 # Only used by the QUIC transport. 0 selects adaptive BBR.
 up_mbps: 0

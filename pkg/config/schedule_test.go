@@ -78,3 +78,43 @@ func TestEmptyScheduleIsValid(t *testing.T) {
 		t.Fatalf("got %v, %v", got, err)
 	}
 }
+
+func TestLoadScheduleLocationFixedOffsets(t *testing.T) {
+	cases := map[string]int{
+		"UTC+8":    8 * 3600,
+		"utc+08":   8 * 3600,
+		"+08:00":   8 * 3600,
+		"-0500":    -5 * 3600,
+		"GMT+5:30": 5*3600 + 30*60,
+	}
+	for name, want := range cases {
+		loc, err := LoadScheduleLocation(name)
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+			continue
+		}
+		_, got := time.Now().In(loc).Zone()
+		if got != want {
+			t.Errorf("%s: offset = %d, want %d", name, got, want)
+		}
+	}
+}
+
+func TestLoadScheduleLocationIANA(t *testing.T) {
+	loc, err := LoadScheduleLocation("Asia/Shanghai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, got := time.Now().In(loc).Zone()
+	if got != 8*3600 {
+		t.Errorf("offset = %d, want %d", got, 8*3600)
+	}
+}
+
+func TestLoadScheduleLocationRejectsGarbage(t *testing.T) {
+	for _, name := range []string{"Mars/Olympus", "UTC+25", "GMT+8:99"} {
+		if _, err := LoadScheduleLocation(name); err == nil {
+			t.Errorf("%q accepted, want error", name)
+		}
+	}
+}

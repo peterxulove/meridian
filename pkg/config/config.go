@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"regexp"
+	"strconv"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -130,6 +133,13 @@ type ClientConfig struct {
 	// midnight, for example "19:00" to "03:00".
 	TransportSchedule []TransportWindow `yaml:"transport_schedule" json:"transport_schedule"`
 
+	// ScheduleTimezone pins the clock the schedule is evaluated against. An
+	// empty value uses the system local zone, which is wrong on routers whose
+	// /etc/localtime is missing or unreadable (Go then silently falls back to
+	// UTC). Accepts an IANA name ("Asia/Shanghai") or a fixed offset
+	// ("UTC+8", "+08:00", "GMT-5").
+	ScheduleTimezone string `yaml:"schedule_timezone" json:"schedule_timezone"`
+
 	RenewalInterval  time.Duration `yaml:"renewal_interval" json:"renewal_interval"`
 	RenewalDataLimit uint64        `yaml:"renewal_data_limit" json:"renewal_data_limit"`
 }
@@ -195,6 +205,43 @@ func parseClock(s string) (int, error) {
 		return 0, fmt.Errorf("invalid time %q", s)
 	}
 	return h*60 + m, nil
+}
+
+// offsetPattern matches fixed UTC offsets: "UTC+8", "UTC+08:00", "+08:00",
+// "-0700". The sign is the real direction (UTC+8 is eight hours ahead).
+var offsetPattern = regexp.MustCompile(`^(?i:(?:UTC|GMT))?([+-])(\d{1,2})(?::?(\d{2}))?$`)
+
+// LoadScheduleLocation resolves the zone used to evaluate transport_schedule.
+// It never silently falls back: a typo would otherwise move the switch by
+// hours, which is exactly the class of bug this option exists to avoid.
+func LoadScheduleLocation(name string) (*time.Location, error) {
+	name = strings.TrimSpace(name)
+	if name == "" || strings.EqualFold(name, "Local") {
+		return time.Local, nil
+	}
+	if m := offsetPattern.FindStringSubmatch(name); m != nil {
+		hours, err := strconv.Atoi(m[2])
+		if err != nil || hours > 14 {
+			return nil, fmt.Errorf("invalid schedule_timezone %q", name)
+		}
+		minutes := 0
+		if m[3] != "" {
+			minutes, err = strconv.Atoi(m[3])
+			if err != nil || minutes > 59 {
+				return nil, fmt.Errorf("invalid schedule_timezone %q", name)
+			}
+		}
+		offset := hours*3600 + minutes*60
+		if m[1] == "-" {
+			offset = -offset
+		}
+		return time.FixedZone(name, offset), nil
+	}
+	loc, err := time.LoadLocation(name)
+	if err != nil {
+		return nil, fmt.Errorf("schedule_timezone %q: %w (use an IANA name or a fixed offset such as UTC+8)", name, err)
+	}
+	return loc, nil
 }
 
 // ServerConfig is the server-side configuration.

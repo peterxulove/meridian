@@ -46,6 +46,29 @@ Meridian 是一个自定义安全代理协议，设计目标是在恶劣的网�
 
 ## 更新日志
 
+### v1.6.11（2026-10-30）
+
+#### 🕘 时段表不再依赖系统时区
+
+`transport_schedule` 现在可以显式指定判断窗口所用的时区：
+
+```yaml
+transport: "WebSocket"
+transport_schedule:
+  - transport: "QUIC"
+    from: "19:00"
+    to: "03:00"
+schedule_timezone: "UTC+8"     # 也支持 Asia/Shanghai 这类 IANA 名称
+```
+
+- 修的是实测踩到的坑：路由器上 `/etc/localtime` 指向的文件不可读时，`date` 只输出 `CST-8`、没有时分，Go 的 `time.Local` 会静默退回 UTC。结果本该 10:59 走 WebSocket，却被判成 02:59 走了 QUIC。
+- 固定偏移支持 `UTC+8`、`UTC+08:00`、`+08:00`、`-0700`、`GMT+5:30`；写错直接启动失败，不会悄悄退化成 UTC。
+- 启动横幅新增一行，直接打印判定时区、当前时间和当前选中的传输，一眼就能确认：
+
+```
+  Schedule:  now 10:59 UTC+8 (UTC+08:00) => WebSocket
+```
+
 ### v1.6.10（2026-10-30）
 
 #### 🕒 按时间切换传输：白天 WebSocket，晚上 QUIC

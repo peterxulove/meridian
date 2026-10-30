@@ -15,6 +15,7 @@ Revision history:
 | 1.5 | 2026-10-30 | Handshake version 3: early data (pipelined CONNECT); server-side DNS cache |
 | 1.6 | 2026-10-30 | Address racing for target dials; flow-stall timeout raised to 10 min; lane drain waits for idle |
 | 1.7 | 2026-10-30 | Client transport schedule: per-lane hot switch between transports on a daily window |
+| 1.7.1 | 2026-10-30 | Schedule windows are evaluated in an explicitly configured zone |
 
 ---
 
@@ -80,6 +81,14 @@ done in that order. The schedule is a client-side policy only; the server just
 serves whichever transport the client dials, which is why a server in
 `QUIC+WebSocket` mode is what makes such a switch possible without a port
 change.
+
+The windows are evaluated against a configured zone, not implicitly against
+whatever the host thinks its local time is. An implementation SHOULD accept an
+explicit fixed offset (`UTC+8`) in addition to an IANA zone name and SHOULD
+refuse to start on an unparsable value. Reading the system zone is a silent
+failure mode worth avoiding: on minimal router images `/etc/localtime` is often
+missing or unreadable, and Go's `time.Local` then falls back to UTC, moving
+every window by hours without any error.
 
 Clients MAY open several independent outer connections ("lanes") to the same
 server — see §6.4. Each lane carries its own handshake, session ID and key
