@@ -46,6 +46,35 @@ Meridian is a custom secure proxy protocol designed to deliver **undetectable en
 
 ## Changelog
 
+### v1.6.10 (2026-10-30)
+
+#### 🕒 Time-based transport switching: WebSocket by day, QUIC at night
+
+The client can now follow a daily schedule in **local time**:
+
+```yaml
+transport: "WebSocket"        # used outside every window
+transport_schedule:
+  - transport: "QUIC"         # 19:00-03:00
+    from: "19:00"
+    to: "03:00"
+```
+
+- The first matching window wins, otherwise `transport` is used. Windows may
+  wrap around midnight.
+- A switch builds the replacement connection on the new transport and installs
+  it **before** retiring the old one, so new connections use the new transport
+  immediately while existing streams finish on the old one (up to five more
+  minutes). There is never a moment without a usable lane.
+- Malformed entries (bad times, a client-unsupported transport such as
+  `QUIC+WebSocket`, identical from/to) fail at start-up instead of silently
+  keeping the wrong transport for a day.
+- The banner prints the schedule and each switch logs
+  `Schedule switched WebSocket -> QUIC`.
+
+Verified locally with a window starting one minute ahead (two lanes): WSS →
+QUIC → WSS, 25 probes at 5 s intervals during the switches, no failures.
+
 ### v1.6.9 (2026-10-30)
 
 #### 🐛 Fix: three problems that all look like "playback interrupted"

@@ -124,8 +124,77 @@ type ClientConfig struct {
 	// WebSocket upgrade settings
 	WSSPath string `yaml:"wss_path" json:"wss_path"`
 
+	// TransportSchedule switches the outer transport on a daily local-time
+	// schedule. The first entry whose window contains the current time wins;
+	// outside every window Transport is used. Windows may wrap around
+	// midnight, for example "19:00" to "03:00".
+	TransportSchedule []TransportWindow `yaml:"transport_schedule" json:"transport_schedule"`
+
 	RenewalInterval  time.Duration `yaml:"renewal_interval" json:"renewal_interval"`
 	RenewalDataLimit uint64        `yaml:"renewal_data_limit" json:"renewal_data_limit"`
+}
+
+// TransportWindow is one entry of a daily transport schedule.
+type TransportWindow struct {
+	Transport TransportType `yaml:"transport" json:"transport"`
+	From      string        `yaml:"from" json:"from"` // "HH:MM", local time
+	To        string        `yaml:"to" json:"to"`     // "HH:MM", local time
+}
+
+// CompiledTransportWindow is a TransportWindow with its times parsed once at
+// start-up, so the supervisor loop can test it every second cheaply.
+type CompiledTransportWindow struct {
+	Transport TransportType
+	From, To  int // minutes since local midnight
+}
+
+// Contains reports whether t falls inside the window. A window whose end is
+// not after its start wraps around midnight.
+func (w CompiledTransportWindow) Contains(t time.Time) bool {
+	m := t.Hour()*60 + t.Minute()
+	if w.From < w.To {
+		return m >= w.From && m < w.To
+	}
+	return m >= w.From || m < w.To
+}
+
+// CompileTransportSchedule validates and parses the configured windows. An
+// invalid entry is a start-up error rather than a silent fallback: a typo in
+// the schedule would otherwise keep the client on the wrong transport for a
+// whole day.
+func CompileTransportSchedule(windows []TransportWindow) ([]CompiledTransportWindow, error) {
+	out := make([]CompiledTransportWindow, 0, len(windows))
+	for i, w := range windows {
+		switch w.Transport {
+		case TransportHysteria, TransportWebSocket:
+		default:
+			return nil, fmt.Errorf("transport_schedule[%d]: unsupported client transport %q (use QUIC or WebSocket)", i, w.Transport)
+		}
+		from, err := parseClock(w.From)
+		if err != nil {
+			return nil, fmt.Errorf("transport_schedule[%d].from: %w", i, err)
+		}
+		to, err := parseClock(w.To)
+		if err != nil {
+			return nil, fmt.Errorf("transport_schedule[%d].to: %w", i, err)
+		}
+		if from == to {
+			return nil, fmt.Errorf("transport_schedule[%d]: from and to are the same (%s)", i, w.From)
+		}
+		out = append(out, CompiledTransportWindow{Transport: w.Transport, From: from, To: to})
+	}
+	return out, nil
+}
+
+func parseClock(s string) (int, error) {
+	var h, m int
+	if _, err := fmt.Sscanf(s, "%d:%d", &h, &m); err != nil {
+		return 0, fmt.Errorf("invalid time %q (want HH:MM)", s)
+	}
+	if h < 0 || h > 23 || m < 0 || m > 59 {
+		return 0, fmt.Errorf("invalid time %q", s)
+	}
+	return h*60 + m, nil
 }
 
 // ServerConfig is the server-side configuration.

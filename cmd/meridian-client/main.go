@@ -60,7 +60,14 @@ func main() {
 
 	fmt.Printf("Meridian Client %s\n", Version)
 	fmt.Printf("  Server:    %s\n", cfg.ServerAddr)
-	fmt.Printf("  Transport: %s\n", cfg.Transport)
+	if len(cfg.TransportSchedule) == 0 {
+		fmt.Printf("  Transport: %s\n", cfg.Transport)
+	} else {
+		fmt.Printf("  Transport: %s by default, scheduled:\n", cfg.Transport)
+		for _, w := range cfg.TransportSchedule {
+			fmt.Printf("             %s  %s-%s\n", w.Transport, w.From, w.To)
+		}
+	}
 	fmt.Printf("  Cipher:    %s\n", cfg.CipherSuite)
 	fmt.Printf("  SOCKS5:    %s\n", cfg.ListenAddr)
 
@@ -117,6 +124,9 @@ type Client struct {
 	mu           sync.RWMutex
 	tunnels      []*TunnelClient
 	laneSessions [][16]byte
+	// schedule switches the outer transport through the day; empty means the
+	// static cfg.Transport is used for the client's whole life.
+	schedule     []config.CompiledTransportWindow
 	tunnelCursor atomic.Uint32
 	stopping     atomic.Bool
 	stopCh       chan struct{}
@@ -144,20 +154,69 @@ func NewClient(cfg config.ClientConfig) (*Client, error) {
 		}
 		copy(sessions[i][:], b)
 	}
+	schedule, err := config.CompileTransportSchedule(cfg.TransportSchedule)
+	if err != nil {
+		return nil, err
+	}
 	return &Client{
 		cfg:          cfg,
 		tunnels:      make([]*TunnelClient, laneCount),
 		laneSessions: sessions,
+		schedule:     schedule,
 		stopCh:       make(chan struct{}),
 	}, nil
+}
+
+// desiredTransport is the transport the schedule asks for right now, or the
+// configured one when no window matches.
+func (c *Client) desiredTransport() config.TransportType {
+	now := time.Now()
+	for _, w := range c.schedule {
+		if w.Contains(now) {
+			return w.Transport
+		}
+	}
+	return c.cfg.Transport
+}
+
+// scheduledSwitchGrace bounds how long a lane that was replaced by a schedule
+// change keeps serving its existing streams. New streams go to the replacement
+// immediately; this only decides when the old outermost connection is closed.
+const scheduledSwitchGrace = 5 * time.Minute
+
+func withTransport(cfg config.ClientConfig, t config.TransportType) config.ClientConfig {
+	cfg.Transport = t
+	return cfg
+}
+
+// retireLane stops a replaced lane from taking new streams and closes it once
+// its streams finish, or when the grace expires.
+func (c *Client) retireLane(lane int, tunnel *TunnelClient, grace time.Duration) {
+	tunnel.draining.Store(true)
+	deadline := time.Now().Add(grace)
+	for !tunnel.closed.Load() {
+		if tunnel.ActiveLoad() == 0 {
+			tunnel.Close()
+			return
+		}
+		if time.Now().After(deadline) {
+			fmt.Printf("  [Tunnel %d/%d] Retired lane still had %d active at grace expiry, closing\n",
+				lane+1, len(c.tunnels), tunnel.ActiveLoad())
+			tunnel.Close()
+			return
+		}
+		time.Sleep(time.Second)
+	}
 }
 
 func (c *Client) maintainTunnel(lane int) {
 	cfg := c.cfg
 	cfg.SessionID = c.laneSessions[lane]
 	store := mtp.NewSessionStore()
+	active := c.desiredTransport()
 
 	for !c.stopping.Load() {
+		cfg.Transport = active
 		tunnel := NewTunnelClient(cfg, store)
 		if err := tunnel.Connect(); err != nil {
 			fmt.Printf("  [Tunnel %d/%d] Connection failed: %v. Retrying in 5s...\n",
@@ -177,6 +236,29 @@ func (c *Client) maintainTunnel(lane int) {
 		lifetime := staggerLifetime(c.cfg.SessionLifetime, lane, len(c.tunnels))
 		var drainDeadline time.Time
 		for !tunnel.closed.Load() && !c.stopping.Load() {
+			// A transport window boundary just passed. Build the replacement
+			// on the new transport first and swap it in, so the lane never has
+			// a gap where new streams have nowhere to go; only then retire the
+			// old tunnel, which keeps serving the streams already on it.
+			if want := c.desiredTransport(); want != active {
+				replacement := NewTunnelClient(withTransport(cfg, want), store)
+				if err := replacement.Connect(); err != nil {
+					fmt.Printf("  [Tunnel %d/%d] Switch to %s failed: %v. Staying on %s.\n",
+						lane+1, len(c.tunnels), want, err, active)
+					time.Sleep(5 * time.Second)
+					continue
+				}
+				c.mu.Lock()
+				c.tunnels[lane] = replacement
+				c.mu.Unlock()
+				fmt.Printf("  [Tunnel %d/%d] Schedule switched %s -> %s (draining %d active)\n",
+					lane+1, len(c.tunnels), active, want, tunnel.ActiveLoad())
+				go c.retireLane(lane, tunnel, scheduledSwitchGrace)
+				active = want
+				tunnel = replacement
+				drainDeadline = time.Time{}
+				continue
+			}
 			// A lane that reaches session_lifetime stops taking new streams and
 			// is closed once the streams already on it finish. This refreshes
 			// the outer TCP/TLS connection periodically without cutting an

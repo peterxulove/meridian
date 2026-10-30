@@ -1,4 +1,4 @@
-# Meridian Protocol Specification v1.6
+# Meridian Protocol Specification v1.7
 
 > A hybrid high-efficiency, anti-detection secure communication protocol.
 > Combines strengths of Shadowsocks, Hysteria/Hysteria2, VLESS, and REALITY.
@@ -14,6 +14,7 @@ Revision history:
 | 1.4 | 2026-10-29 | `QUIC` transport on the server binds UDP only; the legacy plaintext TCP listener is no longer opened |
 | 1.5 | 2026-10-30 | Handshake version 3: early data (pipelined CONNECT); server-side DNS cache |
 | 1.6 | 2026-10-30 | Address racing for target dials; flow-stall timeout raised to 10 min; lane drain waits for idle |
+| 1.7 | 2026-10-30 | Client transport schedule: per-lane hot switch between transports on a daily window |
 
 ---
 
@@ -69,6 +70,16 @@ plaintext TCP listener on `listen_addr`: an unauthenticated TCP port that
 answers arbitrary connections with tunnel framing is trivially fingerprintable
 and defeats the anti-detection goal. (Before v1.6.7 the `QUIC` value fell
 through to the legacy raw-TCP path and opened both.)
+
+A client MAY switch transports on a daily local-time schedule. A switch is a
+per-lane operation: build the replacement connection on the new transport,
+install it for new streams, then retire the old lane once its streams finish
+(bounded by a grace period). Cutting the old lane first would leave a window
+with no usable tunnel and surface as a connection failure, so it MUST NOT be
+done in that order. The schedule is a client-side policy only; the server just
+serves whichever transport the client dials, which is why a server in
+`QUIC+WebSocket` mode is what makes such a switch possible without a port
+change.
 
 Clients MAY open several independent outer connections ("lanes") to the same
 server — see §6.4. Each lane carries its own handshake, session ID and key

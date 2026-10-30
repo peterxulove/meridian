@@ -38,6 +38,20 @@ tunnel_connections: 4
 session_lifetime: "1h"
 dial_timeout: "15s"
 
+# ─── Daily Transport Schedule (optional) ───
+# Switches the outer transport by local time. The first window containing the
+# current time wins; outside every window `transport` above is used. A window
+# may wrap around midnight. Each lane builds the replacement connection on the
+# new transport first and only then retires the old one, so a switch does not
+# drop new connections.
+#
+# Example: WebSocket during the day (best against DPI) and QUIC at night when
+# the daytime congestion has cleared.
+# transport_schedule:
+#   - transport: "QUIC"
+#     from: "19:00"
+#     to: "03:00"
+
 # Only used by the QUIC transport. 0 selects adaptive BBR.
 up_mbps: 0
 down_mbps: 0
