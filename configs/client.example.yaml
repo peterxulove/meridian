@@ -43,6 +43,13 @@ tunnel_connections: 4
 # connection is not kept alive indefinitely. 0 disables recycling.
 session_lifetime: "1h"
 dial_timeout: "15s"
+# OpenClash (and any transparent proxy built the same way) redirects locally
+# generated TCP into its proxy, which turns the tunnel's own connection to the
+# server into a loop through the tunnel. Its nftables chain returns traffic
+# whose socket GID is 65534 untouched, so a client started as root with this
+# value escapes the redirect. Only the GID changes; the client keeps running
+# as root. 0 disables. Routers with OpenClash: 65534.
+socket_gid: 0
 # How long a stream may carry no byte in either direction before it becomes a
 # candidate for reclamation. Candidates are only closed while the lane is 80%
 # full, so a paused video is not reset just because time passed — a paused

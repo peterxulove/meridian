@@ -12,7 +12,7 @@
 
 set -e
 
-DEFAULT_RELEASE_VERSION="v1.6.20"
+DEFAULT_RELEASE_VERSION="v1.6.21"
 
 # Re-execute with bash if run with sh
 if [ -z "$BASH_VERSION" ]; then
@@ -414,6 +414,20 @@ configure_client() {
         ' "$client_yaml")
     fi
 
+    # Keep an operator's value across regeneration, and default to 65534 on
+    # OpenWrt where OpenClash is the usual companion. See the field comment in
+    # pkg/config: OpenClash's nftables chain returns skgid 65534 untouched, so
+    # the tunnel's own connection escapes the local proxy instead of looping
+    # back into it.
+    local client_socket_gid=""
+    if [ -r "$client_yaml" ]; then
+        client_socket_gid=$(grep -m1 '^socket_gid:' "$client_yaml" | cut -d: -f2- | tr -d ' "')
+    fi
+    if [ -z "$client_socket_gid" ]; then
+        client_socket_gid=0
+        if [ "$OS" = "openwrt" ]; then client_socket_gid=65534; fi
+    fi
+
     cat <<EOF | $SUDO tee "$client_yaml" >/dev/null
 # Meridian Client - Auto-generated configuration
 server_addr: "${client_server_addr}"
@@ -455,6 +469,10 @@ max_concurrent_streams: 512
 tunnel_connections: ${client_lanes}
 session_lifetime: "1h"
 dial_timeout: "15s"
+# Bypass OpenClash's local proxy redirect, which otherwise feeds the tunnel's
+# own connection back into the tunnel. 65534 = nobody/nogroup; 0 disables.
+# Only the socket GID changes — the client still runs as root.
+socket_gid: ${client_socket_gid}
 # A stream silent for this long becomes a reclamation candidate; it is only
 # actually reclaimed while the lane is 80% full, so paused videos survive.
 # An abandoned connection otherwise keeps its slot forever. 0 disables.
@@ -663,6 +681,17 @@ optimize_config() {
     fi
     if [ "$role" = "client" ] && ! yaml_has_key "$config_file" "tunnel_connections"; then
         set_yaml_key "$config_file" "tunnel_connections" "4"
+    fi
+    # OpenClash on the router redirects locally generated TCP into the local
+    # proxy; with the tunnel listening on the same box that becomes a loop and
+    # the lane dies with "WebSocket dial failed: EOF". Its chain returns skgid
+    # 65534 untouched, so new router installs default to that GID.
+    if [ "$role" = "client" ] && ! yaml_has_key "$config_file" "socket_gid"; then
+        if [ "$OS" = "openwrt" ]; then
+            set_yaml_key "$config_file" "socket_gid" "65534"
+        else
+            set_yaml_key "$config_file" "socket_gid" "0"
+        fi
     fi
 
     set_yaml_key "$config_file" "padding_mode" '"random"'

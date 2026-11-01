@@ -58,6 +58,11 @@ func main() {
 		cfg.ListenAddr = listen
 	}
 
+	// Must happen before the first socket is dialled: OpenClash decides what to
+	// redirect by socket GID, and a redirected tunnel connection loops through
+	// the proxy the tunnel itself feeds.
+	socketGIDErr := applySocketGID(cfg.SocketGID)
+
 	// Install the log sink before anything else logs: a router's syslog ring
 	// is small enough that a burst of errors erases its own evidence, so the
 	// file is where the timeline has to live.
@@ -72,6 +77,13 @@ func main() {
 
 	logf("Meridian Client %s", Version)
 	logf("  Server:    %s", cfg.ServerAddr)
+	if cfg.SocketGID > 0 {
+		if socketGIDErr != nil {
+			logf("  SocketGID: %d (not applied: %v)", cfg.SocketGID, socketGIDErr)
+		} else {
+			logf("  SocketGID: %d", cfg.SocketGID)
+		}
+	}
 	if len(cfg.TransportSchedule) == 0 {
 		logf("  Transport: %s", cfg.Transport)
 	} else {

@@ -111,6 +111,17 @@ type ClientConfig struct {
 	SessionLifetime   time.Duration `yaml:"session_lifetime" json:"session_lifetime"`
 	DialTimeout       time.Duration `yaml:"dial_timeout" json:"dial_timeout"`
 
+	// SocketGID, when non-zero and the process starts as root, drops the
+	// process group before any socket is created. Routers that run OpenClash
+	// redirect locally generated TCP into the local proxy, so a tunnel's own
+	// connection to the server is fed back through the tunnel and dies. The
+	// generated nftables chain returns skgid 65534 (nobody) untouched, so a
+	// client started with SocketGID=65534 reaches the server directly.
+	//
+	// Only the GID changes; the UID stays 0, so log files, log rotation and
+	// binds on privileged ports keep working unchanged.
+	SocketGID int `yaml:"socket_gid" json:"socket_gid"`
+
 	// Hysteria v2
 	UpMbps   uint64 `yaml:"up_mbps" json:"up_mbps"`
 	DownMbps uint64 `yaml:"down_mbps" json:"down_mbps"`

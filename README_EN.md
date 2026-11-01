@@ -46,6 +46,50 @@ Meridian is a custom secure proxy protocol designed to deliver **undetectable en
 
 ## Changelog
 
+### v1.6.21 (2026-11-01)
+
+#### 🚦 One lane keeps failing with `WebSocket dial failed: EOF`
+
+On host 110, the instance pointing at arm (10808) failed every lane with
+`WebSocket dial failed: EOF` right after the v1.6.20 upgrade, retrying every
+five seconds forever. The same binary with the same configuration worked on
+111, and 110's other instance (10809 → j3) was fine.
+
+An `openssl s_client` from 110 reproduced the EOF, yet a capture on the server
+saw **zero packets** — the TCP handshake "completed" locally, so the connection
+never left the host. OpenClash's log on 110 explained it:
+
+```
+[TCP] 192.168.1.110:57872 --> 144.24.88.87:19443 match Match using PROXY[110meridian-arm]
+```
+
+OpenClash routed the **host's own connection to the server** through a proxy
+node that is the local 10808 listener — the tunnel's egress was fed back into
+the tunnel, a loop that closes immediately. Daytime WebSocket (TCP) hit it;
+QUIC (UDP) was unaffected, which is why the failure looked intermittent.
+
+The fix leaves the OpenClash configuration alone. The nftables chain OpenClash
+generates begins with `meta skgid 65534 return` — **traffic whose socket GID is
+65534 (nobody) is returned untouched**. The client therefore gains
+`socket_gid`:
+
+- When started as root with a non-zero `socket_gid`, the client calls
+  `setgroups`/`setgid` before creating any socket, so every outbound connection
+  carries that GID and OpenClash passes it through.
+- **The UID stays 0**, so log files, log rotation and low-port binds keep
+  working. No permission changes and no `procd_set_param user` are needed.
+- `deploy.sh` writes `socket_gid: 65534` into newly generated client configs on
+  OpenWrt, preserves an operator's value on regeneration, and uses 0 elsewhere.
+
+Apply it to the second instance on the same host, and to 111 as well — 111 was
+only working because its matching rule happened to go direct, at the cost of an
+extra local proxy hop. Restart the services afterwards:
+
+```sh
+/etc/init.d/meridian-client restart
+/etc/init.d/meridian-client2 restart
+```
+
 ### v1.6.20 (2026-11-01)
 
 #### 🎬 Some videos start instantly, others spin twice

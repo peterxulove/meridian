@@ -73,6 +73,44 @@ WSS、另一个常驻 QUIC。
 
 ## 更新日志
 
+### v1.6.21（2026-11-01）
+
+#### 🚦 一条 lane 一直 `WebSocket dial failed: EOF`
+
+现象：110 上指向 arm 的实例（10808）升级到 v1.6.20 后每条 lane 都是
+`WebSocket dial failed: EOF`，五秒重试一次，永远连不上；同一份配置、同一个
+二进制在 111 上正常，而 110 的另一个实例（10809 → j3）也正常。
+
+用 openssl 直连能复现同样的 EOF，在服务端抓包却**一个包都没有**——TCP 三次
+握手在本地就"完成"了，说明连接没有出网。查 110 的 OpenClash 日志：
+
+```
+[TCP] 192.168.1.110:57872 --> 144.24.88.87:19443 match Match using PROXY[110meridian-arm]
+```
+
+OpenClash 把**本机发往服务器的 TCP** 判进了代理节点，而那个节点就是本机的
+10808——隧道自己的出站连接被塞回隧道，形成自环，于是立刻被关掉。白天走 WSS
+（TCP）会中招，QUIC（UDP）不受影响，所以故障看起来时有时无。
+
+修复不碰 OpenClash 配置。OpenClash 生成的 nftables 链第一条就是
+`meta skgid 65534 return`——**socket 的 GID 是 65534（nobody）的流量直接放行**。
+客户端因此新增 `socket_gid`：
+
+- 启动时若以 root 运行且 `socket_gid` 非 0，先 `setgroups`/`setgid` 再创建任何
+  socket，之后所有出站连接都带这个 GID，OpenClash 直接放行。
+- **UID 保持 0**，所以日志文件、日志轮转、低端口绑定全都不受影响，不需要改配置
+  文件权限，也不需要 `procd_set_param user`。
+- `deploy.sh` 在 OpenWrt 上生成客户端配置时默认写入 `socket_gid: 65534`，重新
+  生成时会保留运维改过的值；其他平台默认 0。
+
+同一台机器上的第二个实例、以及 111，也建议加上（111 之前只是碰巧那条规则走了
+直连，白多跳一次本地代理）。改完重启服务即可：
+
+```sh
+/etc/init.d/meridian-client restart
+/etc/init.d/meridian-client2 restart
+```
+
 ### v1.6.20（2026-11-01）
 
 #### 🎬 有的视频秒开，有的要转两圈
