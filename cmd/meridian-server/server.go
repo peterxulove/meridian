@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -87,6 +88,49 @@ func (s *Server) dialTarget(ctx context.Context, addr string) (net.Conn, error) 
 		s.dns.Invalidate(host)
 	}
 	return conn, err
+}
+
+// dialUDPTarget opens a connected UDP socket for a UDP-over-MFP stream. There
+// is no handshake to race: UDP dial only binds and records the peer, so the
+// first address that parses is used. The DNS answer still goes through the
+// same cache as TCP dials, which keeps a new media host from paying a resolver
+// round trip on every datagram.
+func (s *Server) dialUDPTarget(ctx context.Context, addr string) (net.Conn, error) {
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return nil, fmt.Errorf("udp: invalid port %q: %w", portStr, err)
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	addrs, err := s.dns.Resolve(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	var lastErr error
+	for _, a := range preferIPv4(addrs) {
+		ip := net.ParseIP(a)
+		if ip == nil {
+			continue
+		}
+		network := "udp4"
+		if ip.To4() == nil {
+			network = "udp6"
+		}
+		conn, err := net.DialUDP(network, nil, &net.UDPAddr{IP: ip, Port: port})
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+	}
+	if lastErr == nil {
+		lastErr = errors.New("udp: resolver returned no usable address")
+	}
+	return nil, lastErr
 }
 
 // preferIPv4 keeps IPv4 first and leaves the original order within a family.
@@ -477,6 +521,7 @@ func (as *activeStream) enqueue(data []byte) bool {
 const (
 	// DATA frame flags carrying the control-plane result of a CONNECT.
 	flagConnect      = 0x01
+	flagUDP          = 0x02
 	flagConnectError = 0x08
 
 	// tunnelWriteTimeout keeps one unresponsive peer from holding writeMu
@@ -587,9 +632,11 @@ func (s *Server) handleTCPTunnel(conn net.Conn) {
 	if flowControl {
 		// Version 3 additionally means the server accepts DATA for a stream
 		// before CONNECT SUCCESS, i.e. the client may pipeline its first bytes
-		// and save a round trip. Clients that predate it only check ">= 2" for
-		// flow control and never pipeline, so they are unaffected.
-		negotiatedVer = 3
+		// and save a round trip. Version 4 adds UDP-over-MFP: a CONNECT with
+		// flagUDP asks the server to dial a UDP socket and carry one datagram
+		// per DATA frame. Older clients only check ">= 2" / ">= 3", so they
+		// are unaffected.
+		negotiatedVer = 4
 	}
 
 	// Build & Send ServerHello
@@ -788,7 +835,7 @@ func (s *Server) handleTCPTunnel(conn net.Conn) {
 
 		if frame.Header.Type == mfp.TypeDATA {
 			flags := frame.Header.Flags
-			if flags == 0x01 {
+			if flags&flagConnect != 0 {
 				// CONNECT stream request
 				targetAddr := string(frame.Data)
 				if targetAddr == "" {
@@ -834,9 +881,16 @@ func (s *Server) handleTCPTunnel(conn net.Conn) {
 				activeStreams[sid] = streamInfo
 				mu.Unlock()
 
-				go func(streamID uint32, addr string, streamInfo *activeStream) {
+				udpStream := flags&flagUDP != 0
+				go func(streamID uint32, addr string, streamInfo *activeStream, udpStream bool) {
 					// Dial on the server side, reusing cached DNS answers.
-					targetConn, err := s.dialTarget(context.Background(), addr)
+					var targetConn net.Conn
+					var err error
+					if udpStream {
+						targetConn, err = s.dialUDPTarget(context.Background(), addr)
+					} else {
+						targetConn, err = s.dialTarget(context.Background(), addr)
+					}
 					if err != nil {
 						if retireStream(streamInfo) {
 							if sendErr := send(mfp.TypeDATA, streamID, 0x08, []byte(err.Error())); sendErr != nil {
@@ -897,7 +951,9 @@ func (s *Server) handleTCPTunnel(conn net.Conn) {
 								_ = send(mfp.TypeRESET, streamID, 0, nil)
 							}
 						}()
-						relayBuf := make([]byte, 60*1024)
+						// One Read must return one whole datagram for UDP
+						// streams; 64 KiB covers the protocol maximum.
+						relayBuf := make([]byte, 65535)
 						for {
 							rn, err := targetConn.Read(relayBuf)
 							if rn > 0 {
@@ -919,7 +975,7 @@ func (s *Server) handleTCPTunnel(conn net.Conn) {
 							}
 						}
 					}()
-				}(sid, targetAddr, streamInfo)
+				}(sid, targetAddr, streamInfo, udpStream)
 			} else {
 				// Standard DATA frame
 				mu.Lock()

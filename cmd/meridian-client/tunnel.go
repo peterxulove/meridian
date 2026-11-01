@@ -45,6 +45,11 @@ type TunnelClient struct {
 	// stream does not have to wait a round trip before the application can
 	// speak. It is negotiated as ServerHello version 3.
 	earlyData bool
+	// udpRelay means the server accepts UDP CONNECT streams (ServerHello
+	// version 4). Without it the local UDP relay falls back to sending
+	// datagrams directly, which leaks them and fails on networks that block
+	// QUIC.
+	udpRelay bool
 
 	// idleTimeout reclaims streams that stopped carrying bytes in either
 	// direction. An abandoned player connection keeps its slot forever
@@ -83,9 +88,15 @@ type TunnelClient struct {
 // user connection.
 var errLaneSaturated = errors.New("tunnel: lane saturated")
 
+// errUDPUnsupported is returned when the server predates UDP-over-MFP. The
+// local relay uses it to fall back to direct datagrams instead of failing
+// every UDP flow.
+var errUDPUnsupported = errors.New("tunnel: server does not support UDP relay")
+
 const (
 	// DATA frame flags carrying the control-plane result of a CONNECT.
 	flagConnect      = 0x01
+	flagUDP          = 0x02
 	flagConnectError = 0x08
 
 	// tunnelWriteTimeout bounds a single frame write. A peer that stops reading
@@ -250,6 +261,9 @@ func (tc *TunnelClient) Connect() error {
 	tc.flowControl = respBuf[4] >= 2
 	// Version 3 also allows sending DATA before the server confirms the dial.
 	tc.earlyData = respBuf[4] >= 3
+	// Version 4 carries UDP datagrams as streams. Older servers would treat
+	// the UDP CONNECT as a normal TCP dial, so the client must not use it.
+	tc.udpRelay = respBuf[4] >= 4
 
 	if resumeKeys != nil && status == 0 {
 		// Server accepted resume
@@ -339,6 +353,21 @@ func (tc *TunnelClient) Connect() error {
 
 // DialStream allocates a new StreamID and requests a connection to targetAddr.
 func (tc *TunnelClient) DialStream(ctx context.Context, targetAddr string) (net.Conn, error) {
+	return tc.dialStream(ctx, targetAddr, flagConnect)
+}
+
+// DialUDPStream opens a stream whose target is a UDP socket. Each Write is one
+// datagram and each Read returns one datagram, so the SOCKS5 UDP relay can
+// carry QUIC through the same encrypted tunnel as TCP instead of sending it
+// directly from the router.
+func (tc *TunnelClient) DialUDPStream(ctx context.Context, targetAddr string) (net.Conn, error) {
+	if !tc.udpRelay {
+		return nil, errUDPUnsupported
+	}
+	return tc.dialStream(ctx, targetAddr, flagConnect|flagUDP)
+}
+
+func (tc *TunnelClient) dialStream(ctx context.Context, targetAddr string, flags byte) (net.Conn, error) {
 	if tc.closed.Load() {
 		return nil, errors.New("tunnel: client is closed")
 	}
@@ -364,6 +393,7 @@ func (tc *TunnelClient) DialStream(ctx context.Context, targetAddr string) (net.
 		sid:         sid,
 		client:      tc,
 		target:      targetAddr,
+		udp:         flags&flagUDP != 0,
 		readChan:    make(chan []byte, config.StreamQueueFrames),
 		confirmChan: make(chan bool, 1),
 		closed:      make(chan struct{}),
@@ -398,8 +428,8 @@ func (tc *TunnelClient) DialStream(ctx context.Context, targetAddr string) (net.
 		return nil, errLaneSaturated
 	}
 
-	// Send CONNECT frame (Flags = 0x01: connect request).
-	if err := tc.sendFrame(mfp.TypeDATA, sid, flagConnect, []byte(targetAddr), 0); err != nil {
+	// Send CONNECT frame (Flags = 0x01 TCP, 0x01|0x02 UDP).
+	if err := tc.sendFrame(mfp.TypeDATA, sid, flags, []byte(targetAddr), 0); err != nil {
 		tc.removeStream(sid)
 		sc.CloseFromServer()
 		return nil, fmt.Errorf("tunnel: failed to send connect frame: %w", err)
@@ -937,8 +967,11 @@ func (tc *TunnelClient) Close() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 type StreamConn struct {
-	sid         uint32
-	client      *TunnelClient
+	sid    uint32
+	client *TunnelClient
+	// udp marks a datagram stream. Its Write must not split one datagram into
+	// several frames, because the peer writes each frame as one UDP packet.
+	udp         bool
 	readChan    chan []byte
 	confirmChan chan bool
 	closed      chan struct{}
@@ -1137,6 +1170,9 @@ func (sc *StreamConn) Write(b []byte) (int, error) {
 	}
 
 	sc.touch()
+	if sc.udp && len(b) > maxFrameDataSize {
+		return 0, fmt.Errorf("tunnel: UDP datagram too large (%d bytes)", len(b))
+	}
 	written := 0
 	for len(b) > 0 {
 		chunk := b

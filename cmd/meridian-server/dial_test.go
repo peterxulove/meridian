@@ -5,6 +5,8 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	"meridian/pkg/config"
 )
 
 func TestDialRaceFallsBackPastBlackhole(t *testing.T) {
@@ -67,5 +69,46 @@ func TestPreferIPv4KeepsAllAddresses(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("got %v, want %v", got, want)
 		}
+	}
+}
+
+func TestDialUDPTarget(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+	go func() {
+		buf := make([]byte, 256)
+		for {
+			n, addr, err := pc.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			_, _ = pc.WriteTo(buf[:n], addr)
+		}
+	}()
+
+	s, err := NewServer(config.ServerConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := s.dialUDPTarget(context.Background(), pc.LocalAddr().String())
+	if err != nil {
+		t.Fatalf("dialUDPTarget: %v", err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.Write([]byte("ping")); err != nil {
+		t.Fatal(err)
+	}
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 256)
+	n, err := conn.Read(buf)
+	if err != nil {
+		t.Fatalf("read echo: %v", err)
+	}
+	if string(buf[:n]) != "ping" {
+		t.Fatalf("echo = %q, want ping", buf[:n])
 	}
 }

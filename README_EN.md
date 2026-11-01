@@ -46,6 +46,31 @@ Meridian is a custom secure proxy protocol designed to deliver **undetectable en
 
 ## Changelog
 
+### v1.6.20 (2026-11-01)
+
+#### 🎬 Some videos start instantly, others spin twice
+
+On the YouTube homepage some videos start immediately and others spin for two cycles. It is not random: it depends on which CDN host the video uses.
+
+The cause is UDP. The YouTube player uses QUIC (UDP 443), OpenClash hands it to SOCKS5 UDP ASSOCIATE, and the client used to send those datagrams **directly to the internet**, outside the Meridian tunnel. This path blocks UDP 443: direct QUIC handshakes to both Cloudflare and YouTube timed out. Chrome tries QUIC for every new googlevideo host, waits about two seconds for the handshake, then falls back to TCP. Hosts already marked QUIC-broken go straight to TCP, which is why some videos look fast and others do not; refreshing the page changes the set of connections and therefore the behaviour.
+
+This release puts UDP inside the tunnel:
+
+- **Protocol version 4 / `flagUDP`**: a CONNECT frame may carry the UDP flag (`0x02`). The server then dials a UDP socket instead of a TCP connection.
+- **One DATA frame is one UDP datagram**: no splitting and no coalescing, so QUIC datagram boundaries survive. The per-frame limit is 60 KiB; real QUIC packets are far smaller.
+- **The server shares its DNS cache with TCP**: a googlevideo host is resolved once and reused by every datagram.
+- **One MFP stream per `client address + target`**: replies carry the correct SOCKS5 UDP header, and a destination idle for 30 minutes is reclaimed.
+- **Automatic fallback for old servers**: a new client talking to v1.6.19 or older negotiates no version 4 and keeps the old direct UDP path instead of asking the server to dial UDP as TCP.
+- The previous fix is retained: the UDP association no longer has a 60 s or 30 s read deadline, so an idle QUIC connection is not closed by the client.
+
+Verified:
+
+- Local end to end: SOCKS5 UDP → Meridian tunnel → server UDP echo. Payloads of 1, 100, 1200, 1400 and 8000 bytes all came back unchanged in about 1 ms.
+- The same association was idle for 75 seconds and still answered in 1 ms.
+- New `TestDialUDPTarget`, `TestUDPDatagramRoundTrip` and `TestUDPDatagramRejectsFragments`; `go test ./...` and `go test -race` are clean.
+
+**The server must be upgraded to v1.6.20 as well**, otherwise UDP stays direct. No client configuration change is required.
+
 ### v1.6.19 (2026-11-01)
 
 #### 📺 A video is slow to start after the YouTube homepage sits idle

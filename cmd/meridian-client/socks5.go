@@ -13,10 +13,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -105,6 +108,10 @@ type Socks5Server struct {
 	wg            sync.WaitGroup
 	sem           chan struct{} // concurrency limiter
 	maxConcurrent int
+	// udpDial opens an encrypted UDP stream through the tunnel. Nil keeps the
+	// historical direct relay, which is also the fallback for servers that do
+	// not understand UDP-over-MFP.
+	udpDial func(ctx context.Context, addr string) (net.Conn, error)
 
 	// Stats
 	mu       sync.Mutex
@@ -113,6 +120,12 @@ type Socks5Server struct {
 	bytesIn  uint64
 	bytesOut uint64
 	failed   uint64
+}
+
+// SetUDPDialer installs the tunnel dialer for UDP datagrams. The client calls
+// it when the server negotiates UDP relay support.
+func (s *Socks5Server) SetUDPDialer(fn func(ctx context.Context, addr string) (net.Conn, error)) {
+	s.udpDial = fn
 }
 
 // NewSocks5Server creates a new SOCKS5 server.
@@ -319,10 +332,253 @@ func (s *Socks5Server) handleUDPAssociate(conn net.Conn, clientUDPAddrStr string
 	}
 }
 
-// udpRelay acts as a UDP relay server, multiplexing packets from the SOCKS5 client.
+// udpRelay multiplexes one SOCKS5 UDP association. Datagrams go through the
+// encrypted tunnel when the server supports UDP-over-MFP; otherwise the
+// historical direct path keeps old servers working.
 func (s *Socks5Server) udpRelay(udpConn *net.UDPConn, tcpClosed chan struct{}, relayDone chan struct{}) {
 	defer close(relayDone)
 
+	// The TCP control connection owns the association. Closing the UDP socket
+	// when it goes away unblocks the read loop below.
+	go func() {
+		<-tcpClosed
+		udpConn.Close()
+	}()
+
+	if s.udpDial != nil {
+		if s.udpRelayTunnel(udpConn) {
+			return
+		}
+		noteEvent("udp_direct", "socks5: server does not support UDP relay, using direct datagrams")
+	}
+	s.udpRelayDirect(udpConn)
+}
+
+// udpRelayStream is one target inside a SOCKS5 UDP association. Its conn is a
+// Meridian stream: one Write is one datagram, one Read returns one datagram.
+type udpRelayStream struct {
+	conn   net.Conn
+	target string
+	last   atomic.Int64
+}
+
+func (u *udpRelayStream) touch() {
+	u.last.Store(time.Now().UnixNano())
+}
+
+// udpRelayTunnel carries datagrams over the encrypted tunnel. It returns false
+// only when the server does not understand UDP-over-MFP, so the caller can
+// fall back to the direct relay; every other termination is handled here.
+func (s *Socks5Server) udpRelayTunnel(udpConn *net.UDPConn) bool {
+	streams := make(map[string]*udpRelayStream)
+	var mu sync.Mutex
+	done := make(chan struct{})
+	defer close(done)
+
+	closeAll := func() {
+		mu.Lock()
+		for key, st := range streams {
+			delete(streams, key)
+			st.conn.Close()
+		}
+		mu.Unlock()
+	}
+	defer closeAll()
+
+	// QUIC sends keepalives while it is alive. A destination silent for the
+	// same threshold as the tunnel reclaimer is no longer worth a stream.
+	go func() {
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				cutoff := time.Now().Add(-30 * time.Minute).UnixNano()
+				mu.Lock()
+				for key, st := range streams {
+					if st.last.Load() < cutoff {
+						delete(streams, key)
+						st.conn.Close()
+					}
+				}
+				mu.Unlock()
+			}
+		}
+	}()
+
+	buf := make([]byte, 65535)
+	for {
+		n, remoteAddr, err := udpConn.ReadFromUDP(buf)
+		if err != nil {
+			return true
+		}
+		target, payload, ok := parseUDPDatagram(buf[:n])
+		if !ok {
+			continue
+		}
+		key := remoteAddr.String() + "|" + target
+
+		mu.Lock()
+		st := streams[key]
+		mu.Unlock()
+		if st == nil {
+			// The dial is normally instant: DialUDPStream returns as soon as
+			// the CONNECT is written (early data), and the server's UDP dial
+			// is a local bind. Keep the bound short so one stalled lane cannot
+			// freeze every other UDP flow in this association.
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			conn, dialErr := s.udpDial(ctx, target)
+			cancel()
+			if dialErr != nil {
+				if errors.Is(dialErr, errUDPUnsupported) {
+					return false
+				}
+				noteEvent("udp_tunnel", "socks5: UDP %s failed: %v", target, dialErr)
+				continue
+			}
+			st = &udpRelayStream{conn: conn, target: target}
+			st.touch()
+			mu.Lock()
+			if existing := streams[key]; existing != nil {
+				st = existing
+				conn.Close()
+			} else {
+				streams[key] = st
+			}
+			mu.Unlock()
+			if st.conn == conn {
+				go s.pumpUDPStream(st, key, remoteAddr, udpConn, &mu, streams)
+			}
+		}
+
+		st.touch()
+		if _, err := st.conn.Write(payload); err != nil {
+			mu.Lock()
+			if streams[key] == st {
+				delete(streams, key)
+			}
+			mu.Unlock()
+			st.conn.Close()
+		}
+	}
+}
+
+// pumpUDPStream sends datagrams from one tunnel stream back to the SOCKS5
+// client. The target is carried in the SOCKS5 UDP header, exactly as the
+// direct relay does.
+func (s *Socks5Server) pumpUDPStream(st *udpRelayStream, key string, clientAddr *net.UDPAddr, udpConn *net.UDPConn, mu *sync.Mutex, streams map[string]*udpRelayStream) {
+	defer func() {
+		st.conn.Close()
+		mu.Lock()
+		if streams[key] == st {
+			delete(streams, key)
+		}
+		mu.Unlock()
+	}()
+
+	buf := make([]byte, 65535)
+	for {
+		n, err := st.conn.Read(buf)
+		if err != nil {
+			return
+		}
+		st.touch()
+		packet := buildUDPDatagram(st.target, buf[:n])
+		if packet == nil {
+			continue
+		}
+		if _, err := udpConn.WriteToUDP(packet, clientAddr); err != nil {
+			return
+		}
+	}
+}
+
+// parseUDPDatagram strips the SOCKS5 UDP request header (RFC 1928 §7).
+func parseUDPDatagram(buf []byte) (target string, payload []byte, ok bool) {
+	if len(buf) < 10 || buf[0] != 0 || buf[1] != 0 || buf[2] != 0 {
+		return "", nil, false
+	}
+	var host string
+	var port, offset int
+	switch buf[3] {
+	case addrIPv4:
+		host = net.IP(buf[4:8]).String()
+		port = int(buf[8])<<8 | int(buf[9])
+		offset = 10
+	case addrIPv6:
+		if len(buf) < 22 {
+			return "", nil, false
+		}
+		host = net.IP(buf[4:20]).String()
+		port = int(buf[20])<<8 | int(buf[21])
+		offset = 22
+	case addrDomain:
+		if len(buf) < 5 {
+			return "", nil, false
+		}
+		domainLen := int(buf[4])
+		if len(buf) < 7+domainLen {
+			return "", nil, false
+		}
+		host = string(buf[5 : 5+domainLen])
+		port = int(buf[5+domainLen])<<8 | int(buf[6+domainLen])
+		offset = 7 + domainLen
+	default:
+		return "", nil, false
+	}
+	return net.JoinHostPort(host, strconv.Itoa(port)), buf[offset:], true
+}
+
+// buildUDPDatagram adds the SOCKS5 UDP response header for one datagram.
+func buildUDPDatagram(target string, payload []byte) []byte {
+	host, portStr, err := net.SplitHostPort(target)
+	if err != nil {
+		return nil
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 0 || port > 65535 {
+		return nil
+	}
+
+	var header []byte
+	if ip := net.ParseIP(host); ip != nil {
+		if ip4 := ip.To4(); ip4 != nil {
+			header = make([]byte, 10)
+			header[3] = addrIPv4
+			copy(header[4:8], ip4)
+			header[8] = byte(port >> 8)
+			header[9] = byte(port)
+		} else {
+			header = make([]byte, 22)
+			header[3] = addrIPv6
+			copy(header[4:20], ip.To16())
+			header[20] = byte(port >> 8)
+			header[21] = byte(port)
+		}
+	} else {
+		if len(host) == 0 || len(host) > 255 {
+			return nil
+		}
+		header = make([]byte, 7+len(host))
+		header[3] = addrDomain
+		header[4] = byte(len(host))
+		copy(header[5:], host)
+		header[5+len(host)] = byte(port >> 8)
+		header[6+len(host)] = byte(port)
+	}
+
+	packet := make([]byte, len(header)+len(payload))
+	copy(packet, header)
+	copy(packet[len(header):], payload)
+	return packet
+}
+
+// udpRelayDirect is the historical UDP path: datagrams leave the router
+// directly, outside the tunnel. It is kept as a fallback for servers that do
+// not negotiate UDP-over-MFP.
+func (s *Socks5Server) udpRelayDirect(udpConn *net.UDPConn) {
 	// Map to keep track of active outbound UDP sockets (client remote address string -> client UDP conn)
 	outConns := make(map[string]*net.UDPConn)
 	var mu sync.Mutex
@@ -333,12 +589,6 @@ func (s *Socks5Server) udpRelay(udpConn *net.UDPConn, tcpClosed chan struct{}, r
 			c.Close()
 		}
 		mu.Unlock()
-	}()
-
-	// Immediately close the UDP listener if the TCP control connection is terminated
-	go func() {
-		<-tcpClosed
-		udpConn.Close()
 	}()
 
 	buf := make([]byte, 65535)

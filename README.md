@@ -73,6 +73,31 @@ WSS、另一个常驻 QUIC。
 
 ## 更新日志
 
+### v1.6.20（2026-11-01）
+
+#### 🎬 有的视频秒开，有的要转两圈
+
+现象：YouTube 首页上点视频，有的立刻出画面，有的要转两圈才出。不是随机卡顿，而是**取决于这个视频用了哪个 CDN 主机**。
+
+根因在 UDP：YouTube 播放器走 QUIC（UDP 443），OpenClash 把它交给 SOCKS5 UDP ASSOCIATE，而客户端此前把 UDP **直接发到外网**，不经过 Meridian 隧道。实测这条线路对 UDP 443 是封的——直连 Cloudflare 和 YouTube 的 QUIC 握手全部超时。Chrome 对每个新的 googlevideo 主机都会先试 QUIC，等约两秒超时才回退 TCP；已经被标记为 QUIC 不可用的主机则直接走 TCP，所以看起来“有的快、有的慢”。刷新首页会重建连接，也会改变这个状态。
+
+这一版把 UDP 真正放进隧道：
+
+- **协议版本 4 / `flagUDP`**：CONNECT 帧新增 UDP 标志（`0x02`）。服务端收到后拨一个 UDP socket，而不是 TCP。
+- **一个 DATA 帧就是一条 UDP 数据报**：不拆分、不合并，保留 QUIC 的数据报边界；单包上限 60 KiB，实际 QUIC 包远小于此。
+- **服务端 DNS 与 TCP 共用缓存**：googlevideo 主机仍然只解析一次，后续数据报直接复用。
+- **SOCKS5 UDP 关联按目标建流**：每个 `客户端地址 + 目标` 一条 MFP 流，回包带正确的 SOCKS5 UDP 头；空闲 30 分钟回收。
+- **旧服务端自动回退**：新客户端连到 v1.6.19 及更早的服务端时，协商不到版本 4，UDP 仍走原来的直连路径，不会把旧服务端拨成 TCP。
+- 同时保留上一版修复：UDP 关联不再有 60 秒/30 秒读超时，空闲的 QUIC 连接不会被客户端自己关掉。
+
+验证：
+
+- 本地端到端：SOCKS5 UDP → Meridian 隧道 → 服务端 UDP echo，1 字节、100 字节、1200、1400、8000 字节全部原样返回，耗时约 1ms。
+- 同一关联空闲 75 秒后再发，仍 1ms 返回。
+- 新增 `TestDialUDPTarget`、`TestUDPDatagramRoundTrip`、`TestUDPDatagramRejectsFragments`；`go test ./...` 与 `go test -race` 全绿。
+
+**这一版服务端必须一起升级到 v1.6.20**，否则 UDP 仍走直连。客户端配置不需要改。
+
 ### v1.6.19（2026-11-01）
 
 #### 📺 YouTube 首页停久了，点视频变慢

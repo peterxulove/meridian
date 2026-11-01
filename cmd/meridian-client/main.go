@@ -530,7 +530,7 @@ func (c *Client) dial(ctx context.Context, network, addr string) (net.Conn, erro
 		return nil, fmt.Errorf("tunnel not connected or unavailable")
 	}
 
-	conn, err := tunnel.DialStream(ctx, addr)
+	conn, err := dialLane(ctx, tunnel, network, addr)
 	if err == nil {
 		return conn, nil
 	}
@@ -546,11 +546,21 @@ func (c *Client) dial(ctx context.Context, network, addr string) (net.Conn, erro
 			candidate.closed.Load() || candidate.Draining() {
 			continue
 		}
-		if next, nextErr := candidate.DialStream(ctx, addr); nextErr == nil {
+		if next, nextErr := dialLane(ctx, candidate, network, addr); nextErr == nil {
 			return next, nil
 		}
 	}
 	return nil, err
+}
+
+// dialLane opens a TCP stream or a UDP datagram stream on one lane. The UDP
+// path is what keeps QUIC inside the tunnel; a server that predates it returns
+// errUDPUnsupported and the SOCKS relay falls back to direct datagrams.
+func dialLane(ctx context.Context, tunnel *TunnelClient, network, addr string) (net.Conn, error) {
+	if network == "udp" {
+		return tunnel.DialUDPStream(ctx, addr)
+	}
+	return tunnel.DialStream(ctx, addr)
 }
 
 // Start performs the initial handshake with the Meridian server and
@@ -580,7 +590,11 @@ func (c *Client) Start() error {
 	case "http":
 		c.proxy = NewHttpProxyServer(c.cfg.ListenAddr, "", "", dialFn, proxyLimit)
 	default:
-		c.proxy = NewSocks5Server(c.cfg.ListenAddr, "", "", dialFn, proxyLimit)
+		socks := NewSocks5Server(c.cfg.ListenAddr, "", "", dialFn, proxyLimit)
+		socks.SetUDPDialer(func(ctx context.Context, addr string) (net.Conn, error) {
+			return c.dial(ctx, "udp", addr)
+		})
+		c.proxy = socks
 	}
 	return c.proxy.Start()
 }

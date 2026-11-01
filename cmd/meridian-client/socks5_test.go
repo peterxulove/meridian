@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"io"
 	"net"
 	"sync"
@@ -103,5 +104,43 @@ func TestUDPAssociateClearsHandshakeDeadline(t *testing.T) {
 	case <-done:
 		t.Fatal("UDP associate closed while its control connection was idle")
 	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func TestUDPDatagramRoundTrip(t *testing.T) {
+	cases := []struct {
+		name   string
+		target string
+	}{
+		{"ipv4", "127.0.0.1:19000"},
+		{"domain", "example.com:443"},
+		{"ipv6", "[2001:db8::1]:53"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := []byte("hello")
+			packet := buildUDPDatagram(tc.target, payload)
+			if packet == nil {
+				t.Fatalf("buildUDPDatagram(%q) returned nil", tc.target)
+			}
+			target, got, ok := parseUDPDatagram(packet)
+			if !ok {
+				t.Fatalf("parseUDPDatagram(%x) failed", packet)
+			}
+			if target != tc.target {
+				t.Fatalf("target = %q, want %q", target, tc.target)
+			}
+			if !bytes.Equal(got, payload) {
+				t.Fatalf("payload = %q, want %q", got, payload)
+			}
+		})
+	}
+}
+
+func TestUDPDatagramRejectsFragments(t *testing.T) {
+	packet := buildUDPDatagram("127.0.0.1:53", []byte("x"))
+	packet[2] = 1 // FRAG must be zero; this relay does not reassemble.
+	if _, _, ok := parseUDPDatagram(packet); ok {
+		t.Fatal("fragmented datagram was accepted")
 	}
 }

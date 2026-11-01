@@ -22,6 +22,7 @@ Revision history:
 | 1.11 | 2026-10-30 | Lane rotation publishes a successor before retiring the old connection; a retired lane is used as a last resort rather than leaving the client with no lane |
 | 1.12 | 2026-10-30 | Client-side first-byte watchdog: a stream the server never answers is reset after `first_byte_timeout`, and three in a row rebuild the lane |
 | 1.13 | 2026-11-01 | Local SOCKS5 UDP associations live for the lifetime of their TCP control connection; no application-level idle deadline |
+| 1.14 | 2026-11-01 | UDP-over-MFP: `CONNECT` flag `0x02` opens a UDP stream, one datagram per DATA frame (ServerHello version 4) |
 
 ---
 
@@ -754,6 +755,40 @@ closing the association forces the browser to wait for QUIC loss detection
 before retrying over TCP. The visible symptom is a video that starts slowly
 only after the page has been idle, while a refresh makes it fast again.
 
+### 6.2.7 UDP-over-MFP streams
+
+SOCKS5 UDP datagrams are carried as ordinary MFP streams. A `CONNECT` frame
+sets `flagUDP` (`0x02`) in addition to `flagConnect` (`0x01`):
+
+```
+CONNECT (UDP):
+  TYPE      = 0x00 DATA
+  STREAM_ID = new stream
+  FLAGS     = 0x03  (CONNECT | UDP)
+  DATA      = "host:port"
+```
+
+- The server dials a connected UDP socket to `host:port` and answers with the
+  usual `CONNECT SUCCESS`. A dial failure uses `0x08 CONNECT failed`.
+- **One DATA frame is exactly one datagram**, in both directions. A sender
+  MUST NOT split a datagram across frames or coalesce datagrams into one
+  frame; the receiver MUST preserve frame boundaries. The maximum payload is
+  the frame limit (60 KiB); a datagram larger than that is rejected.
+- Per-stream ACK flow control applies unchanged. The server may read at most
+  `stream_window` bytes ahead of the application, and the client ACKs bytes it
+  has delivered to the SOCKS5 client.
+- A stream is identified by the client's UDP source address and the target
+  address. An implementation SHOULD reclaim a destination that has been idle
+  for `stream_idle_timeout` (Meridian uses 30 minutes).
+- ServerHello version 4 advertises support. A client MUST NOT send `flagUDP`
+  to a server that negotiated a lower version; Meridian falls back to direct
+  datagrams in that case. Servers MUST ignore the UDP bit for old clients,
+  which never set it.
+
+Carrying UDP inside the tunnel is what makes QUIC work on a network that
+blocks UDP 443: the client no longer sends the QUIC handshake directly, and
+the server's outbound UDP path is the one that reaches the CDN.
+
 ### 6.3 Keepalive & Heartbeat
 
 Ping/Pong frames with timestamp:
@@ -1007,7 +1042,7 @@ to disable recycling).
 | Cipher | AEAD (Chacha20-Poly1305 / AES-GCM) |
 | Auth | HMAC-SHA256 in frame header |
 | TCP stream | QUIC streams or WebSocket frames |
-| UDP relay | MFP BOUNDARY frames over QUIC |
+| UDP relay | MFP DATA frames, one datagram per frame (`flagUDP`, version 4) |
 
 ### 10.2 Hysteria → Meridian
 
