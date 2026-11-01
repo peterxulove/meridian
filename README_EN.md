@@ -46,6 +46,29 @@ Meridian is a custom secure proxy protocol designed to deliver **undetectable en
 
 ## Changelog
 
+### v1.6.19 (2026-11-01)
+
+#### 📺 A video is slow to start after the YouTube homepage sits idle
+
+The symptom is specific: a fresh browser plays a video immediately, but after sitting on the YouTube homepage for a long time the first click takes several seconds. Refreshing the homepage makes it fast again. TCP is not the problem — reusing an idle SOCKS connection after 60 seconds still produced a 77 ms first byte.
+
+The problem is UDP. Chrome uses QUIC (UDP 443) for YouTube, and OpenClash hands that to SOCKS5 UDP ASSOCIATE. `handleUDPAssociate` set a **60 second read deadline** on the control TCP connection on every loop, even though that connection carries no protocol traffic after the reply. Once the homepage had been idle for a minute, the client tore down its own UDP association; the QUIC connection died with it, and the next video click waited for QUIC loss detection before falling back to TCP. Refreshing created a new association, hence the instant recovery.
+
+The 30 second handshake deadline set by `handleConn` was never cleared either, so removing only the 60 second line would still have killed the association at 30 seconds.
+
+- **The UDP association now lives exactly as long as its TCP control connection**: `handleUDPAssociate` clears the deadline immediately and the read loop installs no application timer.
+- **TCP keepalive detects a client that vanished**: 30 second probes on the control connection; a normal close still returns EOF and is reclaimed immediately.
+- **No more "idle for a minute, kill QUIC" timer**. Sitting on a homepage, pausing a video, or leaving a tab in the background no longer triggers it.
+
+Verified:
+
+- Before: the first UDP DNS query succeeded in 0.18 s; after 75 seconds idle the second query timed out after 5 s (the association was gone).
+- After: the same 75 second idle, the second query returned in **0.025 s**.
+- TCP control: first byte after a 60 second idle was still 77 ms.
+- New unit test `TestUDPAssociateClearsHandshakeDeadline` asserts the handshake deadline is cleared and no new deadline is installed; `go test ./...` is clean.
+
+No wire change; the server does not need to be updated, but the clients on 110/111 do. `deploy.sh` now defaults to v1.6.19 (it had been pinned to v1.6.13).
+
 ### v1.6.18 (2026-10-30)
 
 #### ⏱ First-byte watchdog: a silent server no longer hangs forever

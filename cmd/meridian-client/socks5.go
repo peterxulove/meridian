@@ -282,16 +282,28 @@ func (s *Socks5Server) handleUDPAssociate(conn net.Conn, clientUDPAddrStr string
 	// Send success reply with the bound UDP IP and Port
 	s.writeReply(conn, replySuccess, &net.TCPAddr{IP: boundUDPAddr.IP, Port: boundUDPAddr.Port})
 
-	// Keep the TCP control connection open to maintain the UDP association.
+	// The association lives as long as its TCP control connection. There is no
+	// protocol traffic on that connection after the reply, so it must not carry
+	// a read deadline: the 30s handshake deadline from handleConn used to be
+	// replaced by a 60s one here, and a QUIC connection idle for a minute was
+	// torn down with it. The browser then had to wait for QUIC loss detection
+	// before retrying over TCP -- the "slow video after sitting on the YouTube
+	// homepage" symptom. TCP keepalive, not an application timer, detects a
+	// client that vanished without closing.
+	conn.SetDeadline(time.Time{})
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		_ = tcpConn.SetKeepAlive(true)
+		_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
+	}
+
 	tcpClosed := make(chan struct{})
 	go func() {
 		defer close(tcpClosed)
 		buf := make([]byte, 256)
 		for {
-			conn.SetDeadline(time.Now().Add(60 * time.Second))
 			_, err := conn.Read(buf)
 			if err != nil {
-				return // TCP connection closed or timed out
+				return // TCP connection closed
 			}
 		}
 	}()

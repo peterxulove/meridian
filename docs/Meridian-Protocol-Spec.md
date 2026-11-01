@@ -21,6 +21,7 @@ Revision history:
 | 1.10 | 2026-10-30 | Reclamation gated on lane pressure rather than age alone (`stream_idle_timeout` default 30m); a draining lane is extended while it still carries an active stream |
 | 1.11 | 2026-10-30 | Lane rotation publishes a successor before retiring the old connection; a retired lane is used as a last resort rather than leaving the client with no lane |
 | 1.12 | 2026-10-30 | Client-side first-byte watchdog: a stream the server never answers is reset after `first_byte_timeout`, and three in a row rebuild the lane |
+| 1.13 | 2026-11-01 | Local SOCKS5 UDP associations live for the lifetime of their TCP control connection; no application-level idle deadline |
 
 ---
 
@@ -731,6 +732,27 @@ timer. Applications legitimately stop reading — a video player pauses once its
 buffer is full — and the window closes immediately when the stream or the
 tunnel is closed, so the timeout only needs to catch a consumer that hung
 forever. Meridian waits 10 minutes.
+
+### 6.2.6 Local UDP association lifetime
+
+The client's SOCKS5 UDP ASSOCIATE path relays datagrams outside the MFP
+streams. An association is identified by its TCP control connection and MUST
+live exactly as long as that connection:
+
+- After the ASSOCIATE reply, the control connection carries no protocol
+  traffic. It MUST NOT have an application-level read deadline; a timer there
+  closes associations that are merely idle.
+- The handshake deadline used while reading the SOCKS request MUST be cleared
+  before entering the control loop. Leaving it in place is the same defect
+  with a shorter timeout.
+- TCP keepalive SHOULD detect a peer that disappeared without closing; a
+  normal close is observed as EOF.
+
+A 60 second deadline is a correctness bug, not a tuning choice: browsers keep
+QUIC connections to media hosts alive across long page-idle periods, and
+closing the association forces the browser to wait for QUIC loss detection
+before retrying over TCP. The visible symptom is a video that starts slowly
+only after the page has been idle, while a refresh makes it fast again.
 
 ### 6.3 Keepalive & Heartbeat
 
