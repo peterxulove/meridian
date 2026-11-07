@@ -2,6 +2,7 @@ package transport
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -107,6 +108,13 @@ func (t *HTTPPOSTTransport) Dial(addr string) (net.Conn, error) {
 	}
 
 	transport := &http.Transport{TLSClientConfig: tlsConfig}
+	if t.config.IPVersion != config.IPVersionAuto {
+		network := t.config.DialNetwork("tcp")
+		d := &net.Dialer{Timeout: t.config.DialTimeout}
+		transport.DialContext = func(ctx context.Context, _, addr string) (net.Conn, error) {
+			return d.DialContext(ctx, network, addr)
+		}
+	}
 	t.client = &http.Client{
 		Transport: transport,
 		Timeout:   t.config.DialTimeout,

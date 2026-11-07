@@ -2,6 +2,12 @@
 # ======================================================
 
 server_addr: "server.example.com:443"
+# IPv6 literals work here, bracketed or bare, with or without a port:
+#   server_addr: "2404:3881:100:1000::6440:146"      → :443 assumed
+#   server_addr: "[2404:3881:100:1000::6440:146]:8443"
+# ip_version pins the family for a hostname that resolves to both records:
+# "auto" (default), "4" or "6".
+ip_version: "auto"
 transport: "WebSocket"
 cipher_suite: 1
 password: "your-strong-random-password-here"

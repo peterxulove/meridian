@@ -48,7 +48,7 @@ func main() {
 	}
 
 	fmt.Printf("Meridian Server %s\n", Version)
-	fmt.Printf("  Listen:    %s\n", cfg.ListenAddr)
+	fmt.Printf("  Listen:    %s\n", cfg.ListenTarget())
 	fmt.Printf("  Transport: %s\n", cfg.Transport)
 	fmt.Printf("  Cipher:    %s\n", cfg.CipherSuite)
 	fmt.Printf("  REALITY:   %v\n", cfg.RealityMode)
@@ -73,7 +73,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Error starting server: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("Server running on %s (PID %d)\n", cfg.ListenAddr, os.Getpid())
+	fmt.Printf("Server running on %s (PID %d)\n", cfg.ListenTarget(), os.Getpid())
 	fmt.Println("Press Ctrl+C to stop.")
 
 	<-sigch

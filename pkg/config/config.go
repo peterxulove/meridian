@@ -3,7 +3,9 @@ package config
 import (
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"os"
 	"regexp"
 	"strconv"
@@ -75,6 +77,7 @@ const (
 // ClientConfig is the client-side configuration.
 type ClientConfig struct {
 	ServerAddr  string        `yaml:"server_addr" json:"server_addr"`
+	IPVersion   string        `yaml:"ip_version" json:"ip_version"` // "auto" (default), "4" or "6"
 	Transport   TransportType `yaml:"transport" json:"transport"`
 	CipherSuite CipherID      `yaml:"cipher_suite" json:"cipher_suite"`
 	Password    string        `yaml:"password" json:"-"` // excluded from JSON logging
@@ -333,7 +336,11 @@ func LoadScheduleLocation(name string) (*time.Location, error) {
 
 // ServerConfig is the server-side configuration.
 type ServerConfig struct {
-	ListenAddr  string        `yaml:"listen_addr" json:"listen_addr"`
+	ListenAddr string `yaml:"listen_addr" json:"listen_addr"`
+	// IPv6 widens an unspecified listen address ("0.0.0.0") to the IPv6
+	// wildcard so one socket serves both families. Set false to keep the
+	// listener IPv4-only.
+	IPv6        bool          `yaml:"ipv6" json:"ipv6"`
 	Transport   TransportType `yaml:"transport" json:"transport"`
 	CipherSuite CipherID      `yaml:"cipher_suite" json:"cipher_suite"`
 	Password    string        `yaml:"password" json:"-"`
@@ -405,6 +412,7 @@ type DestinationConfig struct {
 // DefaultClientConfig returns sensible defaults.
 func DefaultClientConfig() ClientConfig {
 	return ClientConfig{
+		IPVersion:           IPVersionAuto,
 		Transport:           TransportHysteria,
 		CipherSuite:         CipherMeridianChacha,
 		SNISpoof:            "www.google.com",
@@ -452,6 +460,7 @@ func DefaultClientConfig() ClientConfig {
 func DefaultServerConfig() ServerConfig {
 	return ServerConfig{
 		ListenAddr:          "0.0.0.0:443",
+		IPv6:                true,
 		Transport:           TransportHysteria,
 		CipherSuite:         CipherMeridianChacha,
 		RealityMode:         false,
@@ -728,6 +737,132 @@ func NormalizeLogRotate(size uint64, keep int) (uint64, int) {
 	return size, keep
 }
 
+// ─── Address handling (IPv4 / IPv6) ──────────────────────────────────────
+
+// DefaultServerPort is assumed when a configured address omits its port.
+const DefaultServerPort = "443"
+
+// Supported IP-version preferences for outbound client dials.
+const (
+	IPVersionAuto = "auto" // let the resolver return both families
+	IPVersion4    = "4"
+	IPVersion6    = "6"
+)
+
+// NormalizeIPVersion maps a configured value onto one of the three supported
+// constants. Anything unrecognised becomes auto, so a typo degrades to the
+// previous behaviour instead of silently pinning the wrong family.
+func NormalizeIPVersion(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "4", "ipv4", "v4":
+		return IPVersion4
+	case "6", "ipv6", "v6":
+		return IPVersion6
+	default:
+		return IPVersionAuto
+	}
+}
+
+// SplitHostPortLoose parses the address forms an operator is likely to type:
+//
+//	example.com            → (example.com, defaultPort)
+//	example.com:443        → (example.com, 443)
+//	[2404:3881::1]         → (2404:3881::1, defaultPort)
+//	[2404:3881::1]:443     → (2404:3881::1, 443)
+//	2404:3881::1           → (2404:3881::1, defaultPort)
+//
+// A bare IPv6 literal must not carry a port: "2404:3881::1:443" is itself a
+// valid IPv6 address, so the port is only unambiguous inside brackets.
+func SplitHostPortLoose(addr, defaultPort string) (host, port string, err error) {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return "", "", errors.New("config: empty address")
+	}
+	// A bare port ("443") means "any host on this port".
+	if p, e := strconv.Atoi(addr); e == nil && p >= 0 && p <= 65535 && !strings.ContainsAny(addr, "+-") {
+		return "", addr, nil
+	}
+	if strings.HasPrefix(addr, "[") {
+		if h, p, e := net.SplitHostPort(addr); e == nil {
+			return strings.Trim(h, "[]"), p, nil
+		}
+		if strings.HasSuffix(addr, "]") {
+			return strings.Trim(addr, "[]"), defaultPort, nil
+		}
+		return "", "", fmt.Errorf("config: malformed bracketed address %q", addr)
+	}
+	// More than one colon and no brackets means the whole string is a host.
+	if strings.Count(addr, ":") > 1 {
+		if net.ParseIP(addr) == nil {
+			return "", "", fmt.Errorf("config: invalid IPv6 address %q", addr)
+		}
+		return addr, defaultPort, nil
+	}
+	if h, p, e := net.SplitHostPort(addr); e == nil {
+		return h, p, nil
+	}
+	return addr, defaultPort, nil
+}
+
+// NormalizeServerAddr returns a dialable "host:port" string. IPv6 literals are
+// bracketed by net.JoinHostPort, which is what net.Dial, net.ResolveUDPAddr and
+// the "wss://" URL builder all need; feeding them a raw "2404:3881::1:443"
+// instead produces a parse error rather than a connection attempt.
+func NormalizeServerAddr(addr, defaultPort string) (string, error) {
+	if defaultPort == "" {
+		defaultPort = DefaultServerPort
+	}
+	host, port, err := SplitHostPortLoose(addr, defaultPort)
+	if err != nil {
+		return "", err
+	}
+	return net.JoinHostPort(host, port), nil
+}
+
+// DualStackListenAddr rewrites an unspecified bind address ("", "0.0.0.0",
+// "::") into the IPv6 wildcard so one socket serves both families. Linux and
+// the BSDs default to net.ipv6.bindv6only=0, which makes [::] accept
+// IPv4-mapped connections too. A specific address is returned unchanged: the
+// operator asked for that interface, not for both.
+func DualStackListenAddr(addr string) (string, error) {
+	host, port, err := SplitHostPortLoose(addr, DefaultServerPort)
+	if err != nil {
+		return "", err
+	}
+	switch {
+	case host == "", host == "0.0.0.0", host == "::":
+		return net.JoinHostPort("::", port), nil
+	default:
+		return net.JoinHostPort(host, port), nil
+	}
+}
+
+// ListenTarget is the address the transport listeners bind. When IPv6 is
+// enabled (the default) an unspecified host is widened to the IPv6 wildcard,
+// so a single QUIC/TCP socket answers on both families. Callers that fail to
+// bind here should retry with ListenAddr, which stays IPv4-only.
+func (c *ServerConfig) ListenTarget() string {
+	if c.IPv6 {
+		if a, err := DualStackListenAddr(c.ListenAddr); err == nil {
+			return a
+		}
+	}
+	return c.ListenAddr
+}
+
+// DialNetwork returns the network string for an outbound dial, adding the
+// family suffix when ip_version pins one: DialNetwork("tcp") → "tcp4"/"tcp6".
+func (c *ClientConfig) DialNetwork(proto string) string {
+	switch c.IPVersion {
+	case IPVersion4:
+		return proto + "4"
+	case IPVersion6:
+		return proto + "6"
+	default:
+		return proto
+	}
+}
+
 // LoadClientConfig reads a YAML/JSON config file and returns a ClientConfig.
 // Fix #15: previous code silently ignored parse failures and returned defaults;
 // now returns an error if both YAML and JSON parsing fail.
@@ -753,6 +888,14 @@ func LoadClientConfig(path string) (ClientConfig, error) {
 			return cfg, fmt.Errorf("config: invalid reality_spki hex: %v", err)
 		}
 		cfg.RealitySPKIHash = hash
+	}
+	cfg.IPVersion = NormalizeIPVersion(cfg.IPVersion)
+	if cfg.ServerAddr != "" {
+		addr, addrErr := NormalizeServerAddr(cfg.ServerAddr, DefaultServerPort)
+		if addrErr != nil {
+			return cfg, addrErr
+		}
+		cfg.ServerAddr = addr
 	}
 	cfg.StreamWindow = NormalizeStreamWindow(cfg.StreamWindow)
 	cfg.MaxConcurrentStream = NormalizeMaxConcurrentStreams(cfg.MaxConcurrentStream)

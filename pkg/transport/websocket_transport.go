@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -36,6 +37,27 @@ func NewWSListener(cfg config.ServerConfig) *WSListener {
 		done:     make(chan struct{}),
 		fallback: newFallbackHandler(cfg),
 	}
+}
+
+// listenTCP binds the configured address, widening an unspecified host to the
+// IPv6 wildcard so one listener answers on both families. A host without IPv6
+// falls back to the configured (IPv4) address instead of failing to start.
+func listenTCP(cfg config.ServerConfig) (net.Listener, string, error) {
+	target := cfg.ListenTarget()
+	ln, err := net.Listen("tcp", target)
+	if err == nil {
+		return ln, target, nil
+	}
+	if target == cfg.ListenAddr {
+		return nil, "", err
+	}
+	fmt.Printf("  [TCP] dual-stack listen on %s failed (%v); falling back to %s\n",
+		target, err, cfg.ListenAddr)
+	ln, rerr := net.Listen("tcp", cfg.ListenAddr)
+	if rerr != nil {
+		return nil, "", err
+	}
+	return ln, cfg.ListenAddr, nil
 }
 
 func (l *WSListener) ListenAndServe() error {
@@ -78,11 +100,15 @@ func (l *WSListener) ListenAndServe() error {
 	mux.Handle("/", l.fallback)
 
 	server := &http.Server{
-		Addr:              l.config.ListenAddr,
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	l.srv = server
+
+	ln, _, err := listenTCP(l.config)
+	if err != nil {
+		return err
+	}
 
 	if l.config.ServerCertFile != "" && l.config.ServerKeyFile != "" {
 		// Mirror the tunnel ALPN list. Without it the client's
@@ -90,12 +116,22 @@ func (l *WSListener) ListenAndServe() error {
 		// the handshake dies with "tls: no application protocol".
 		// http/1.1 comes first: gorilla's dialer upgrades over HTTP/1.1, so
 		// negotiating a tunnel-only ALPN makes the handshake itself fail.
-		server.TLSConfig = &tls.Config{
-			NextProtos: alpnServerWS,
+		//
+		// The pair is loaded here rather than by ListenAndServeTLS because the
+		// listener is created up front: that is what lets the bind fall back to
+		// IPv4 when the host has no IPv6.
+		cert, cerr := tls.LoadX509KeyPair(l.config.ServerCertFile, l.config.ServerKeyFile)
+		if cerr != nil {
+			_ = ln.Close()
+			return cerr
 		}
-		return server.ListenAndServeTLS(l.config.ServerCertFile, l.config.ServerKeyFile)
+		server.TLSConfig = &tls.Config{
+			NextProtos:   alpnServerWS,
+			Certificates: []tls.Certificate{cert},
+		}
+		return server.Serve(tls.NewListener(ln, server.TLSConfig))
 	}
-	return server.ListenAndServe()
+	return server.Serve(ln)
 }
 
 func (l *WSListener) Accept() (net.Conn, error) {
@@ -291,6 +327,17 @@ func WSDial(serverURL string, cfg config.ClientConfig) (*WSConn, error) {
 		HandshakeTimeout: 15 * time.Second,
 		ReadBufferSize:   64 * 1024,
 		WriteBufferSize:  64 * 1024,
+	}
+
+	// ip_version pins the address family. gorilla resolves the URL host with
+	// its own dialer, so the only way to force a family is to take over the
+	// dial itself.
+	if cfg.IPVersion != config.IPVersionAuto {
+		network := cfg.DialNetwork("tcp")
+		familyDialer := &net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}
+		dialer.NetDialContext = func(ctx context.Context, _, addr string) (net.Conn, error) {
+			return familyDialer.DialContext(ctx, network, addr)
+		}
 	}
 
 	conn, _, err := dialer.Dial(serverURL, nil)

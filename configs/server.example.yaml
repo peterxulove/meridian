@@ -2,6 +2,11 @@
 # ======================================================
 
 listen_addr: "0.0.0.0:443"
+# Widen an unspecified listen_addr to the IPv6 wildcard so one socket answers
+# on both families (QUIC/UDP and WebSocket/TCP alike). Requires IPv6 on the
+# host; without it the server logs the failure and falls back to plain IPv4.
+# Set false to keep the listener IPv4-only.
+ipv6: true
 transport: "QUIC+WebSocket"
 cipher_suite: 1
 password: "your-strong-random-password-here"

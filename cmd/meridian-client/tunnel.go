@@ -142,7 +142,7 @@ func (tc *TunnelClient) Connect() error {
 			return fmt.Errorf("tunnel: TLS config error: %w", err)
 		}
 
-		serverAddr, err := net.ResolveUDPAddr("udp", tc.cfg.ServerAddr)
+		serverAddr, err := net.ResolveUDPAddr(tc.cfg.DialNetwork("udp"), tc.cfg.ServerAddr)
 		if err != nil {
 			return fmt.Errorf("tunnel: resolve UDP addr failed: %w", err)
 		}
@@ -186,7 +186,7 @@ func (tc *TunnelClient) Connect() error {
 		}
 		conn = postConn
 	} else {
-		tcpConn, err := net.DialTimeout("tcp", tc.cfg.ServerAddr, tc.cfg.DialTimeout)
+		tcpConn, err := net.DialTimeout(tc.cfg.DialNetwork("tcp"), tc.cfg.ServerAddr, tc.cfg.DialTimeout)
 		if err != nil {
 			return fmt.Errorf("tunnel: TCP dial failed: %w", err)
 		}

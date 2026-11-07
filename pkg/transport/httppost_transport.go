@@ -16,6 +16,7 @@ package transport
 
 import (
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/hex"
 	"errors"
 	"io"
@@ -386,16 +387,27 @@ func (l *MirrorListener) ListenAndServe() error {
 	mux.Handle(l.path(), l.Handler())
 
 	srv := &http.Server{
-		Addr:              l.cfg.ListenAddr,
 		Handler:           mux,
 		ReadHeaderTimeout: 30 * time.Second,
+	}
+
+	ln, _, err := listenTCP(l.cfg)
+	if err != nil {
+		return err
 	}
 
 	if l.cfg.ServerCertFile != "" && l.cfg.ServerKeyFile != "" {
 		// The mirror is ordinary HTTPS; ALPN must allow HTTP/1.1 or the
 		// client's transport cannot complete the request at all.
-		srv.TLSConfig = serverMirrorTLS(l.cfg)
-		return srv.ListenAndServeTLS(l.cfg.ServerCertFile, l.cfg.ServerKeyFile)
+		cfgTLS := serverMirrorTLS(l.cfg)
+		cert, cerr := tls.LoadX509KeyPair(l.cfg.ServerCertFile, l.cfg.ServerKeyFile)
+		if cerr != nil {
+			_ = ln.Close()
+			return cerr
+		}
+		cfgTLS.Certificates = []tls.Certificate{cert}
+		srv.TLSConfig = cfgTLS
+		return srv.Serve(tls.NewListener(ln, cfgTLS))
 	}
-	return srv.ListenAndServe()
+	return srv.Serve(ln)
 }

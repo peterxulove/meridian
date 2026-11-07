@@ -271,17 +271,42 @@ func (s *Server) Start() error {
 	}
 }
 
+// bindUDP opens the QUIC socket. With IPv6 enabled the wildcard is widened so
+// a single socket answers on both families; hosts without IPv6 fall back to
+// the configured (IPv4) address instead of failing to start.
+func (s *Server) bindUDP() (*net.UDPConn, string, error) {
+	target := s.cfg.ListenTarget()
+	addr, err := net.ResolveUDPAddr("udp", target)
+	if err != nil {
+		return nil, "", err
+	}
+	conn, err := net.ListenUDP("udp", addr)
+	if err == nil {
+		return conn, target, nil
+	}
+	if target == s.cfg.ListenAddr {
+		return nil, "", err
+	}
+	fmt.Printf("  [Hysteria v2] dual-stack bind on %s failed (%v); falling back to %s\n",
+		target, err, s.cfg.ListenAddr)
+	addr, rerr := net.ResolveUDPAddr("udp", s.cfg.ListenAddr)
+	if rerr != nil {
+		return nil, "", err
+	}
+	conn, rerr = net.ListenUDP("udp", addr)
+	if rerr != nil {
+		return nil, "", err
+	}
+	return conn, s.cfg.ListenAddr, nil
+}
+
 func (s *Server) startHysteria() error {
 	tlsCfg, err := transport.ServerTLSConfig(s.cfg)
 	if err != nil {
 		return err
 	}
 
-	udpAddr, err := net.ResolveUDPAddr("udp", s.cfg.ListenAddr)
-	if err != nil {
-		return err
-	}
-	conn, err := net.ListenUDP("udp", udpAddr)
+	conn, boundAddr, err := s.bindUDP()
 	if err != nil {
 		return err
 	}
@@ -307,7 +332,7 @@ func (s *Server) startHysteria() error {
 	}
 	s.hyServer = hyServer
 
-	fmt.Printf("  [Hysteria v2] Listening on %s (tunnel server)\n", s.cfg.ListenAddr)
+	fmt.Printf("  [Hysteria v2] Listening on %s (tunnel server)\n", boundAddr)
 
 	s.wg.Add(1)
 	go func() {
@@ -337,7 +362,7 @@ func (s *Server) startHTTPPOST() error {
 		}
 	}()
 
-	fmt.Printf("  [HTTP-POST] Listening on %s%s (tunnel server)\n", s.cfg.ListenAddr, listener.Path())
+	fmt.Printf("  [HTTP-POST] Listening on %s%s (tunnel server)\n", s.cfg.ListenTarget(), listener.Path())
 
 	for {
 		if s.stopped.Load() {
@@ -364,7 +389,7 @@ func (s *Server) startWS() error {
 		}
 	}()
 
-	fmt.Printf("  [WebSocket] Listening on %s%s (tunnel server)\n", s.cfg.ListenAddr, s.cfg.WSSPath)
+	fmt.Printf("  [WebSocket] Listening on %s%s (tunnel server)\n", s.cfg.ListenTarget(), s.cfg.WSSPath)
 
 	for {
 		if s.stopped.Load() {
@@ -434,13 +459,20 @@ var (
 )
 
 func (s *Server) startTCP() {
-	ln, err := net.Listen("tcp", s.cfg.ListenAddr)
+	target := s.cfg.ListenTarget()
+	ln, err := net.Listen("tcp", target)
+	if err != nil && target != s.cfg.ListenAddr {
+		fmt.Printf("  [TCP] dual-stack listen on %s failed (%v); falling back to %s\n",
+			target, err, s.cfg.ListenAddr)
+		target = s.cfg.ListenAddr
+		ln, err = net.Listen("tcp", target)
+	}
 	if err != nil {
-		fmt.Printf("  [TCP] Listen error on %s: %v\n", s.cfg.ListenAddr, err)
+		fmt.Printf("  [TCP] Listen error on %s: %v\n", target, err)
 		return
 	}
 	defer ln.Close()
-	fmt.Printf("  [TCP] Listening on %s (tunnel server)\n", s.cfg.ListenAddr)
+	fmt.Printf("  [TCP] Listening on %s (tunnel server)\n", target)
 
 	for {
 		if s.stopped.Load() {
